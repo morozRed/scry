@@ -1,13 +1,16 @@
 //! Reads the live process table. Every call here works without root.
 
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::mem::{MaybeUninit, size_of};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use libc::{c_int, c_void};
 
-use crate::model::{ProcId, Process, SNAPSHOT_SCHEMA, Snapshot};
+use crate::model::{DiskSample, ProcId, Process, SNAPSHOT_SCHEMA, Snapshot};
 
 // `struct kinfo_proc` from <sys/sysctl.h> on arm64. libc has no binding, so the fields Scry
 // reads are taken by offset: `kp_proc.p_un.__p_starttime` (a timeval) opens the record and
@@ -34,13 +37,9 @@ pub fn scan() -> Result<Snapshot> {
         .into_iter()
         .filter(|p| still.get(&p.id.pid) == Some(&p.id.start_us))
         .collect();
-    let taken_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or_default();
     Ok(Snapshot {
         schema: SNAPSHOT_SCHEMA,
-        taken_at_ms,
+        taken_at_ms: now_ms(),
         viewer_uid,
         processes,
     })
@@ -107,6 +106,57 @@ fn parse_record(rec: &[u8; KINFO_PROC_SIZE]) -> (i32, i64) {
     (pid, sec * 1_000_000 + i64::from(usec))
 }
 
+/// The identity of one live process, or `None` if no process has that pid.
+pub fn proc_id(pid: i32) -> Option<ProcId> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut buf = [0u8; KINFO_PROC_SIZE];
+    let mut len = buf.len();
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != KINFO_PROC_SIZE {
+        return None;
+    }
+    let (found, start_us) = parse_record(&buf);
+    (found == pid).then_some(ProcId { pid, start_us })
+}
+
+/// Reads total, free and available space of the volume holding `path`.
+pub fn volume_space(path: &Path) -> Result<DiskSample> {
+    let c_path = CString::new(path.as_os_str().as_bytes())?;
+    let mut st = MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::statfs(c_path.as_ptr(), st.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("statfs {}", path.display()));
+    }
+    let st = unsafe { st.assume_init() };
+    let block = u64::from(st.f_bsize);
+    let volume = unsafe { CStr::from_ptr(st.f_mntonname.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    Ok(DiskSample {
+        at_ms: now_ms(),
+        volume,
+        total_bytes: st.f_blocks * block,
+        free_bytes: st.f_bfree * block,
+        avail_bytes: st.f_bavail * block,
+    })
+}
+
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 fn read_process(id: ProcId) -> Option<Process> {
     let info = short_bsd_info(id.pid)?;
     let exe = exe_path(id.pid);
@@ -142,7 +192,8 @@ fn short_bsd_info(pid: i32) -> Option<libc::proc_bsdshortinfo> {
     (n == size).then(|| unsafe { info.assume_init() })
 }
 
-fn exe_path(pid: i32) -> Option<String> {
+/// The executable `pid` runs, as the kernel resolved it.
+pub fn exe_path(pid: i32) -> Option<String> {
     let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
     (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
@@ -197,6 +248,35 @@ mod tests {
             ps_start,
             "start time matches ps"
         );
+    }
+
+    #[test]
+    fn proc_id_matches_the_full_scan_and_misses_a_dead_pid() {
+        let me = std::process::id() as i32;
+        let scanned = all_pids_with_start()
+            .unwrap()
+            .into_iter()
+            .find(|(pid, _)| *pid == me)
+            .unwrap();
+        assert_eq!(
+            proc_id(me),
+            Some(ProcId {
+                pid: me,
+                start_us: scanned.1
+            })
+        );
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id() as i32;
+        child.wait().unwrap();
+        assert_eq!(proc_id(dead), None);
+    }
+
+    #[test]
+    fn root_volume_has_space_figures_in_order() {
+        let s = volume_space(Path::new("/")).unwrap();
+        assert_eq!(s.volume, "/");
+        assert!(s.total_bytes > 0);
+        assert!(s.avail_bytes <= s.free_bytes && s.free_bytes <= s.total_bytes);
     }
 
     #[test]
