@@ -2,6 +2,7 @@ mod daemon_cmd;
 mod doctor_cmd;
 mod ports;
 mod stop;
+mod worktrees;
 
 use scry::tui;
 
@@ -47,6 +48,8 @@ enum Command {
     Ports(ports::PortsArgs),
     Why(ports::WhyArgs),
     Stop(stop::StopArgs),
+    /// List linked worktrees with their state, size and probable creator.
+    Worktrees(worktrees::WorktreesArgs),
     /// Measure Scry itself.
     Bench {
         #[command(subcommand)]
@@ -75,6 +78,8 @@ enum BenchWhat {
         #[arg(long)]
         json: bool,
     },
+    /// Time a worktrees scan: discovery, git and sizing.
+    Worktrees(worktrees::BenchArgs),
 }
 
 /// The exit code for arguments Scry cannot parse, from sysexits(3). Clap's own code, 2, is
@@ -100,11 +105,15 @@ fn main() -> Result<()> {
         Some(Command::Ports(a)) => ports::ports(a),
         Some(Command::Why(a)) => ports::why(a),
         Some(Command::Stop(a)) => stop::run(a),
+        Some(Command::Worktrees(args)) => worktrees::run(args),
         Some(Command::Bench {
             what: BenchWhat::Scan { runs, json },
         }) => bench_scan(runs, json),
         Some(Command::Daemon { action }) => daemon_cmd::run(action),
         Some(Command::Doctor { json }) => doctor_cmd::run(json),
+        Some(Command::Bench {
+            what: BenchWhat::Worktrees(args),
+        }) => worktrees::bench(args),
     }
 }
 
