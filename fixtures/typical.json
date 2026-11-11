@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "taken_at_ms": 1762853000000,
   "viewer_uid": 501,
   "processes": [
@@ -45,7 +45,11 @@
       "uid": 501,
       "name": "Ghostty",
       "exe": "/Applications/Ghostty.app/Contents/MacOS/ghostty",
-      "footprint": 325058560
+      "footprint": 325058560,
+      "argv": [
+        "/Applications/Ghostty.app/Contents/MacOS/ghostty"
+      ],
+      "cwd": "~"
     },
     {
       "id": {
@@ -56,7 +60,15 @@
       "uid": 501,
       "name": "zsh",
       "exe": "/bin/zsh",
-      "footprint": 3145728
+      "footprint": 3145728,
+      "argv": [
+        "-zsh"
+      ],
+      "cwd": "~/acme/wt-auth",
+      "project": {
+        "root": "~/acme/wt-auth",
+        "kind": "worktree"
+      }
     },
     {
       "id": {
@@ -67,18 +79,39 @@
       "uid": 501,
       "name": "claude",
       "exe": "~/.local/bin/claude",
-      "footprint": 976224256
+      "footprint": 976224256,
+      "argv": [
+        "claude"
+      ],
+      "cwd": "~/acme/wt-auth",
+      "project": {
+        "root": "~/acme/wt-auth",
+        "kind": "worktree"
+      }
     },
     {
       "id": {
         "pid": 1320,
-        "start_us": 1762000001320000
+        "start_us": 1762845500000000
       },
       "ppid": 1311,
       "uid": 501,
       "name": "node",
       "exe": "/opt/homebrew/bin/node",
-      "footprint": 432013312
+      "footprint": 432013312,
+      "argv": [
+        "node",
+        "~/acme/wt-auth/node_modules/.bin/next",
+        "dev"
+      ],
+      "cwd": "~/acme/wt-auth",
+      "project": {
+        "root": "~/acme/wt-auth",
+        "kind": "worktree"
+      },
+      "stamps": {
+        "claude_code_session_id": "7f3a9c2e"
+      }
     },
     {
       "id": {
@@ -89,7 +122,19 @@
       "uid": 501,
       "name": "node",
       "exe": "/opt/homebrew/bin/node",
-      "footprint": 228589568
+      "footprint": 228589568,
+      "argv": [
+        "node",
+        "~/.npm/_npx/1a2b/node_modules/@modelcontextprotocol/server-github/dist/index.js"
+      ],
+      "cwd": "~/acme/wt-auth",
+      "project": {
+        "root": "~/acme/wt-auth",
+        "kind": "worktree"
+      },
+      "stamps": {
+        "claude_code_session_id": "7f3a9c2e"
+      }
     },
     {
       "id": {
@@ -100,7 +145,18 @@
       "uid": 501,
       "name": "codex",
       "exe": "/opt/homebrew/bin/codex",
-      "footprint": 566231040
+      "footprint": 566231040,
+      "argv": [
+        "codex"
+      ],
+      "cwd": "~/acme/api",
+      "project": {
+        "root": "~/acme/api",
+        "kind": "git"
+      },
+      "stamps": {
+        "codex_session_id": "c-41d2"
+      }
     },
     {
       "id": {
@@ -111,7 +167,156 @@
       "uid": 501,
       "name": "tmux",
       "exe": "/opt/homebrew/bin/tmux",
-      "footprint": 9437184
+      "footprint": 9437184,
+      "argv": [
+        "tmux",
+        "new",
+        "-s",
+        "work"
+      ],
+      "cwd": "~"
     }
-  ]
+  ],
+  "sockets": [
+    {
+      "proto": "tcp",
+      "family": "v4",
+      "local_ip": "0.0.0.0",
+      "local_port": 22,
+      "remote_ip": "0.0.0.0",
+      "remote_port": 0,
+      "state": "listen",
+      "pid": 1,
+      "epid": 1,
+      "uid": 0
+    },
+    {
+      "proto": "tcp",
+      "family": "v6",
+      "local_ip": "::",
+      "local_port": 22,
+      "remote_ip": "::",
+      "remote_port": 0,
+      "state": "listen",
+      "pid": 1,
+      "epid": 1,
+      "uid": 0
+    },
+    {
+      "proto": "tcp",
+      "family": "v4",
+      "local_ip": "127.0.0.1",
+      "local_port": 3000,
+      "remote_ip": "0.0.0.0",
+      "remote_port": 0,
+      "state": "listen",
+      "pid": 1320,
+      "epid": 1320,
+      "uid": 501
+    },
+    {
+      "proto": "tcp",
+      "family": "v6",
+      "local_ip": "::1",
+      "local_port": 3000,
+      "remote_ip": "::",
+      "remote_port": 0,
+      "state": "listen",
+      "pid": 1320,
+      "epid": 1320,
+      "uid": 501
+    },
+    {
+      "proto": "tcp",
+      "family": "v4",
+      "local_ip": "127.0.0.1",
+      "local_port": 3000,
+      "remote_ip": "127.0.0.1",
+      "remote_port": 54012,
+      "state": "established",
+      "pid": 1320,
+      "epid": 1320,
+      "uid": 501
+    },
+    {
+      "proto": "tcp",
+      "family": "v4",
+      "local_ip": "127.0.0.1",
+      "local_port": 54012,
+      "remote_ip": "127.0.0.1",
+      "remote_port": 3000,
+      "state": "established",
+      "pid": 1311,
+      "epid": 1311,
+      "uid": 501
+    },
+    {
+      "proto": "tcp",
+      "family": "v4",
+      "local_ip": "127.0.0.1",
+      "local_port": 8080,
+      "remote_ip": "0.0.0.0",
+      "remote_port": 0,
+      "state": "listen",
+      "pid": 4999,
+      "epid": 4999,
+      "uid": 501
+    },
+    {
+      "proto": "udp",
+      "family": "v4",
+      "local_ip": "0.0.0.0",
+      "local_port": 5353,
+      "remote_ip": "0.0.0.0",
+      "remote_port": 0,
+      "state": null,
+      "pid": 725,
+      "epid": 725,
+      "uid": 0
+    },
+    {
+      "proto": "udp",
+      "family": "v4",
+      "local_ip": "0.0.0.0",
+      "local_port": 0,
+      "remote_ip": "0.0.0.0",
+      "remote_port": 0,
+      "state": null,
+      "pid": 1311,
+      "epid": 1311,
+      "uid": 501
+    },
+    {
+      "proto": "udp",
+      "family": "v4",
+      "local_ip": "192.0.2.10",
+      "local_port": 61000,
+      "remote_ip": "192.0.2.1",
+      "remote_port": 53,
+      "state": null,
+      "pid": 1311,
+      "epid": 1311,
+      "uid": 501
+    }
+  ],
+  "user_names": {
+    "0": "root"
+  },
+  "pulse": {
+    "cpu_percent": {
+      "state": "ready",
+      "value": 23.0
+    },
+    "memory": {
+      "state": "ready",
+      "value": "normal"
+    },
+    "swap": {
+      "state": "ready",
+      "value": {
+        "used": 1288490188,
+        "total": 2147483648
+      }
+    }
+  }
 }

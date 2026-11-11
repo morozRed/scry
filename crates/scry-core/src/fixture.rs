@@ -1,3 +1,5 @@
+//! Loading recorded snapshots, and redacting a live one before it is written.
+
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -32,18 +34,33 @@ pub fn home_dir() -> Result<String> {
     Ok(home)
 }
 
-/// Rewrites anything that names the person: the home directory becomes `~`.
+/// Rewrites anything that names the person: the home directory becomes `~` in paths and
+/// arguments, and connected sockets, which name their peers, are dropped.
 pub fn redact(mut snap: Snapshot, home: &str) -> Snapshot {
     let home = home.trim_end_matches('/');
+    snap.sockets.retain(|s| s.is_listening());
     for p in &mut snap.processes {
-        if let Some(exe) = &mut p.exe
-            && let Some(rest) = exe.strip_prefix(home)
-            && (rest.is_empty() || rest.starts_with('/'))
-        {
-            *exe = format!("~{rest}");
+        for path in [p.exe.as_mut(), p.cwd.as_mut()].into_iter().flatten() {
+            tilde(path, home);
+        }
+        if let Some(project) = &mut p.project {
+            tilde(&mut project.root, home);
+        }
+        for arg in p.argv.iter_mut().flatten() {
+            *arg = arg.replace(&format!("{home}/"), "~/");
+            tilde(arg, home);
         }
     }
     snap
+}
+
+/// `home` or `home/...` becomes `~` or `~/...`; a lookalike prefix such as `home2` does not.
+pub fn tilde(path: &mut String, home: &str) {
+    if let Some(rest) = path.strip_prefix(home)
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        *path = format!("~{rest}");
+    }
 }
 
 #[cfg(test)]
@@ -66,7 +83,12 @@ mod tests {
                 name: "x".into(),
                 exe: Some(exe.into()),
                 footprint: None,
+                argv: Some(vec![exe.into(), format!("--config={exe}")]),
+                cwd: Some(exe.into()),
+                project: None,
+                stamps: Default::default(),
             }],
+            ..Snapshot::default()
         }
     }
 
@@ -78,6 +100,32 @@ mod tests {
         assert_eq!(s.processes[0].exe.as_deref(), Some("~/bin/x"));
         let s = redact(snap_with_exe("/Users/anna/bin/x"), "/Users/ann");
         assert_eq!(s.processes[0].exe.as_deref(), Some("/Users/anna/bin/x"));
+    }
+
+    #[test]
+    fn redact_rewrites_home_in_arguments_and_the_working_directory() {
+        let s = redact(snap_with_exe("/Users/dev/bin/x"), "/Users/dev");
+        let p = &s.processes[0];
+        assert_eq!(p.cwd.as_deref(), Some("~/bin/x"));
+        assert_eq!(
+            p.argv.as_deref(),
+            Some(&["~/bin/x".to_string(), "--config=~/bin/x".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn redact_keeps_only_listening_sockets() {
+        let mut s = parse(include_str!("../../../fixtures/typical.json")).unwrap();
+        s.processes.clear();
+        let s = redact(s, "/Users/dev");
+        assert!(!s.sockets.is_empty());
+        assert!(s.sockets.iter().all(|s| s.is_listening()));
+    }
+
+    #[test]
+    fn the_committed_fixture_loads() {
+        let s = parse(include_str!("../../../fixtures/typical.json")).unwrap();
+        assert!(!s.sockets.is_empty());
     }
 
     #[test]

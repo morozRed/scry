@@ -1,5 +1,9 @@
 //! Reads the live process table. Every call here works without root.
 
+pub mod procinfo;
+pub mod pulse;
+pub mod sockets;
+
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::mem::{MaybeUninit, size_of};
@@ -18,6 +22,8 @@ use crate::model::{DiskSample, ProcId, Process, SNAPSHOT_SCHEMA, Snapshot};
 const KINFO_PROC_SIZE: usize = 648;
 const KINFO_STARTTIME_OFFSET: usize = 0;
 const KINFO_PID_OFFSET: usize = 40;
+const KINFO_STAT_OFFSET: usize = 36;
+const SZOMB: u8 = 5;
 
 unsafe extern "C" {
     fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *mut c_void) -> c_int;
@@ -42,6 +48,7 @@ pub fn scan() -> Result<Snapshot> {
         taken_at_ms: now_ms(),
         viewer_uid,
         processes,
+        ..Snapshot::default()
     })
 }
 
@@ -96,6 +103,38 @@ fn parse_kinfo(buf: &[u8]) -> Result<Vec<(i32, i64)>> {
     }
     let (records, _) = buf.as_chunks::<KINFO_PROC_SIZE>();
     Ok(records.iter().map(parse_record).collect())
+}
+
+/// A live process's start time, and whether it has exited and waits to be reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Liveness {
+    pub start_us: i64,
+    pub zombie: bool,
+}
+
+/// Reads one pid's start time straight from the kernel, for the identity check before a signal.
+pub fn liveness(pid: i32) -> Option<Liveness> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut rec = [0u8; KINFO_PROC_SIZE];
+    let mut len = KINFO_PROC_SIZE;
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            4,
+            rec.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != KINFO_PROC_SIZE {
+        return None;
+    }
+    let (got, start_us) = parse_record(&rec);
+    (got == pid).then_some(Liveness {
+        start_us,
+        zombie: rec[KINFO_STAT_OFFSET] == SZOMB,
+    })
 }
 
 fn parse_record(rec: &[u8; KINFO_PROC_SIZE]) -> (i32, i64) {
@@ -174,6 +213,10 @@ fn read_process(id: ProcId) -> Option<Process> {
         name: String::from_utf8_lossy(&comm).into_owned(),
         exe,
         footprint,
+        argv: None,
+        cwd: None,
+        project: None,
+        stamps: Default::default(),
     })
 }
 
