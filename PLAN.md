@@ -33,6 +33,11 @@ these hold on the reference Mac from a clean clone:
 7. **Every M0 to M6 exit criterion is a test or a recorded number.**
 8. **Each milestone lands as its own PR,** reviewed by agents that did not write
    it, with green CI.
+9. **It is ready to open-source.** A stranger can read the README, build it and
+   contribute: MIT `LICENSE`, `CONTRIBUTING.md`, crate metadata, planning notes
+   rewritten for outside readers under `docs/`, and `scripts/check-public.sh`
+   (run by local CI) finding no personal paths, emails, private IPs or
+   credentials in tracked files. Fixtures and screenshots use synthetic data.
 
 Left to the operator: publishing a Homebrew tap, Developer ID signing,
 installing hooks into the real `~/.claude/settings.json`, and leaving the
@@ -122,7 +127,7 @@ feature: `ssh` in and run `scry`.
  ▾ claude  scry                        134M          41m              live
    ├ node codegraph                     96M          41m   stamp
    └ paper mcp                          38M          41m   stamp
- ▸ codex   squake-api  (4 processes)   1.1G  :5173   3h               live
+ ▸ codex   billing-api (4 processes)   1.1G  :5173   3h               live
 ────────────────────────────────────────────────────────────────────────────────
  next dev   pid 48213   started 14:02
  :3000 is held by `next dev` in ~/acme/wt-auth. Its Claude Code session ended
