@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Cell, HighlightSpacing, Row, Table, TableState};
 
 use super::fit;
-use crate::tui::theme::{Chrome, Theme, glyph};
+use crate::tui::theme::{Theme, glyph};
 use crate::tui::views::{CellKind, Column, Shown, Sort, Width, is_numeric};
 
 const GAP: u16 = 2;
@@ -29,11 +29,6 @@ pub fn table(
     list: &ListView,
     offset: &Shared<usize>,
 ) -> Vec<(String, Rect)> {
-    let marker = if theme.chrome == Chrome::Panels {
-        "▌"
-    } else {
-        " "
-    };
     let inner = area.width.saturating_sub(1);
     let visible: Vec<usize> = (0..list.columns.len())
         .filter(|&i| list.columns[i].min_list_width <= area.width)
@@ -91,7 +86,7 @@ pub fn table(
         .header(header)
         .column_spacing(GAP)
         .row_highlight_style(theme.selection)
-        .highlight_symbol(Text::from(Span::styled(marker, theme.accent)))
+        .highlight_symbol(Text::from(Span::styled(" ", theme.accent)))
         .highlight_spacing(HighlightSpacing::Always);
     let mut state = TableState::default()
         .with_offset(offset.get())
@@ -146,12 +141,6 @@ fn first_cell<'a>(theme: &Theme, s: &Shown<'a>) -> Vec<Span<'a>> {
 
 fn cell_spans<'a>(theme: &Theme, cell: &crate::tui::views::Cell) -> Vec<Span<'a>> {
     match cell.kind {
-        CellKind::State(state) if theme.pills => {
-            vec![Span::styled(
-                format!(" {} ", state.word()),
-                theme.pill(state.tone()),
-            )]
-        }
         CellKind::State(state) => {
             let tone = theme.tone(state.tone());
             vec![

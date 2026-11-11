@@ -1,3 +1,5 @@
+//! Overview: one ranked list of what needs attention; enter opens the row it is about.
+
 use scry_core::view::{Board, Load, Tab, human_bytes};
 
 use super::{Cell, Column, Row, ViewDef};

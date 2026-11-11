@@ -2,8 +2,8 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::text::Span;
-use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
 use scry_core::view::{Load, Tab};
 
 use super::app::{App, Mode};
@@ -40,7 +40,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
     let [header, tabs, top, body, bottom, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(u16::from(theme.chrome != Chrome::Panels)),
+        Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(u16::from(rules)),
         Constraint::Length(1),
@@ -63,7 +63,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
             let shown = app.shown(&rows);
             count = Some((shown.len(), rows.len()));
             let cursor = app.cursor(&shown);
-            let (list, pane, beside) = split(f, body, theme, title);
+            let (list, pane, beside) = split(f, body, theme);
             let state = app.state();
             painted.rows = table::table(
                 f,
@@ -103,8 +103,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
                 Load::Unavailable(why) => Status::Unavailable(why),
                 Load::Failed(why) => Status::Failed(why),
             };
-            let inner = panel(f, body, theme, title);
-            states::status(f, inner, theme, title, status);
+            states::status(f, body, theme, title, status);
         }
     }
 
@@ -131,50 +130,34 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
 
 /// Splits the body into list and detail: below the list under 120 columns, beside it
 /// from 120.
-fn split(f: &mut Frame, body: Rect, theme: &Theme, title: &str) -> (Rect, Rect, bool) {
-    let beside = body.width >= BESIDE_FROM;
-    let (list, pane) = if beside {
+fn split(f: &mut Frame, body: Rect, theme: &Theme) -> (Rect, Rect, bool) {
+    let rules = theme.chrome == Chrome::Rules;
+    if body.width >= BESIDE_FROM {
         let w = (body.width * 36 / 100).clamp(40, 56);
-        let [l, gap, r] = Layout::horizontal([
+        let [list, gap, pane] = Layout::horizontal([
             Constraint::Min(0),
-            Constraint::Length(u16::from(theme.chrome != Chrome::Panels)),
+            Constraint::Length(1),
             Constraint::Length(w),
         ])
         .areas(body);
-        if theme.chrome == Chrome::Rules {
-            let bar = vec![ratatui::text::Line::raw("│"); gap.height as usize];
+        if rules {
+            let bar = vec![Line::raw("│"); gap.height as usize];
             f.render_widget(Paragraph::new(bar).style(theme.border), gap);
         }
-        (l, r)
+        (list, pane, true)
     } else {
         let h = if body.height >= 24 { 7 } else { 5 };
-        let h = h + 2 * u16::from(theme.chrome == Chrome::Panels);
-        let [l, gap, r] = Layout::vertical([
+        let [list, gap, pane] = Layout::vertical([
             Constraint::Min(0),
-            Constraint::Length(u16::from(theme.chrome == Chrome::Rules)),
+            Constraint::Length(u16::from(rules)),
             Constraint::Length(h),
         ])
         .areas(body);
-        if theme.chrome == Chrome::Rules {
+        if rules {
             chrome::rule(f, gap, theme);
         }
-        (l, r)
-    };
-    (panel(f, list, theme, title), pane, beside)
-}
-
-/// The list area, boxed for the Panels look.
-fn panel(f: &mut Frame, area: Rect, theme: &Theme, title: &str) -> Rect {
-    if theme.chrome != Chrome::Panels {
-        return area;
+        (list, pane, false)
     }
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(theme.border)
-        .title(Span::styled(format!(" {title} "), theme.strong));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    inner
 }
 
 fn footer_left<'a>(app: &App, count: Option<(usize, usize)>) -> Vec<Span<'a>> {

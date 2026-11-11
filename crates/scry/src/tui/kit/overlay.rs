@@ -16,7 +16,7 @@ fn card(theme: &Theme, borders: Borders) -> Block<'static> {
         .style(theme.surface);
     match theme.chrome {
         Chrome::Rules => block,
-        _ => block.border_type(BorderType::Rounded),
+        Chrome::Bands => block.border_type(BorderType::Rounded),
     }
 }
 
@@ -55,11 +55,7 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
         ]));
     }
 
-    let borders = match theme.chrome {
-        Chrome::Panels => Borders::ALL,
-        _ => Borders::TOP,
-    };
-    let block = card(theme, borders).padding(Padding::new(2, 2, 1, 1));
+    let block = card(theme, Borders::TOP).padding(Padding::new(2, 2, 1, 1));
     let probe = block.inner(body);
     let head = text.len() as u16 + wrapped_extra(what, probe.width) + 1;
     let height = ((body.height - probe.height) + head + 1 + n as u16).min(body.height);

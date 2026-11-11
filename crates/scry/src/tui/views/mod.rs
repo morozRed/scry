@@ -8,6 +8,7 @@ mod ports;
 mod worktrees;
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use scry_core::view::{Board, Detail, Load, State, Tab, Target};
 
@@ -195,7 +196,7 @@ pub fn shown<'a>(
     rows: &'a [Row],
     sort: Option<Sort>,
     filter: &str,
-    collapsed: &std::collections::HashSet<String>,
+    collapsed: &HashSet<String>,
 ) -> Vec<Shown<'a>> {
     let tree = rows.iter().any(|r| r.depth > 0);
     let order = sorted(rows, sort);

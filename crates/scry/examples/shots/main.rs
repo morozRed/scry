@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use scry::tui::app::{App, Source};
 use scry::tui::theme::{Colors, Look, Rgb, SHIPPED, Theme};
-use scry::tui::{App, Source, ui};
+use scry::tui::ui;
 use scry_core::view::{Board, Load};
 use svg::{Palette, TERMINAL_BASIC, TOMORROW_NIGHT};
 
@@ -23,11 +24,7 @@ fn main() -> anyhow::Result<()> {
     let design = Board::parse(&std::fs::read_to_string(root.join("fixtures/design.json"))?)?;
     let mut n = 0;
 
-    for (look, name) in [
-        (Look::Native, "native"),
-        (Look::Tinted, "tinted"),
-        (Look::Panels, "panels"),
-    ] {
+    for (look, name) in [(Look::Native, "native"), (Look::Tinted, "tinted")] {
         for pal in PALETTES {
             for (w, h) in SIZES {
                 let theme = Theme::new(look, colors(look, pal));

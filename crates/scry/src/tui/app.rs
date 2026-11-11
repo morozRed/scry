@@ -1,3 +1,6 @@
+//! The UI model and its update: what is on screen, which mode the keys are in, and how
+//! each key changes it. Nothing here draws.
+
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

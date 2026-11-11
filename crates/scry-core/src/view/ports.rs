@@ -1,3 +1,5 @@
+//! The Ports view model.
+
 use serde::{Deserialize, Serialize};
 
 use super::{Detail, Evidence, State, Target};

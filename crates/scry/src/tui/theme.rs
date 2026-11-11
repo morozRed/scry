@@ -87,16 +87,14 @@ pub enum Chrome {
     Rules,
     /// Tinted bands behind the header, detail and footer, no lines.
     Bands,
-    /// Rounded boxes around the list and the detail.
-    Panels,
 }
 
-/// The looks compared in docs/design.md.
+/// The looks compared in docs/design.md. Native is also what Tinted falls back to
+/// without truecolor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Look {
     Native,
     Tinted,
-    Panels,
 }
 
 pub const SHIPPED: Look = Look::Tinted;
@@ -121,8 +119,6 @@ pub struct Theme {
     pub key: Style,
     pub matched: Style,
     pub tab_active: Style,
-    /// States drawn as filled pills instead of glyph and word.
-    pub pills: bool,
     /// Set only for truecolor, where fades can be computed.
     pub motion: Option<MotionColors>,
 }
@@ -144,12 +140,6 @@ impl Theme {
             (Look::Tinted, Colors::True { bg, fg }) => tinted(bg, fg),
             (Look::Tinted, other) => Theme::new(Look::Native, other),
             (Look::Native, c) => native(c),
-            (Look::Panels, c) => Theme {
-                chrome: Chrome::Panels,
-                pills: c != Colors::Mono,
-                selection: Style::new().add_modifier(Modifier::BOLD),
-                ..native(c)
-            },
         }
     }
 
@@ -160,14 +150,6 @@ impl Theme {
             Tone::Warn => self.warn,
             Tone::Danger => self.danger,
             Tone::Quiet => self.muted,
-        }
-    }
-
-    /// A pill: the tone as background, for looks that use them.
-    pub fn pill(&self, tone: Tone) -> Style {
-        match (tone, self.tone(tone).fg) {
-            (Tone::Quiet, _) | (_, None) => self.tone(tone).add_modifier(Modifier::REVERSED),
-            (_, Some(c)) => Style::new().fg(Color::Black).bg(c),
         }
     }
 }
@@ -205,13 +187,13 @@ fn native(colors: Colors) -> Theme {
         key: bold,
         matched: paint(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         tab_active: paint(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        pills: false,
         motion: None,
     }
 }
 
-/// Hues chosen for contrast of at least 4.5:1 on common light and dark backgrounds; the
-/// neutrals are mixed from the terminal's own background and foreground.
+/// Each hue keeps 5:1 contrast or more on white, Solarized light, black, Tomorrow Night and
+/// One Dark backgrounds, and 3.7:1 on the selection tint. The neutrals are mixed from the
+/// terminal's own background and foreground.
 fn tinted(bg: Rgb, fg: Rgb) -> Theme {
     let dark = bg.luma() < fg.luma();
     let [accent, ok, info, warn, danger] = if dark {
@@ -225,16 +207,16 @@ fn tinted(bg: Rgb, fg: Rgb) -> Theme {
     } else {
         [
             Rgb(0x2f, 0x5f, 0xd0),
-            Rgb(0x1e, 0x7f, 0x45),
-            Rgb(0x10, 0x80, 0x8c),
-            Rgb(0x9a, 0x5b, 0x00),
-            Rgb(0xc6, 0x30, 0x3e),
+            Rgb(0x1b, 0x73, 0x40),
+            Rgb(0x0c, 0x74, 0x80),
+            Rgb(0x93, 0x57, 0x00),
+            Rgb(0xc0, 0x2d, 0x3b),
         ]
     };
     let s = Style::new();
     let text = fg.mix(bg, 0.06);
     let surface = bg.mix(fg, if dark { 0.07 } else { 0.05 });
-    let select = bg.mix(accent, if dark { 0.24 } else { 0.14 });
+    let select = bg.mix(accent, if dark { 0.16 } else { 0.10 });
     Theme {
         chrome: Chrome::Bands,
         text: s.fg(text.into()),
@@ -256,7 +238,6 @@ fn tinted(bg: Rgb, fg: Rgb) -> Theme {
             .fg(accent.into())
             .bg(select.into())
             .add_modifier(Modifier::BOLD),
-        pills: false,
         motion: Some(MotionColors {
             bg,
             fg: text,

@@ -48,8 +48,8 @@ pub fn header(f: &mut Frame, area: Rect, theme: &Theme, board: &Board, source: &
         spans.push(Span::raw("   "));
     }
     let used = width(&spans);
-    if used + source.content.len() <= room {
-        spans.push(Span::raw(" ".repeat(room - used - source.content.len())));
+    if used + source.width() <= room {
+        spans.push(Span::raw(" ".repeat(room - used - source.width())));
         spans.push(source);
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);

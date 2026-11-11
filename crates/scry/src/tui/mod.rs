@@ -30,9 +30,9 @@ use scry_core::view::{Board, Tone};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-pub use app::{Action, App, Mode, Source};
+use app::{Action, App, Mode, Source};
 use motion::Motion;
-pub use theme::Theme;
+use theme::Theme;
 
 const SAMPLE_EVERY: Duration = Duration::from_secs(2);
 const INPUT_POLL: Duration = Duration::from_millis(250);

@@ -1,3 +1,5 @@
+//! Agents: sessions as a tree with the processes they own, leftovers flagged.
+
 use scry_core::view::agents::{reap_targets, stop_target};
 use scry_core::view::{Board, Load, State, Tab, Target, human_age, human_bytes};
 

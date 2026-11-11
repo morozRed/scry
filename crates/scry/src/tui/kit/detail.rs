@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use scry_core::view::Detail;
 
 use super::{fill, width};
@@ -13,22 +13,16 @@ use crate::tui::theme::{Chrome, Theme};
 
 pub fn detail(f: &mut Frame, area: Rect, theme: &Theme, d: &Detail, beside: bool) {
     let block = match theme.chrome {
-        Chrome::Panels => Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(theme.border)
-            .title(Span::styled(format!(" {} ", d.title), theme.strong))
-            .padding(Padding::horizontal(1)),
         Chrome::Bands => {
             fill(f, area, theme.surface);
             Block::new().padding(Padding::new(2, 2, u16::from(beside), 0))
         }
         Chrome::Rules => Block::new().padding(Padding::horizontal(1)),
     };
-    let titled = theme.chrome != Chrome::Panels;
     let lines = if beside {
-        tall(theme, d, titled)
+        tall(theme, d)
     } else {
-        wide(theme, d, titled, block.inner(area).width as usize)
+        wide(theme, d, block.inner(area).width as usize)
     };
     f.render_widget(
         Paragraph::new(lines)
@@ -39,19 +33,10 @@ pub fn detail(f: &mut Frame, area: Rect, theme: &Theme, d: &Detail, beside: bool
 }
 
 /// Facts share the title line; the ones that do not fit are left for the wider layout.
-fn wide<'a>(theme: &Theme, d: &'a Detail, titled: bool, room: usize) -> Vec<Line<'a>> {
-    let mut head = Vec::new();
-    if titled {
-        head.push(Span::styled(d.title.as_str(), theme.strong));
-    }
+fn wide<'a>(theme: &Theme, d: &'a Detail, room: usize) -> Vec<Line<'a>> {
+    let mut head = vec![Span::styled(d.title.as_str(), theme.strong)];
     for (i, fact) in d.facts.iter().enumerate() {
-        let sep = if i == 0 && titled {
-            "   "
-        } else if i == 0 {
-            ""
-        } else {
-            "  ·  "
-        };
+        let sep = if i == 0 { "   " } else { "  ·  " };
         let more = [
             Span::styled(sep, theme.faint),
             Span::styled(format!("{} ", fact.label), theme.muted),
@@ -75,12 +60,8 @@ fn wide<'a>(theme: &Theme, d: &'a Detail, titled: bool, room: usize) -> Vec<Line
     lines
 }
 
-fn tall<'a>(theme: &Theme, d: &'a Detail, titled: bool) -> Vec<Line<'a>> {
-    let mut lines = Vec::new();
-    if titled {
-        lines.push(Line::styled(d.title.as_str(), theme.strong));
-        lines.push(Line::raw(""));
-    }
+fn tall<'a>(theme: &Theme, d: &'a Detail) -> Vec<Line<'a>> {
+    let mut lines = vec![Line::styled(d.title.as_str(), theme.strong), Line::raw("")];
     let pad = d.facts.iter().map(|f| f.label.len()).max().unwrap_or(0) + 2;
     for fact in &d.facts {
         lines.push(Line::from(vec![

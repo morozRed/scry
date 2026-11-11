@@ -1,3 +1,5 @@
+//! Screen snapshots from fixtures and the key-handling state machine.
+
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

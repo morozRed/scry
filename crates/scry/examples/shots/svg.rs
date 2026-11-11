@@ -45,7 +45,7 @@ pub const TERMINAL_BASIC: Palette = Palette {
     ],
 };
 
-/// Tomorrow Night, the palette Ghostty ships by default.
+/// Tomorrow Night, a common dark palette.
 pub const TOMORROW_NIGHT: Palette = Palette {
     name: "dark",
     bg: hex(0x1d1f21),

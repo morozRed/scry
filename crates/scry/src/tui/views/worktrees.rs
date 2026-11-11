@@ -1,3 +1,5 @@
+//! Worktrees: state, size and probable creator. Not collected yet, so it says so.
+
 use scry_core::view::{Board, Load, Tab};
 
 use super::{Row, ViewDef};

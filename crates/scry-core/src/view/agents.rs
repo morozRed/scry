@@ -1,3 +1,5 @@
+//! The Agents view model and the reap rule's target selection.
+
 use serde::{Deserialize, Serialize};
 
 use super::{Detail, Evidence, State, Target};

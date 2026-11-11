@@ -1,3 +1,5 @@
+//! Ports: listening sockets with the process, project and session behind each.
+
 use scry_core::view::{Board, Load, State, Tab, human_age};
 
 use super::{Cell, Column, Row, ViewDef};
