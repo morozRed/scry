@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Result;
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -17,11 +18,14 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use scry_core::Snapshot;
 use scry_core::view::{Overview, Tab};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 const MIN_W: u16 = 80;
 const MIN_H: u16 = 24;
 const SAMPLE_EVERY: Duration = Duration::from_secs(2);
 const INPUT_POLL: Duration = Duration::from_millis(250);
+const SIGNAL_GRACE: Duration = Duration::from_secs(1);
 
 pub enum Source {
     Live,
@@ -120,13 +124,7 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     let mut app = App::new(crate::load(fixture)?, source);
 
     let stop = Arc::new(AtomicBool::new(false));
-    for sig in [
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-        signal_hook::consts::SIGINT,
-    ] {
-        signal_hook::flag::register(sig, Arc::clone(&stop))?;
-    }
+    watch_signals(Arc::clone(&stop))?;
 
     let (tx, rx) = mpsc::channel();
     if live {
@@ -185,10 +183,29 @@ fn event_loop(
     Ok(())
 }
 
+/// SIGTERM and SIGINT ask the loop to stop and restore the terminal. A hung-up terminal can
+/// leave crossterm spinning inside `poll`, where the loop never sees the flag, so SIGHUP
+/// exits at once and the others exit after a grace period.
+fn watch_signals(stop: Arc<AtomicBool>) -> Result<()> {
+    let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])?;
+    std::thread::spawn(move || {
+        let Some(sig) = signals.forever().next() else {
+            return;
+        };
+        stop.store(true, Ordering::Relaxed);
+        if sig != SIGHUP {
+            std::thread::sleep(SIGNAL_GRACE);
+            ratatui::restore();
+        }
+        std::process::exit(128 + sig);
+    });
+    Ok(())
+}
+
 /// Ctrl-Z: give the shell its terminal back, stop, and take it again on `fg`.
 fn suspend(terminal: &mut DefaultTerminal) -> Result<()> {
     disable_raw_mode()?;
-    execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    execute!(std::io::stdout(), LeaveAlternateScreen, Show)?;
     unsafe { libc::raise(libc::SIGTSTP) };
     enable_raw_mode()?;
     execute!(std::io::stdout(), EnterAlternateScreen)?;

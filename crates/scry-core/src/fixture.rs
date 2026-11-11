@@ -21,11 +21,20 @@ pub fn parse(text: &str) -> Result<Snapshot> {
     Ok(snap)
 }
 
+/// The home directory to redact, from `HOME` or the password database.
+pub fn home_dir() -> Result<String> {
+    let home = std::env::home_dir()
+        .map(|p| p.to_string_lossy().trim_end_matches('/').to_string())
+        .unwrap_or_default();
+    if home.is_empty() {
+        bail!("cannot tell the home directory, so a redacted snapshot cannot be written");
+    }
+    Ok(home)
+}
+
 /// Rewrites anything that names the person: the home directory becomes `~`.
-pub fn redact(mut snap: Snapshot, home: Option<&str>) -> Snapshot {
-    let Some(home) = home.filter(|h| h.len() > 1) else {
-        return snap;
-    };
+pub fn redact(mut snap: Snapshot, home: &str) -> Snapshot {
+    let home = home.trim_end_matches('/');
     for p in &mut snap.processes {
         if let Some(exe) = &mut p.exe
             && let Some(rest) = exe.strip_prefix(home)
@@ -63,9 +72,11 @@ mod tests {
 
     #[test]
     fn redact_rewrites_home_but_not_a_lookalike_prefix() {
-        let s = redact(snap_with_exe("/Users/ann/bin/x"), Some("/Users/ann"));
+        let s = redact(snap_with_exe("/Users/ann/bin/x"), "/Users/ann");
         assert_eq!(s.processes[0].exe.as_deref(), Some("~/bin/x"));
-        let s = redact(snap_with_exe("/Users/anna/bin/x"), Some("/Users/ann"));
+        let s = redact(snap_with_exe("/Users/ann/bin/x"), "/Users/ann/");
+        assert_eq!(s.processes[0].exe.as_deref(), Some("~/bin/x"));
+        let s = redact(snap_with_exe("/Users/anna/bin/x"), "/Users/ann");
         assert_eq!(s.processes[0].exe.as_deref(), Some("/Users/anna/bin/x"));
     }
 

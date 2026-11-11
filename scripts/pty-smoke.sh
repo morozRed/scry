@@ -51,11 +51,25 @@ t send-keys -t smoke "$RUN" Enter
 wait_for "Nothing needs attention"
 t send-keys -t smoke C-z
 check "Ctrl-Z leaves the alternate screen" "Stopped"
+if [ "$(t display -p -t smoke '#{cursor_flag}')" = 1 ]; then echo "ok   Ctrl-Z shows the cursor"; else echo "FAIL Ctrl-Z shows the cursor"; fails=$((fails + 1)); fi
 t send-keys -t smoke fg Enter
 if wait_for "Nothing needs attention"; then echo "ok   fg redraws the TUI"; else echo "FAIL fg redraws the TUI"; fails=$((fails + 1)); fi
 t send-keys -t smoke q
 sleep 0.3
 t send-keys -t smoke "stty -a | grep -o -- '-\{0,1\}icanon' | sed 's/^/RESUMED=/'" Enter
 check "quit after resume restores the terminal" "RESUMED=icanon"
+
+t new-window -d -t smoke -n hup "$BIN tui --fixture $FIX"
+sleep 1
+hup_pid=$(pgrep -f "^$BIN tui --fixture" | head -1)
+t kill-window -t smoke:hup
+sleep 2
+if [ -n "$hup_pid" ] && ! kill -0 "$hup_pid" 2>/dev/null; then
+  echo "ok   a closed terminal ends the TUI"
+else
+  echo "FAIL a closed terminal ends the TUI (pid ${hup_pid:-none} still running)"
+  [ -n "$hup_pid" ] && kill -9 "$hup_pid" 2>/dev/null
+  fails=$((fails + 1))
+fi
 
 [ "$fails" -eq 0 ] && echo "pty smoke: all passed" || { echo "pty smoke: $fails failed"; exit 1; }

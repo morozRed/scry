@@ -1,6 +1,6 @@
 //! Reads the live process table. Every call here works without root.
 
-use std::ffi::CStr;
+use std::collections::HashMap;
 use std::mem::{MaybeUninit, size_of};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,9 +23,16 @@ unsafe extern "C" {
 pub fn scan() -> Result<Snapshot> {
     let starts = all_pids_with_start()?;
     let viewer_uid = unsafe { libc::getuid() };
-    let processes = starts
+    let read: Vec<Process> = starts
         .into_iter()
         .filter_map(|(pid, start_us)| read_process(ProcId { pid, start_us }))
+        .collect();
+    // A pid can exit and be reused while its details are read. Reading the table again
+    // brackets those reads: a record whose pid is gone or restarted could mix two processes.
+    let still: HashMap<i32, i64> = all_pids_with_start()?.into_iter().collect();
+    let processes = read
+        .into_iter()
+        .filter(|p| still.get(&p.id.pid) == Some(&p.id.start_us))
         .collect();
     let taken_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -89,30 +96,34 @@ fn parse_kinfo(buf: &[u8]) -> Result<Vec<(i32, i64)>> {
         );
     }
     let (records, _) = buf.as_chunks::<KINFO_PROC_SIZE>();
-    Ok(records
-        .iter()
-        .map(|rec| {
-            let at = |o: usize, n: usize| &rec[o..o + n];
-            let sec = i64::from_ne_bytes(at(KINFO_STARTTIME_OFFSET, 8).try_into().unwrap());
-            let usec = i32::from_ne_bytes(at(KINFO_STARTTIME_OFFSET + 8, 4).try_into().unwrap());
-            let pid = i32::from_ne_bytes(at(KINFO_PID_OFFSET, 4).try_into().unwrap());
-            (pid, sec * 1_000_000 + i64::from(usec))
-        })
-        .collect())
+    Ok(records.iter().map(parse_record).collect())
+}
+
+fn parse_record(rec: &[u8; KINFO_PROC_SIZE]) -> (i32, i64) {
+    let at = |o: usize, n: usize| &rec[o..o + n];
+    let sec = i64::from_ne_bytes(at(KINFO_STARTTIME_OFFSET, 8).try_into().unwrap());
+    let usec = i32::from_ne_bytes(at(KINFO_STARTTIME_OFFSET + 8, 4).try_into().unwrap());
+    let pid = i32::from_ne_bytes(at(KINFO_PID_OFFSET, 4).try_into().unwrap());
+    (pid, sec * 1_000_000 + i64::from(usec))
 }
 
 fn read_process(id: ProcId) -> Option<Process> {
     let info = short_bsd_info(id.pid)?;
-    let name = unsafe { CStr::from_ptr(info.pbsi_comm.as_ptr()) }
-        .to_string_lossy()
-        .into_owned();
+    let exe = exe_path(id.pid);
+    let footprint = footprint(id.pid);
+    let comm: Vec<u8> = info
+        .pbsi_comm
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
     Some(Process {
         id,
         ppid: info.pbsi_ppid as i32,
         uid: info.pbsi_uid,
-        name,
-        exe: exe_path(id.pid),
-        footprint: footprint(id.pid),
+        name: String::from_utf8_lossy(&comm).into_owned(),
+        exe,
+        footprint,
     })
 }
 

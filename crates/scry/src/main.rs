@@ -93,8 +93,7 @@ fn print_overview(snap: &Snapshot, json: bool) -> Result<()> {
 }
 
 fn snapshot(out: Option<PathBuf>) -> Result<()> {
-    let home = std::env::var("HOME").ok();
-    let snap = fixture::redact(sys::scan()?, home.as_deref());
+    let snap = fixture::redact(sys::scan()?, &fixture::home_dir()?);
     let text = serde_json::to_string_pretty(&snap)?;
     match out {
         Some(path) => {
