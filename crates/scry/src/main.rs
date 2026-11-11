@@ -1,3 +1,5 @@
+mod daemon_cmd;
+mod doctor_cmd;
 mod tui;
 
 use std::io::IsTerminal;
@@ -42,6 +44,16 @@ enum Command {
         #[command(subcommand)]
         what: BenchWhat,
     },
+    /// Install, inspect or run the background recorder.
+    Daemon {
+        #[command(subcommand)]
+        action: daemon_cmd::Action,
+    },
+    /// Check that Scry can work on this Mac, with a fix for each problem.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -71,6 +83,8 @@ fn main() -> Result<()> {
         Some(Command::Bench {
             what: BenchWhat::Scan { runs, json },
         }) => bench_scan(runs, json),
+        Some(Command::Daemon { action }) => daemon_cmd::run(action),
+        Some(Command::Doctor { json }) => doctor_cmd::run(json),
     }
 }
 

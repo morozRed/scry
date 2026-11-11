@@ -32,6 +32,19 @@ pub struct Snapshot {
     pub processes: Vec<Process>,
 }
 
+/// One `statfs` reading of a volume. Bytes, from block counts times the block size.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskSample {
+    pub at_ms: i64,
+    /// Mount point.
+    pub volume: String,
+    pub total_bytes: u64,
+    /// Free blocks, including those reserved for root.
+    pub free_bytes: u64,
+    /// What an unprivileged process can still write.
+    pub avail_bytes: u64,
+}
+
 impl Snapshot {
     pub fn own_processes(&self) -> impl Iterator<Item = &Process> {
         self.processes.iter().filter(|p| p.uid == self.viewer_uid)
