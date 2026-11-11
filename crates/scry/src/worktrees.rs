@@ -5,8 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use clap::Args;
-use scry_core::fixture::home_dir;
-use scry_core::worktree::view::{Status, WorktreesView, bytes};
+use scry_core::config::Config;
+use scry_core::paths::Paths;
+use scry_core::worktree::view::{WorktreesView, bytes};
 use scry_core::worktree::{self, ScanOptions, Timings, WorktreeScan};
 use serde::Serialize;
 
@@ -14,8 +15,8 @@ use serde::Serialize;
 pub struct WorktreesArgs {
     #[arg(long)]
     json: bool,
-    /// A folder to look for repos in. Repeat for more. Defaults to those of ~/sources,
-    /// ~/code, ~/src and ~/Developer that exist.
+    /// A folder to look for repos in. Repeat for more. Defaults to `code_roots` from the
+    /// config file.
     #[arg(long = "root", value_name = "DIR")]
     roots: Vec<PathBuf>,
     /// Skip sizing, which walks every file and takes most of the time.
@@ -34,13 +35,13 @@ pub struct BenchArgs {
 }
 
 fn options(roots: Vec<PathBuf>) -> Result<ScanOptions> {
-    let home = PathBuf::from(home_dir()?);
+    let paths = Paths::from_env()?;
     let roots = if roots.is_empty() {
-        worktree::default_roots(&home)
+        Config::load(&paths)?.0.code_roots
     } else {
         roots
     };
-    Ok(ScanOptions::new(&home, roots))
+    Ok(ScanOptions::new(&paths.user_home, roots))
 }
 
 pub fn run(args: WorktreesArgs) -> Result<()> {
@@ -78,9 +79,8 @@ pub fn run(args: WorktreesArgs) -> Result<()> {
         eprintln!("warning: {w}");
     }
     println!(
-        "{} Scanned {} repos in {:.1} s.",
+        "{} Took {:.1} s.",
         view.summary,
-        scan.repos,
         scan.timings.total_ms / 1000.0
     );
     Ok(())
@@ -101,7 +101,9 @@ fn print_table(view: &WorktreesView) {
                 clip(&r.repo, 18),
                 clip(&r.branch, 28),
                 size(r.allocated),
-                size(r.reclaimable),
+                // Reclaimable is a lower bound.
+                r.reclaimable
+                    .map_or("-".into(), |b| format!("≥ {}", bytes(b))),
                 r.creator.clone(),
                 r.last_commit.clone().unwrap_or_else(|| "-".into()),
             ]
@@ -163,12 +165,11 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         })
         .collect();
     let last = scans.last().expect("at least one run");
-    let worktrees = last.worktrees.len();
-    let removable = last
-        .worktrees
-        .iter()
-        .filter(|w| Status::of(w).removable())
-        .count();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    // The same view as `scry worktrees`, so both print the same counts.
+    let view = WorktreesView::new(last, now, &opts.home);
     let entries: u64 = last
         .worktrees
         .iter()
@@ -190,9 +191,11 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     if args.json {
         let v = serde_json::json!({
             "roots": opts.roots,
-            "repos": last.repos,
-            "worktrees": worktrees,
-            "removable": removable,
+            "repos_scanned": last.repos,
+            "repos": view.repos,
+            "worktrees": view.rows.len(),
+            "counts": view.counts,
+            "can_go_frees_at_least": view.reclaimable,
             "entries_sized": entries,
             "runs": args.runs,
             "first": first,
@@ -200,9 +203,9 @@ pub fn bench(args: BenchArgs) -> Result<()> {
         });
         println!("{v}");
     } else {
+        println!("{}", view.summary);
         println!(
-            "{worktrees} worktrees in {} repos, {entries} entries sized, {removable} removable, under {}.",
-            last.repos,
+            "{entries} entries sized under {}.",
             show_roots(&opts.roots, &opts.home)
         );
         println!(

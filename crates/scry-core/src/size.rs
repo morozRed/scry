@@ -1,23 +1,28 @@
-//! Sizes subtrees in one `getattrlistbulk` walk: the bytes they hold on disk and the bytes a
-//! delete gives back at once. The Worktrees view sizes each worktree with it; the Disk view
-//! sizes catalog entries with it.
+//! Sizes subtrees in one `getattrlistbulk` walk: the bytes they hold on disk and at least the
+//! bytes a delete gives back at once. The Worktrees view sizes each worktree with it; the Disk
+//! view sizes catalog entries with it.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Once};
 
 use libc::c_void;
 use serde::Serialize;
+
+use crate::protected::{FileId, Protected, Resolved, file_id};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Size {
     /// Bytes on disk (`ATTR_FILE_ALLOCSIZE`), each hard-linked file counted once.
     pub allocated: u64,
-    /// Bytes freed at once if the subtree were deleted (`ATTR_CMNEXT_PRIVATESIZE`). Blocks
-    /// shared with a clone or a snapshot do not count, nor does a hard-linked file with a
-    /// link outside the subtree.
+    /// A lower bound on the bytes freed at once if the subtree were deleted: the sum of each
+    /// file's private bytes (`ATTR_CMNEXT_PRIVATESIZE`). Blocks shared with a clone or a
+    /// snapshot do not count, nor does a hard-linked file with a link outside the subtree.
+    /// Two clones of one file inside the subtree each report their shared blocks as not
+    /// private, though deleting both frees them, and the kernel offers no count of that.
     pub reclaimable: u64,
 }
 
@@ -32,13 +37,9 @@ pub struct SubtreeSize {
     pub error: Option<String>,
 }
 
-/// Folders a scan never enters, because reading them makes macOS ask the user for permission
-/// in the name of the terminal app.
-pub const PROTECTED: [&str; 3] = ["Desktop", "Documents", "Downloads"];
-
 pub struct Walker {
-    exclude: HashSet<PathBuf>,
-    protected: Vec<PathBuf>,
+    exclude: HashSet<FileId>,
+    protected: Protected,
     threads: usize,
 }
 
@@ -50,15 +51,20 @@ impl Walker {
         let threads = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(2));
         Walker {
             exclude: HashSet::new(),
-            protected: PROTECTED.iter().map(|d| canonical(&home.join(d))).collect(),
+            protected: Protected::new(home),
             threads,
         }
     }
 
     /// Folders not to enter when met inside a subtree, such as a worktree nested in another.
     pub fn exclude(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        self.exclude
-            .extend(paths.into_iter().map(|p| canonical(&p)));
+        for p in paths {
+            if let Resolved::Outside(p) = self.protected.resolve(&p)
+                && let Ok(m) = std::fs::metadata(&p)
+            {
+                self.exclude.insert(file_id(&m));
+            }
+        }
         self
     }
 
@@ -70,23 +76,27 @@ impl Walker {
     /// Sizes each subtree, in order. A hard-linked file inside two subtrees is allocated to
     /// the first one walked, and is reclaimable only from a subtree that holds all its links.
     pub fn measure(&self, roots: &[PathBuf]) -> Vec<SubtreeSize> {
+        raise_fd_limit();
         let mut out = vec![SubtreeSize::default(); roots.len()];
         let mut jobs = Vec::new();
-        let mut devs = Vec::with_capacity(roots.len());
+        let mut devs = vec![0; roots.len()];
         for (i, root) in roots.iter().enumerate() {
-            let root = canonical(root);
-            devs.push(0);
-            if let Some(p) = self.protected.iter().find(|p| root.starts_with(p)) {
-                out[i].error = Some(format!("{} is never read", p.display()));
-                continue;
-            }
-            match std::fs::symlink_metadata(&root) {
-                Ok(m) if m.is_dir() => {
-                    devs[i] = std::os::darwin::fs::MetadataExt::st_dev(&m) as i32;
-                    out[i].dirs = 1;
-                    jobs.push(Job { dir: root, tree: i });
+            let root = match self.protected.resolve(root) {
+                Resolved::Inside(folder) => {
+                    out[i].error = Some(format!("{} is a protected folder", folder.display()));
+                    continue;
                 }
-                Ok(_) => out[i].error = Some("not a directory".into()),
+                Resolved::Outside(root) => root,
+            };
+            match open_root(&root) {
+                Ok((fd, id)) => {
+                    devs[i] = id.0;
+                    out[i].dirs = 1;
+                    jobs.push(Job {
+                        dir: Open::Root(fd),
+                        tree: i,
+                    });
+                }
                 Err(e) => out[i].error = Some(e.to_string()),
             }
         }
@@ -97,7 +107,7 @@ impl Walker {
             state: Mutex::new(QueueState { jobs, busy: 0 }),
             ready: Condvar::new(),
         };
-        let links: Mutex<HashMap<(i32, u64), Link>> = Mutex::new(HashMap::new());
+        let links: Mutex<HashMap<FileId, Link>> = Mutex::new(HashMap::new());
         let ctx = Ctx {
             walker: self,
             devs: &devs,
@@ -130,13 +140,70 @@ impl Walker {
     }
 }
 
-fn canonical(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+/// A queued folder keeps its parent open until it is opened itself, so a deep tree walked by
+/// several threads can hold more descriptors than macOS's default soft limit of 256.
+fn raise_fd_limit() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let mut r = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+            return;
+        }
+        // OPEN_MAX, the most setrlimit accepts on macOS.
+        let want = r.rlim_max.min(10_240);
+        if r.rlim_cur < want {
+            r.rlim_cur = want;
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
+        }
+    });
+}
+
+fn fstat_id(fd: &OwnedFd) -> Option<FileId> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0).then_some((st.st_dev, st.st_ino))
+}
+
+const DIR_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+fn open_root(path: &Path) -> std::io::Result<(OwnedFd, FileId)> {
+    let c = CString::new(path.as_os_str().as_bytes())?;
+    let fd = unsafe { libc::open(c.as_ptr(), DIR_FLAGS) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let id = fstat_id(&fd).ok_or_else(std::io::Error::last_os_error)?;
+    Ok((fd, id))
+}
+
+/// Opens the folder `name` inside `parent`, never through a symlink, and only if it is still
+/// the folder that was listed: same device, same inode.
+fn open_child(parent: &OwnedFd, name: &CStr, listed: FileId) -> Option<OwnedFd> {
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), DIR_FLAGS) };
+    if fd < 0 {
+        return None;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    (fstat_id(&fd)? == listed).then_some(fd)
 }
 
 struct Job {
-    dir: PathBuf,
+    dir: Open,
     tree: usize,
+}
+
+enum Open {
+    Root(OwnedFd),
+    /// A folder found inside `parent`, opened relative to it when its turn comes.
+    Child {
+        parent: Arc<OwnedFd>,
+        name: CString,
+        id: FileId,
+    },
 }
 
 struct QueueState {
@@ -196,9 +263,10 @@ struct Tally {
 
 struct Ctx<'a> {
     walker: &'a Walker,
+    /// The device of each subtree's root. Nothing on another device is counted.
     devs: &'a [i32],
     queue: &'a Queue,
-    links: &'a Mutex<HashMap<(i32, u64), Link>>,
+    links: &'a Mutex<HashMap<FileId, Link>>,
     trees: usize,
 }
 
@@ -207,33 +275,31 @@ impl Ctx<'_> {
         let mut tally = vec![Tally::default(); self.trees];
         let mut buf = vec![0u8; 128 * 1024];
         while let Some(job) = self.queue.next() {
-            let found = self.read_dir(&job, &mut buf, &mut tally[job.tree]);
+            let tree = job.tree;
+            let found = self.read_dir(job, &mut buf, &mut tally[tree]);
             self.queue.finish(found);
         }
         tally
     }
 
-    fn read_dir(&self, job: &Job, buf: &mut [u8], t: &mut Tally) -> Vec<Job> {
+    fn read_dir(&self, job: Job, buf: &mut [u8], t: &mut Tally) -> Vec<Job> {
         let mut found = Vec::new();
-        let Ok(cpath) = CString::new(job.dir.as_os_str().as_bytes()) else {
-            t.skipped += 1;
-            return found;
+        let fd = match job.dir {
+            Open::Root(fd) => fd,
+            Open::Child { parent, name, id } => match open_child(&parent, &name, id) {
+                Some(fd) => fd,
+                None => {
+                    t.skipped += 1;
+                    return found;
+                }
+            },
         };
-        let fd = unsafe {
-            libc::open(
-                cpath.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            t.skipped += 1;
-            return found;
-        }
+        let fd = Arc::new(fd);
         let mut list = ATTR_LIST;
         loop {
             let n = unsafe {
                 libc::getattrlistbulk(
-                    fd,
+                    fd.as_raw_fd(),
                     (&raw mut list).cast::<c_void>(),
                     buf.as_mut_ptr().cast(),
                     buf.len(),
@@ -253,30 +319,47 @@ impl Ctx<'_> {
                     break;
                 };
                 at += entry.len;
-                self.count(job, entry, t, &mut found);
+                self.count(job.tree, &fd, entry, t, &mut found);
             }
         }
-        unsafe { libc::close(fd) };
         found
     }
 
-    fn count(&self, job: &Job, e: Entry, t: &mut Tally, found: &mut Vec<Job>) {
+    fn count(
+        &self,
+        tree: usize,
+        dir: &Arc<OwnedFd>,
+        e: Entry,
+        t: &mut Tally,
+        found: &mut Vec<Job>,
+    ) {
         if e.error != 0 {
             t.skipped += 1;
             return;
         }
+        if e.dev != self.devs[tree] {
+            return;
+        }
+        let id = (e.dev, e.ino);
         if e.objtype == VDIR {
-            if e.mount_point || e.dev != self.devs[job.tree] {
+            if e.mount_point
+                || self.walker.exclude.contains(&id)
+                || self.walker.protected.folder(id).is_some()
+            {
                 return;
             }
-            let dir = job.dir.join(std::ffi::OsStr::from_bytes(e.name));
-            if self.walker.exclude.contains(&dir) || self.walker.protected.contains(&dir) {
+            let Ok(name) = CString::new(e.name) else {
+                t.skipped += 1;
                 return;
-            }
+            };
             t.dirs += 1;
             found.push(Job {
-                dir,
-                tree: job.tree,
+                dir: Open::Child {
+                    parent: Arc::clone(dir),
+                    name,
+                    id,
+                },
+                tree,
             });
             return;
         }
@@ -288,20 +371,20 @@ impl Ctx<'_> {
             return;
         }
         let mut links = self.links.lock().unwrap();
-        match links.get_mut(&(e.dev, e.ino)) {
+        match links.get_mut(&id) {
             Some(link) => {
                 link.seen += 1;
-                link.shared |= link.tree != job.tree;
+                link.shared |= link.tree != tree;
             }
             None => {
                 t.allocated += e.alloc;
                 links.insert(
-                    (e.dev, e.ino),
+                    id,
                     Link {
                         nlink: e.nlink,
                         seen: 1,
                         private,
-                        tree: job.tree,
+                        tree,
                         shared: false,
                     },
                 );
@@ -560,9 +643,41 @@ mod tests {
             .unwrap();
         assert_eq!(h.files, 1, "only code/repo/file: {h:?}");
         assert!(near(h.size.allocated, MIB));
-        assert!(d.error.as_deref().unwrap().contains("never read"), "{d:?}");
+        assert!(
+            d.error
+                .as_deref()
+                .unwrap()
+                .contains("is a protected folder"),
+            "{d:?}"
+        );
         assert_eq!(d.files, 0);
         assert_eq!(n.files, 1, "an excluded folder can still be a root: {n:?}");
+    }
+
+    #[test]
+    fn opens_a_queued_folder_through_its_parent_and_only_if_unchanged() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("tree");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(t.path().join("outside/b")).unwrap();
+        let (parent, _) = open_root(&root.join("a")).unwrap();
+        let b = file_id(&fs::metadata(root.join("a/b")).unwrap());
+
+        // After `b` was listed, `a` turns into a symlink to a lookalike. A path now leads
+        // there, but the open goes through the descriptor of the real `a`.
+        fs::rename(root.join("a"), root.join("a.real")).unwrap();
+        std::os::unix::fs::symlink(t.path().join("outside"), root.join("a")).unwrap();
+        assert_ne!(file_id(&fs::metadata(root.join("a/b")).unwrap()), b);
+        let fd = open_child(&parent, c"b", b).expect("the folder that was listed");
+        assert_eq!(fstat_id(&fd), Some(b));
+
+        // `b` itself swapped for a symlink, then for another folder: neither is opened.
+        fs::rename(root.join("a.real/b"), root.join("a.real/b.old")).unwrap();
+        std::os::unix::fs::symlink(t.path().join("outside/b"), root.join("a.real/b")).unwrap();
+        assert!(open_child(&parent, c"b", b).is_none());
+        fs::remove_file(root.join("a.real/b")).unwrap();
+        fs::create_dir(root.join("a.real/b")).unwrap();
+        assert!(open_child(&parent, c"b", b).is_none());
     }
 
     #[test]

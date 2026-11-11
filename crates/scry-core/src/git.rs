@@ -1,13 +1,16 @@
-//! Runs the `git` CLI, the source of truth for repositories and worktrees, and parses what it
-//! prints into types. Nothing here writes to a repository.
+//! Runs the `git` CLI and parses what it prints into types, and reads the small files git
+//! keeps about worktrees. Nothing here writes to a repository.
 
-use std::io::Read;
+use std::ffi::OsStr;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 pub struct Output {
     pub code: Option<i32>,
@@ -15,9 +18,18 @@ pub struct Output {
     pub stderr: String,
 }
 
-/// Runs `git -C dir args…`, killing it after `timeout`.
+/// Runs `git -C dir args…`. Whatever git starts dies with it, and the call ends at `timeout`
+/// even if something still holds git's output open.
 pub fn run(dir: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
-    let mut child = Command::new("git")
+    let mut cmd = Command::new("git");
+    // Inside a git hook, GIT_DIR, GIT_INDEX_FILE and the like would aim every call at the
+    // hook's repository.
+    for (key, _) in std::env::vars_os() {
+        if key.as_bytes().starts_with(b"GIT_") {
+            cmd.env_remove(key);
+        }
+    }
+    let mut child = cmd
         .arg("-C")
         .arg(dir)
         // A monitor must not start an fsmonitor daemon or rewrite the index under an agent.
@@ -29,39 +41,143 @@ pub fn run(dir: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Its own process group, so a timeout also kills anything git started.
+        // Its own process group, so everything git starts can be killed with it.
         .process_group(0)
         .spawn()
         .context("running git")?;
-    let drain = |r: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut r) = r {
-                let _ = r.read_to_end(&mut buf);
-            }
-            String::from_utf8_lossy(&buf).into_owned()
-        })
-    };
-    let out = drain(child.stdout.take().map(|s| Box::new(s) as _));
-    let err = drain(child.stderr.take().map(|s| Box::new(s) as _));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            // The child is not reaped yet, so its pid, which is also the group id, is ours.
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-            let _ = child.wait();
-            bail!("git {} timed out after {timeout:?}", args.join(" "));
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    };
+    let pid = child.id() as i32;
+    let pipes: [OwnedFd; 2] = [
+        child.stdout.take().expect("piped").into(),
+        child.stderr.take().expect("piped").into(),
+    ];
+    let read = collect(pid, &pipes, Instant::now() + timeout);
+    // git is not reaped yet, so its pid still names its group and cannot have been reused.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let status = child.wait()?;
+    let [stdout, stderr] = read.map_err(|e| match e.kind() {
+        io::ErrorKind::TimedOut => anyhow!("git {} timed out after {timeout:?}", args.join(" ")),
+        _ => anyhow!("git {}: {e}", args.join(" ")),
+    })?;
+    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
     Ok(Output {
         code: status.code(),
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
+        stdout: text(stdout),
+        stderr: text(stderr),
     })
+}
+
+/// Reads both pipes until they close and git has exited, sleeping in `kevent` between reads.
+/// Once git has exited, anything still holding a pipe is a child it left behind, so the group
+/// is killed and the rest is read at once.
+fn collect(pid: i32, pipes: &[OwnedFd; 2], deadline: Instant) -> io::Result<[Vec<u8>; 2]> {
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+    let change = |ident: usize, filter, flags, fflags| libc::kevent {
+        ident,
+        filter,
+        flags,
+        fflags,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let apply = |ev: libc::kevent| {
+        let n = unsafe {
+            libc::kevent(
+                kq.as_raw_fd(),
+                &ev,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    for p in pipes {
+        apply(change(
+            p.as_raw_fd() as usize,
+            libc::EVFILT_READ,
+            libc::EV_ADD,
+            0,
+        ))?;
+    }
+    let mut exited = match apply(change(
+        pid as usize,
+        libc::EVFILT_PROC,
+        libc::EV_ADD | libc::EV_ONESHOT,
+        libc::NOTE_EXIT,
+    )) {
+        Ok(()) => false,
+        // It exited before it could be watched.
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => true,
+        Err(e) => return Err(e),
+    };
+    let mut open = [true, true];
+    let mut out = [Vec::new(), Vec::new()];
+    let mut buf = vec![0u8; 64 * 1024];
+    while open[0] || open[1] || !exited {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let ts = libc::timespec {
+            tv_sec: left.as_secs() as libc::time_t,
+            tv_nsec: left.subsec_nanos() as libc::c_long,
+        };
+        let mut events = [change(0, 0, 0, 0); 3];
+        let n = unsafe {
+            libc::kevent(
+                kq.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                3,
+                &ts,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        for ev in &events[..n as usize] {
+            if ev.filter == libc::EVFILT_PROC {
+                exited = true;
+                if open[0] || open[1] {
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+                continue;
+            }
+            let fd = ev.ident as RawFd;
+            let Some(i) = pipes.iter().position(|p| p.as_raw_fd() == fd) else {
+                continue;
+            };
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            match n {
+                1.. => out[i].extend_from_slice(&buf[..n as usize]),
+                0 => {
+                    open[i] = false;
+                    apply(change(fd as usize, libc::EVFILT_READ, libc::EV_DELETE, 0))?;
+                }
+                _ => {
+                    let e = io::Error::last_os_error();
+                    if e.kind() != io::ErrorKind::Interrupted {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Runs git and returns its stdout, or an error carrying git's first line of complaint.
@@ -74,59 +190,86 @@ pub fn stdout(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
     Ok(out.stdout)
 }
 
-/// One record of `git worktree list --porcelain -z`.
+/// The one `git status` call made per worktree. Flags override any config that would hide an
+/// untracked file or a change inside a submodule, and HEAD comes from the same call.
+pub const STATUS: [&str; 6] = [
+    "status",
+    "--porcelain=v2",
+    "-z",
+    "--branch",
+    "--untracked-files=normal",
+    "--ignore-submodules=none",
+];
+
+/// What one `git status` call says about a worktree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ListedWorktree {
-    pub path: PathBuf,
-    pub head: Option<String>,
-    /// Short name, without `refs/heads/`.
+pub struct Status {
+    /// HEAD's commit; None before the first commit.
+    pub oid: Option<String>,
+    /// None when HEAD is detached.
     pub branch: Option<String>,
-    pub bare: bool,
-    /// `Some("")` when locked without a reason.
-    pub locked: Option<String>,
-    pub prunable: Option<String>,
+    /// The upstream's short name, as git prints it.
+    pub upstream: Option<String>,
+    /// Commits ahead of and behind the upstream; None when the upstream ref is gone.
+    pub ahead_behind: Option<(u32, u32)>,
+    /// Tracked entries changed, staged or unmerged, submodules included.
+    pub changed: u32,
+    /// Untracked entries. An untracked folder is one entry.
+    pub untracked: u32,
 }
 
-pub fn parse_worktree_list(z: &str) -> Vec<ListedWorktree> {
-    let mut out = Vec::new();
-    let mut cur: Option<ListedWorktree> = None;
-    for field in z.split('\0') {
-        if field.is_empty() {
-            out.extend(cur.take());
-            continue;
-        }
-        let (key, value) = field.split_once(' ').unwrap_or((field, ""));
-        if key == "worktree" {
-            out.extend(cur.take());
-            cur = Some(ListedWorktree {
-                path: PathBuf::from(value),
-                ..Default::default()
-            });
-            continue;
-        }
-        let Some(w) = cur.as_mut() else { continue };
-        match key {
-            "HEAD" => w.head = Some(value.to_string()),
-            "branch" => {
-                w.branch = Some(value.strip_prefix("refs/heads/").unwrap_or(value).into());
+/// Parses the output of `STATUS`.
+pub fn parse_status(z: &str) -> Result<Status> {
+    let mut s = Status::default();
+    let mut has_oid = false;
+    let mut fields = z.split('\0');
+    while let Some(field) = fields.next() {
+        if let Some(header) = field.strip_prefix("# ") {
+            let (key, value) = header.split_once(' ').unwrap_or((header, ""));
+            match key {
+                "branch.oid" => {
+                    has_oid = true;
+                    s.oid = (value != "(initial)").then(|| value.into());
+                }
+                "branch.head" => s.branch = (value != "(detached)").then(|| value.into()),
+                "branch.upstream" => s.upstream = Some(value.into()),
+                "branch.ab" => {
+                    let (a, b) = value.split_once(' ').unwrap_or_default();
+                    let num = |n: &str, sign| n.strip_prefix(sign)?.parse().ok();
+                    s.ahead_behind = num(a, '+').zip(num(b, '-'));
+                }
+                _ => {}
             }
-            "bare" => w.bare = true,
-            "locked" => w.locked = Some(value.to_string()),
-            "prunable" => w.prunable = Some(value.to_string()),
-            _ => {}
+            continue;
+        }
+        match field.as_bytes().first() {
+            None | Some(b'!') => {}
+            Some(b'1' | b'u') => s.changed += 1,
+            // A rename or copy carries its original path in the next field.
+            Some(b'2') => {
+                s.changed += 1;
+                fields.next();
+            }
+            Some(b'?') => s.untracked += 1,
+            Some(_) => bail!("unexpected git status record {field:?}"),
         }
     }
-    out.extend(cur);
-    out
+    if !has_oid {
+        bail!("git status printed no branch.oid");
+    }
+    Ok(s)
 }
 
-/// The `for-each-ref` format that `parse_refs` reads.
-pub const REF_FORMAT: &str = "--format=%(refname)%09%(upstream)%09%(upstream:track)%09%(symref)";
+/// The `for-each-ref` format that `parse_refs` reads. Ref names cannot hold a tab or a
+/// newline, so both are safe separators.
+pub const REF_FORMAT: &str =
+    "--format=%(refname)%09%(objectname)%09%(upstream)%09%(upstream:track)%09%(symref)";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ref {
     /// Full name, such as `refs/heads/main`.
     pub name: String,
+    pub oid: String,
     pub upstream: Option<String>,
     /// The upstream is configured but its remote-tracking ref no longer exists.
     pub upstream_gone: bool,
@@ -138,12 +281,13 @@ pub fn parse_refs(text: &str) -> Vec<Ref> {
     text.lines()
         .filter_map(|line| {
             let f: Vec<&str> = line.split('\t').collect();
-            let [name, upstream, track, symref] = f.as_slice() else {
+            let [name, oid, upstream, track, symref] = f.as_slice() else {
                 return None;
             };
             let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
             Some(Ref {
                 name: name.to_string(),
+                oid: oid.to_string(),
                 upstream: some(upstream),
                 upstream_gone: *track == "[gone]",
                 symref: some(symref),
@@ -152,29 +296,64 @@ pub fn parse_refs(text: &str) -> Vec<Ref> {
         .collect()
 }
 
-/// Counts of `git status --porcelain` lines: tracked changes, then untracked files.
-pub fn count_status(text: &str) -> (u32, u32) {
-    text.lines()
-        .filter(|l| !l.is_empty())
-        .fold((0, 0), |(changed, untracked), l| {
-            if l.starts_with("??") {
-                (changed, untracked + 1)
-            } else {
-                (changed + 1, untracked)
-            }
-        })
+/// The arguments that list stash entries for `parse_stashes`, one record per NUL.
+pub const STASH_LIST: [&str; 5] = ["log", "-z", "-g", "--format=%P%x09%gs", "refs/stash"];
+
+/// One stash entry: the commit it was made on and the branch its message names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stash {
+    pub base: String,
+    /// None when it was made on a detached HEAD or its message is not git's own.
+    pub branch: Option<String>,
 }
 
-/// The target of a `.git` file: `gitdir: <path>`, relative to the file's folder if not absolute.
-pub fn read_gitdir_file(dot_git: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(dot_git).ok()?;
-    let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
-    let target = Path::new(target);
-    Some(if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        dot_git.parent()?.join(target)
+pub fn parse_stashes(z: &str) -> Vec<Stash> {
+    z.split('\0')
+        .filter_map(|record| {
+            let (parents, subject) = record.trim_start_matches('\n').split_once('\t')?;
+            let base = parents.split(' ').next()?.to_string();
+            // git writes "WIP on <branch>: …" or "On <branch>: …", and a branch name cannot
+            // hold a colon.
+            let branch = ["WIP on ", "On "]
+                .iter()
+                .find_map(|p| subject.strip_prefix(p))
+                .and_then(|rest| rest.split_once(':'))
+                .map(|(b, _)| b)
+                .filter(|b| *b != "(no branch)")
+                .map(Into::into);
+            Some(Stash { base, branch })
+        })
+        .collect()
+}
+
+/// The target of a `.git` file, `gitdir: <path>`, relative to the file's folder unless
+/// absolute. Like git, only line endings are trimmed, so a path may hold any other byte.
+pub fn read_gitdir_file(dot_git: &Path) -> io::Result<PathBuf> {
+    let mut text = std::fs::read(dot_git)?;
+    while text.last().is_some_and(|b| matches!(b, b'\n' | b'\r')) {
+        text.pop();
+    }
+    let Some(target) = text.strip_prefix(b"gitdir: ") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a gitdir file",
+        ));
+    };
+    let target = Path::new(OsStr::from_bytes(target));
+    Ok(match dot_git.parent() {
+        Some(dir) if target.is_relative() => dir.join(target),
+        _ => target.to_path_buf(),
     })
+}
+
+/// A path git stores in a file of a worktree's record, such as `gitdir` or `commondir`, with
+/// trailing whitespace trimmed as git does. It may be relative to the record.
+pub fn read_path_file(file: &Path) -> Option<PathBuf> {
+    let mut text = std::fs::read(file).ok()?;
+    while text.last().is_some_and(u8::is_ascii_whitespace) {
+        text.pop();
+    }
+    (!text.is_empty()).then(|| PathBuf::from(std::ffi::OsString::from_vec(text)))
 }
 
 #[cfg(test)]
@@ -182,38 +361,90 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_worktree_list_porcelain_z() {
-        let z = "worktree /r\0HEAD aaa\0branch refs/heads/main\0\0\
-                 worktree /r/.claude/worktrees/agent-1\0HEAD bbb\0branch refs/heads/feat/x\0locked claude agent agent-1 (pid 7)\0\0\
-                 worktree /gone\0HEAD ccc\0detached\0prunable gitdir file points to non-existent location\0\0";
-        let w = parse_worktree_list(z);
-        assert_eq!(w.len(), 3);
-        assert_eq!(w[0].branch.as_deref(), Some("main"));
-        assert_eq!(w[1].branch.as_deref(), Some("feat/x"));
-        assert_eq!(w[1].locked.as_deref(), Some("claude agent agent-1 (pid 7)"));
-        assert_eq!(w[2].branch, None, "detached");
-        assert!(w[2].prunable.is_some());
-        assert_eq!(w[2].path, PathBuf::from("/gone"));
+    fn parses_status_v2_with_renames_untracked_folders_and_newlines() {
+        let z = "# branch.oid 1111111111111111111111111111111111111111\0# branch.head feat\0\
+                 # branch.upstream origin/feat\0# branch.ab +2 -5\0# stash 3\0\
+                 1 .M N... 100644 100644 100644 aaa aaa README\0\
+                 2 R. N... 100644 100644 100644 aaa aaa R100 new\nname\0old\0\
+                 1 .M S.M. 160000 160000 160000 bbb bbb vendor/lib\0\
+                 u UU N... 100644 100644 100644 100644 ccc ccc ccc both\0\
+                 ? notes.txt\0? newdir/\0";
+        let s = parse_status(z).unwrap();
+        assert_eq!(
+            s.oid.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(s.branch.as_deref(), Some("feat"));
+        assert_eq!(s.upstream.as_deref(), Some("origin/feat"));
+        assert_eq!(s.ahead_behind, Some((2, 5)));
+        assert_eq!((s.changed, s.untracked), (4, 2));
+
+        let gone = "# branch.oid abc\0# branch.head feat\0# branch.upstream origin/feat\0";
+        assert_eq!(
+            parse_status(gone).unwrap().ahead_behind,
+            None,
+            "upstream gone"
+        );
+        let detached = "# branch.oid (initial)\0# branch.head (detached)\0";
+        let s = parse_status(detached).unwrap();
+        assert_eq!((s.oid, s.branch), (None, None));
+        assert!(parse_status("? stray\0").is_err(), "no branch.oid header");
     }
 
     #[test]
     fn parses_refs_with_a_gone_upstream_and_a_symref() {
-        let text = "refs/heads/a\trefs/remotes/origin/a\t[gone]\t\n\
-                    refs/heads/b\trefs/remotes/origin/b\t[ahead 2]\t\n\
-                    refs/heads/c\t\t\t\n\
-                    refs/remotes/origin/HEAD\t\t\trefs/remotes/origin/main\n";
+        let text = "refs/heads/a\taaa\trefs/remotes/origin/a\t[gone]\t\n\
+                    refs/heads/b\tbbb\trefs/remotes/origin/b\t[ahead 2]\t\n\
+                    refs/heads/c\tccc\t\t\t\n\
+                    refs/remotes/origin/HEAD\tddd\t\t\trefs/remotes/origin/main\n";
         let r = parse_refs(text);
         assert!(r[0].upstream_gone);
         assert_eq!(r[0].upstream.as_deref(), Some("refs/remotes/origin/a"));
         assert!(!r[1].upstream_gone);
+        assert_eq!(r[1].oid, "bbb");
         assert_eq!(r[2].upstream, None);
         assert_eq!(r[3].symref.as_deref(), Some("refs/remotes/origin/main"));
     }
 
     #[test]
-    fn counts_changed_and_untracked_status_lines() {
-        assert_eq!(count_status(""), (0, 0));
-        assert_eq!(count_status(" M a\nA  b\nR  c -> d\n?? e\n?? f/\n"), (3, 2));
+    fn parses_stash_entries_by_base_and_branch() {
+        let z = "aaa bbb\tWIP on feat: aaa subject\0\nccc ddd eee\tOn main: saved\0\
+                 fff ggg\tWIP on (no branch): fff x\0";
+        assert_eq!(
+            parse_stashes(z),
+            [
+                Stash {
+                    base: "aaa".into(),
+                    branch: Some("feat".into())
+                },
+                Stash {
+                    base: "ccc".into(),
+                    branch: Some("main".into())
+                },
+                Stash {
+                    base: "fff".into(),
+                    branch: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_a_gitdir_file_whose_path_holds_a_newline() {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join(".git");
+        std::fs::write(&file, "gitdir: /x/odd\nrepo/.git/worktrees/a\n").unwrap();
+        assert_eq!(
+            read_gitdir_file(&file).unwrap(),
+            PathBuf::from("/x/odd\nrepo/.git/worktrees/a")
+        );
+        std::fs::write(&file, "gitdir: ../.git/modules/lib\r\n").unwrap();
+        assert_eq!(
+            read_gitdir_file(&file).unwrap(),
+            t.path().join("../.git/modules/lib")
+        );
+        std::fs::write(&file, "nonsense\n").unwrap();
+        assert!(read_gitdir_file(&file).is_err());
     }
 
     #[test]
@@ -228,5 +459,41 @@ mod tests {
         .expect("timed out");
         assert!(err.to_string().contains("timed out"), "{err}");
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn returns_when_git_exits_though_a_background_child_holds_its_pipes() {
+        let t = Instant::now();
+        let out = run(
+            Path::new("/"),
+            &["-c", "alias.bg=!sleep 20 & echo $!", "bg"],
+            Duration::from_secs(10),
+        )
+        .expect("git exits at once");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let pid: i32 = out.stdout.trim().parse().expect("the child's pid");
+        // The child was in git's process group, so it went with it.
+        let gone = (0..100).any(|_| {
+            std::thread::sleep(Duration::from_millis(10));
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            !alive
+        });
+        assert!(gone, "pid {pid} still runs");
+    }
+
+    #[test]
+    fn ends_at_the_deadline_when_a_child_outside_the_group_holds_the_pipes() {
+        let t = Instant::now();
+        // With job control on, sh starts the job in a group of its own, out of reach of the
+        // group kill.
+        let err = run(
+            Path::new("/"),
+            &["-c", "alias.away=!set -m; sleep 5 & echo started", "away"],
+            Duration::from_millis(500),
+        )
+        .err()
+        .expect("timed out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     }
 }

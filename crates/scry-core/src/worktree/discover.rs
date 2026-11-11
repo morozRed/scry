@@ -1,18 +1,23 @@
-//! Finds repositories under the code roots and agent folders, lists their linked worktrees
-//! with git, reads each one's state and sizes them all in one walk.
+//! Finds repositories under the code roots and agent folders, reads git's record of each
+//! linked worktree, looks at each folder once with one `git status`, and sizes them all in
+//! one walk. Nothing inside a protected folder is read, and no git runs there.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::creator::{self, CreatorSource};
+use super::verdict::{Reading, judge};
 use super::{
-    Changes, GitFacts, Head, Lock, Merge, Orphan, Timings, Upstream, Worktree, WorktreeScan,
+    Changes, GitFacts, Head, Lock, Merge, NotRead, Timings, Upstream, Worktree, WorktreeScan,
     WorktreeState,
 };
-use crate::git::{self, ListedWorktree, Ref};
-use crate::size::{PROTECTED, Walker};
+use crate::git::{self, Ref};
+use crate::protected::{Protected, Resolved, file_id};
+use crate::size::Walker;
 
 pub struct ScanOptions {
     pub home: PathBuf,
@@ -41,39 +46,38 @@ impl ScanOptions {
     }
 }
 
-/// The code roots from PLAN.md that exist in `home`.
-pub fn default_roots(home: &Path) -> Vec<PathBuf> {
-    ["sources", "code", "src", "Developer"]
-        .iter()
-        .map(|d| home.join(d))
-        .filter(|p| p.is_dir())
-        .collect()
-}
-
 pub fn scan(opts: &ScanOptions) -> WorktreeScan {
     let start = Instant::now();
+    let guard = Protected::new(&opts.home);
     let mut warnings = Vec::new();
-    let protected: Vec<PathBuf> = PROTECTED.iter().map(|d| opts.home.join(d)).collect();
 
     let mut found = Found::default();
     for root in &opts.roots {
-        let root = canonical(root);
-        if protected.iter().any(|p| root.starts_with(canonical(p))) {
-            warnings.push(format!("{} is never scanned", root.display()));
-            continue;
+        match guard.resolve(root) {
+            Resolved::Inside(folder) => warnings.push(format!(
+                "{} was not read: protected folder {}",
+                root.display(),
+                folder.display()
+            )),
+            Resolved::Outside(root) => find(&root, 0, opts.max_depth, &guard, &mut found),
         }
-        find(&root, 0, opts.max_depth, &protected, &mut found);
     }
     for dir in &opts.agent_dirs {
-        find(&canonical(dir), 0, 2, &protected, &mut found);
+        if let Resolved::Outside(dir) = guard.resolve(dir) {
+            find(&dir, 0, 2, &guard, &mut found);
+        }
     }
     // Agent worktree folders inside each checkout hold leftovers git may no longer know.
     for checkout in found.checkouts.clone() {
-        let Ok(entries) = std::fs::read_dir(checkout.join(".claude/worktrees")) else {
+        let Resolved::Outside(dir) = guard.resolve(&checkout.join(".claude/worktrees")) else {
+            continue;
+        };
+        let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
         for e in entries.flatten() {
-            if e.path().join(".git").is_file() {
+            let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
+            if is_dir && fs::symlink_metadata(e.path().join(".git")).is_ok_and(|m| m.is_file()) {
                 found.pointers.push(e.path());
             }
         }
@@ -84,62 +88,69 @@ pub fn scan(opts: &ScanOptions) -> WorktreeScan {
 
     let git_start = Instant::now();
     let timeout = opts.git_timeout;
-    let pointers = par_map(&found.pointers, opts.threads, |dir| classify(dir, timeout));
-
-    let mut commons: Vec<PathBuf> = found
-        .checkouts
-        .iter()
-        .map(|c| canonical(&c.join(".git")))
-        .collect();
-    let mut orphans = Vec::new();
-    for (dir, kind) in found.pointers.iter().zip(pointers) {
-        match kind {
-            Pointer::Linked { common } | Pointer::Checkout { common } => {
-                commons.push(canonical(&common))
-            }
-            Pointer::Submodule => {}
-            Pointer::Broken { gitdir } => orphans.push((dir.clone(), Ok(gitdir))),
-            Pointer::Unreadable { error } => orphans.push((dir.clone(), Err(error))),
+    let mut commons: Vec<PathBuf> = found.checkouts.iter().map(|c| c.join(".git")).collect();
+    let mut loose = Vec::new();
+    for dir in &found.pointers {
+        match link(&guard, dir) {
+            Link::Worktree { common } | Link::Repo { gitdir: common } => commons.push(common),
+            other => loose.push((dir.clone(), other)),
         }
     }
     commons.sort();
     commons.dedup();
 
-    let repos = par_map(&commons, opts.threads, |c| list_repo(c, timeout));
-    let mut tasks = Vec::new();
-    for repo in &repos {
+    let repos = par_map(&commons, opts.threads, |c| read_repo(c, timeout));
+    let mut tasks: Vec<(usize, &Record)> = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
         if let Some(e) = &repo.error {
             warnings.push(format!("{}: {e}", repo.common.display()));
         }
-        tasks.extend(repo.linked.iter().map(|w| (repo, w)));
+        tasks.extend(repo.records.iter().map(|r| (i, r)));
     }
-    let states = par_map(&tasks, opts.threads, |(repo, w)| {
-        read_state(repo, w, timeout)
+    let looks = par_map(&tasks, opts.threads, |(_, rec)| look(rec, &guard, timeout));
+
+    // Read after the looks, so a stash made in between is seen.
+    let indexed: Vec<(usize, &Repo)> = repos.iter().enumerate().collect();
+    let facts = par_map(&indexed, opts.threads, |(i, repo)| {
+        let mine: Vec<(&Record, &Look)> = tasks
+            .iter()
+            .zip(&looks)
+            .filter(|((r, _), _)| r == i)
+            .map(|((_, rec), l)| (*rec, l))
+            .collect();
+        repo_facts(repo, &mine, timeout)
     });
+
     let mut worktrees: Vec<Worktree> = tasks
         .iter()
-        .zip(states)
-        .map(|((repo, w), state)| worktree(repo, w, state, &opts.creators))
+        .zip(looks)
+        .map(|((i, rec), look)| worktree(&repos[*i], rec, look, &facts[*i], &opts.creators))
         .collect();
 
     let mut seen: HashSet<PathBuf> = worktrees.iter().map(|w| w.path.clone()).collect();
-    for (dir, pointer) in orphans {
-        let dir = canonical(&dir);
+    for (dir, link) in loose {
         if !seen.insert(dir.clone()) {
             continue;
         }
-        let gitdir = git::read_gitdir_file(&dir.join(".git"));
-        let (state, repo) = match pointer {
-            Ok(gitdir) => (
-                WorktreeState::Orphaned(Orphan::BrokenPointer {
-                    gitdir: gitdir.clone(),
-                }),
+        let (state, repo) = match link {
+            Link::Broken { gitdir } => (
+                judge(
+                    Reading::BrokenLink {
+                        gitdir: gitdir.clone(),
+                    },
+                    None,
+                ),
                 repo_from_gitdir(&gitdir),
             ),
-            Err(error) => (
-                WorktreeState::Unreadable { error },
-                gitdir.map_or(dir.clone(), |g| repo_from_gitdir(&g)),
+            Link::Protected { folder, gitdir } => (
+                WorktreeState::NotRead(NotRead::ProtectedFolder { folder }),
+                repo_from_gitdir(&gitdir),
             ),
+            Link::Unreadable { error } => (
+                WorktreeState::NotRead(NotRead::Failed { error }),
+                dir.clone(),
+            ),
+            Link::Worktree { .. } | Link::Repo { .. } => continue,
         };
         worktrees.push(Worktree {
             creator: creator::attribute(&opts.creators, &dir, None),
@@ -168,20 +179,14 @@ pub fn scan(opts: &ScanOptions) -> WorktreeScan {
     }
 }
 
-/// Sizes every worktree whose folder exists, in one walk. A worktree nested inside another
-/// counts only toward itself.
+/// Sizes every worktree in one walk. A worktree nested inside another counts only toward
+/// itself. The walker refuses protected folders and reports a missing folder as an error.
 pub fn measure(scan: &mut WorktreeScan, home: &Path) {
     let start = Instant::now();
-    let on_disk: Vec<usize> = (0..scan.worktrees.len())
-        .filter(|&i| scan.worktrees[i].path.is_dir())
-        .collect();
-    let roots: Vec<PathBuf> = on_disk
-        .iter()
-        .map(|&i| scan.worktrees[i].path.clone())
-        .collect();
+    let roots: Vec<PathBuf> = scan.worktrees.iter().map(|w| w.path.clone()).collect();
     let sizes = Walker::new(home).exclude(roots.clone()).measure(&roots);
-    for (i, size) in on_disk.into_iter().zip(sizes) {
-        scan.worktrees[i].size = Some(size);
+    for (w, size) in scan.worktrees.iter_mut().zip(sizes) {
+        w.size = Some(size);
     }
     scan.timings.size_ms = ms(start);
     scan.timings.total_ms += scan.timings.size_ms;
@@ -191,25 +196,22 @@ fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
 
-fn canonical(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
-}
-
 #[derive(Default)]
 struct Found {
     /// Folders whose `.git` is a folder: main checkouts.
     checkouts: Vec<PathBuf>,
-    /// Folders whose `.git` is a file: a linked worktree, a submodule, or a broken pointer.
+    /// Folders whose `.git` is a file: a linked worktree, a submodule, or a broken link.
     pointers: Vec<PathBuf>,
 }
 
 /// Build output and dependencies hold no repos worth the walk.
 const SKIP: [&str; 2] = ["node_modules", "target"];
 
-/// Collects repos up to `max` folders down. It stops at a checkout: git lists the worktrees
-/// and submodules inside one, and the walk would otherwise read every source folder.
-fn find(dir: &Path, depth: usize, max: usize, protected: &[PathBuf], found: &mut Found) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+/// Collects repos up to `max` folders down. It stops at a checkout: its git folder lists
+/// the worktrees inside it, and the walk would otherwise read every source folder. Symlinks
+/// are not followed, and a protected folder is never entered.
+fn find(dir: &Path, depth: usize, max: usize, guard: &Protected, found: &mut Found) {
+    let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     let mut subdirs = Vec::new();
@@ -226,26 +228,36 @@ fn find(dir: &Path, depth: usize, max: usize, protected: &[PathBuf], found: &mut
         }
         let name = name.to_string_lossy();
         if depth < max && kind.is_dir() && !name.starts_with('.') && !SKIP.contains(&&*name) {
-            subdirs.push(e.path());
+            subdirs.push(e);
         }
     }
     for d in subdirs {
-        if !protected.contains(&d) {
-            find(&d, depth + 1, max, protected, found);
+        let protected = d
+            .metadata()
+            .is_ok_and(|m| guard.folder(file_id(&m)).is_some());
+        if !protected {
+            find(&d.path(), depth + 1, max, guard, found);
         }
     }
 }
 
-enum Pointer {
-    Linked {
+/// What a folder's `.git` file points at, read from the files git keeps, without running git.
+enum Link {
+    /// A linked worktree's record, inside its repo's git folder.
+    Worktree {
         common: PathBuf,
     },
-    /// A main checkout whose git folder lives elsewhere (`git init --separate-git-dir`).
-    Checkout {
-        common: PathBuf,
+    /// A whole git folder: a submodule's, or a checkout's made with `--separate-git-dir`.
+    Repo {
+        gitdir: PathBuf,
     },
-    Submodule,
+    /// The git folder it names is gone.
     Broken {
+        gitdir: PathBuf,
+    },
+    /// It leads into a protected folder.
+    Protected {
+        folder: PathBuf,
         gitdir: PathBuf,
     },
     Unreadable {
@@ -253,34 +265,28 @@ enum Pointer {
     },
 }
 
-/// A `.git` file can mean a linked worktree or a submodule; git says which.
-fn classify(dir: &Path, timeout: Duration) -> Pointer {
-    let args = [
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-dir",
-        "--git-common-dir",
-        "--show-superproject-working-tree",
-    ];
-    match git::stdout(dir, &args, timeout) {
-        Ok(out) => match out.lines().collect::<Vec<_>>().as_slice() {
-            [_, _, superproject, ..] if !superproject.is_empty() => Pointer::Submodule,
-            [git_dir, common, ..] if git_dir != common => Pointer::Linked {
-                common: common.into(),
-            },
-            [_, common, ..] => Pointer::Checkout {
-                common: common.into(),
-            },
-            _ => Pointer::Unreadable {
-                error: format!("unexpected rev-parse output {out:?}"),
-            },
+fn link(guard: &Protected, dir: &Path) -> Link {
+    let gitdir = match git::read_gitdir_file(&dir.join(".git")) {
+        Ok(g) => g,
+        Err(e) => {
+            return Link::Unreadable {
+                error: format!("its .git file: {e}"),
+            };
+        }
+    };
+    let admin = match guard.resolve(&gitdir) {
+        Resolved::Inside(folder) => return Link::Protected { folder, gitdir },
+        Resolved::Outside(p) => p,
+    };
+    if !admin.is_dir() {
+        return Link::Broken { gitdir };
+    }
+    match git::read_path_file(&admin.join("commondir")) {
+        Some(common) => match guard.resolve(&admin.join(common)) {
+            Resolved::Inside(folder) => Link::Protected { folder, gitdir },
+            Resolved::Outside(common) => Link::Worktree { common },
         },
-        Err(e) => match git::read_gitdir_file(&dir.join(".git")) {
-            Some(gitdir) if !gitdir.exists() => Pointer::Broken { gitdir },
-            _ => Pointer::Unreadable {
-                error: e.to_string(),
-            },
-        },
+        None => Link::Repo { gitdir: admin },
     }
 }
 
@@ -298,106 +304,125 @@ fn repo_from_gitdir(gitdir: &Path) -> PathBuf {
 
 struct Repo {
     common: PathBuf,
-    main: Option<PathBuf>,
-    linked: Vec<ListedWorktree>,
-    default: Option<DefaultBranch>,
+    /// Its main checkout, or the git folder itself when there is none.
+    shown_as: PathBuf,
+    records: Vec<Record>,
     refs: HashMap<String, Ref>,
-    /// Worktree HEADs merged into the default branch, to the ref that holds them.
-    merged: HashMap<String, String>,
-    commit_times: HashMap<String, i64>,
-    /// Worktree path to its folder under `.git/worktrees`.
-    admin: HashMap<PathBuf, PathBuf>,
+    default: Option<DefaultBranch>,
     error: Option<String>,
 }
 
-fn list_repo(common: &Path, timeout: Duration) -> Repo {
+/// One folder under `<common>/worktrees`: git's record of a linked worktree.
+struct Record {
+    admin: PathBuf,
+    /// The worktree's folder, from the record's `gitdir` file. None when that file is gone,
+    /// which leaves nothing but the record.
+    path: Option<PathBuf>,
+    head: RecordHead,
+    lock: Option<Lock>,
+    created_at: Option<i64>,
+}
+
+enum RecordHead {
+    Branch(String),
+    Detached(String),
+    Unreadable,
+}
+
+fn read_repo(common: &Path, timeout: Duration) -> Repo {
+    let checkout = common
+        .parent()
+        .filter(|_| common.file_name() == Some(".git".as_ref()));
     let mut repo = Repo {
         common: common.to_path_buf(),
-        main: (common.file_name() == Some(".git".as_ref()))
-            .then(|| common.parent().map(Path::to_path_buf))
-            .flatten(),
-        linked: Vec::new(),
-        default: None,
+        shown_as: checkout.unwrap_or(common).to_path_buf(),
+        records: read_records(common),
         refs: HashMap::new(),
-        merged: HashMap::new(),
-        commit_times: HashMap::new(),
-        admin: admin_dirs(common),
+        default: None,
         error: None,
     };
-    // git keeps every linked worktree under `.git/worktrees`; without one there is nothing
-    // to ask git about.
-    if repo.admin.is_empty() {
+    // Without a record there is nothing to ask git about.
+    if repo.records.is_empty() {
         return repo;
     }
-    let listed = match git::stdout(common, &["worktree", "list", "--porcelain", "-z"], timeout) {
-        Ok(out) => git::parse_worktree_list(&out),
-        Err(e) => {
-            repo.error = Some(e.to_string());
-            return repo;
-        }
-    };
-    let refs_args = [
+    let args = [
         "for-each-ref",
         git::REF_FORMAT,
         "refs/heads",
-        "refs/remotes/origin/HEAD",
-        "refs/remotes/origin/main",
-        "refs/remotes/origin/master",
+        "refs/remotes/origin",
+        "refs/stash",
     ];
-    match git::stdout(common, &refs_args, timeout) {
+    match git::stdout(common, &args, timeout) {
         Ok(out) => {
             repo.refs = git::parse_refs(&out)
                 .into_iter()
                 .map(|r| (r.name.clone(), r))
-                .collect()
+                .collect();
         }
         Err(e) => repo.error = Some(e.to_string()),
     }
-    let mut listed = listed.into_iter();
-    let main = listed.next();
-    let main_branch = main.as_ref().and_then(|m| m.branch.clone());
-    if let Some(m) = main.filter(|m| !m.bare) {
-        repo.main = Some(m.path);
-    }
-    repo.linked = listed.filter(|w| !w.bare).collect();
+    let main_branch = match read_head(&common.join("HEAD")) {
+        RecordHead::Branch(b) => Some(b),
+        _ => None,
+    };
     repo.default = default_branch(&repo.refs, main_branch.as_deref());
-
-    let mut heads: Vec<String> = repo
-        .linked
-        .iter()
-        .filter(|w| w.prunable.is_none() && w.path.exists())
-        .filter_map(|w| w.head.clone())
-        .collect();
-    heads.sort();
-    heads.dedup();
-    if heads.is_empty() {
-        return repo;
-    }
-    if let Some(d) = &repo.default {
-        match merged_heads(common, d, &heads, timeout) {
-            Ok(m) => repo.merged = m,
-            Err(e) => repo.error = Some(e.to_string()),
-        }
-    }
-    match commit_times(common, &heads, timeout) {
-        Ok(t) => repo.commit_times = t,
-        Err(e) => repo.error = Some(e.to_string()),
-    }
     repo
 }
 
-fn admin_dirs(common: &Path) -> HashMap<PathBuf, PathBuf> {
-    let Ok(entries) = std::fs::read_dir(common.join("worktrees")) else {
-        return HashMap::new();
+fn read_records(common: &Path) -> Vec<Record> {
+    let Ok(entries) = fs::read_dir(common.join("worktrees")) else {
+        return Vec::new();
     };
-    entries
+    let mut records: Vec<Record> = entries
         .flatten()
-        .filter_map(|e| {
-            let text = std::fs::read_to_string(e.path().join("gitdir")).ok()?;
-            let dot_git = PathBuf::from(text.trim_end());
-            Some((dot_git.parent()?.to_path_buf(), e.path()))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| {
+            let admin = e.path();
+            // The file names the worktree's `.git` file, relative to the record when git
+            // was asked for relative paths.
+            let path = git::read_path_file(&admin.join("gitdir")).map(|p| {
+                let dot_git = admin.join(p);
+                match dot_git.file_name() {
+                    Some(n) if n == ".git" => dot_git.parent().unwrap_or(&dot_git).to_path_buf(),
+                    _ => dot_git,
+                }
+            });
+            let lock = fs::read(admin.join("locked")).ok().map(|text| {
+                let reason = String::from_utf8_lossy(&text).trim().to_string();
+                Lock {
+                    reason: (!reason.is_empty()).then_some(reason),
+                }
+            });
+            let created_at = fs::metadata(&admin)
+                .and_then(|m| m.created())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            Record {
+                head: read_head(&admin.join("HEAD")),
+                admin,
+                path,
+                lock,
+                created_at,
+            }
         })
-        .collect()
+        .collect();
+    records.sort_by(|a, b| a.admin.cmp(&b.admin));
+    records
+}
+
+fn read_head(file: &Path) -> RecordHead {
+    let Ok(text) = fs::read_to_string(file) else {
+        return RecordHead::Unreadable;
+    };
+    let text = text.trim();
+    match text.strip_prefix("ref: refs/heads/") {
+        Some(branch) => RecordHead::Branch(branch.to_string()),
+        None if text.len() >= 40 && text.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            RecordHead::Detached(text.to_string())
+        }
+        None => RecordHead::Unreadable,
+    }
 }
 
 struct DefaultBranch {
@@ -437,107 +462,389 @@ fn default_branch(refs: &HashMap<String, Ref>, main_branch: Option<&str>) -> Opt
     (!refs.is_empty()).then_some(DefaultBranch { refs })
 }
 
-fn head(w: &ListedWorktree) -> Head {
-    match (&w.branch, &w.head) {
-        (Some(name), Some(oid)) => Head::Branch {
-            name: name.clone(),
-            oid: oid.clone(),
-        },
-        (None, Some(oid)) => Head::Detached { oid: oid.clone() },
-        _ => Head::Unknown,
-    }
+/// What one look at a registered worktree's folder found.
+enum Look {
+    Protected {
+        path: PathBuf,
+        folder: PathBuf,
+    },
+    Missing,
+    NoGitLink(PathBuf),
+    LinkElsewhere {
+        path: PathBuf,
+        gitdir: PathBuf,
+    },
+    /// The folder links back to its record and one `git status` read it.
+    Status(PathBuf, git::Status),
+    Failed {
+        path: PathBuf,
+        error: String,
+    },
 }
 
-fn read_state(repo: &Repo, w: &ListedWorktree, timeout: Duration) -> WorktreeState {
-    let admin_dir = repo.admin.get(&w.path).cloned();
-    let git_says = w.prunable.clone();
-    if !w.path.exists() {
-        return WorktreeState::Orphaned(Orphan::Missing {
-            admin_dir,
-            git_says,
-        });
+fn look(rec: &Record, guard: &Protected, timeout: Duration) -> Look {
+    let Some(path) = &rec.path else {
+        return Look::Missing;
+    };
+    let path = match guard.resolve(path) {
+        Resolved::Inside(folder) => {
+            return Look::Protected {
+                path: path.clone(),
+                folder,
+            };
+        }
+        Resolved::Outside(p) => p,
+    };
+    let failed = |path: &Path, e: io::Error| Look::Failed {
+        path: path.to_path_buf(),
+        error: e.to_string(),
+    };
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Look::Missing,
+        Err(e) => return failed(&path, e),
+        Ok(m) if !m.is_dir() => return Look::NoGitLink(path),
+        Ok(_) => {}
     }
-    if w.prunable.is_some() || !w.path.join(".git").exists() {
-        return WorktreeState::Orphaned(Orphan::Unusable {
-            admin_dir,
-            git_says,
-        });
+    let dot_git = path.join(".git");
+    match fs::symlink_metadata(&dot_git) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Look::NoGitLink(path),
+        Err(e) => return failed(&path, e),
+        Ok(m) if !m.is_file() => {
+            return Look::LinkElsewhere {
+                path,
+                gitdir: dot_git,
+            };
+        }
+        Ok(_) => {}
     }
-    match git_facts(repo, &w.path, &head(w), timeout) {
-        Ok(facts) => WorktreeState::Present(facts),
-        Err(e) => WorktreeState::Unreadable {
+    let gitdir = match git::read_gitdir_file(&dot_git) {
+        Ok(g) => g,
+        Err(e) => return failed(&path, e),
+    };
+    let same = |a: &Path, b: &Path| match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => file_id(&a) == file_id(&b),
+        _ => false,
+    };
+    match guard.resolve(&gitdir) {
+        Resolved::Outside(g) if same(&g, &rec.admin) => {}
+        _ => return Look::LinkElsewhere { path, gitdir },
+    }
+    match git::stdout(&path, &git::STATUS, timeout).and_then(|out| git::parse_status(&out)) {
+        Ok(status) => Look::Status(path, status),
+        Err(e) => Look::Failed {
+            path,
             error: e.to_string(),
         },
     }
 }
 
+/// What the repo says about the HEADs its worktrees reported.
+struct RepoFacts {
+    /// HEADs reachable from the default branch, to the ref that holds them.
+    merged: HashMap<String, String>,
+    commit_times: HashMap<String, i64>,
+    stashes: Vec<git::Stash>,
+    /// Commits that only one record's HEAD holds, by record, where that is evidence.
+    only_here: Result<HashMap<PathBuf, u32>, String>,
+}
+
+fn repo_facts(
+    repo: &Repo,
+    mine: &[(&Record, &Look)],
+    timeout: Duration,
+) -> Result<RepoFacts, String> {
+    if let Some(e) = &repo.error {
+        return Err(e.clone());
+    }
+    let mut heads: Vec<String> = mine
+        .iter()
+        .filter_map(|(_, l)| match l {
+            Look::Status(_, s) => s.oid.clone(),
+            _ => None,
+        })
+        .collect();
+    heads.sort();
+    heads.dedup();
+    let mut facts = RepoFacts {
+        merged: HashMap::new(),
+        commit_times: HashMap::new(),
+        stashes: Vec::new(),
+        only_here: Ok(HashMap::new()),
+    };
+    let common = &repo.common;
+    if !heads.is_empty() {
+        if let Some(d) = &repo.default {
+            facts.merged = merged_heads(common, d, &heads, timeout).map_err(|e| e.to_string())?;
+        }
+        facts.commit_times = commit_times(common, &heads, timeout).map_err(|e| e.to_string())?;
+        if repo.refs.contains_key("refs/stash") {
+            let out = git::stdout(common, &git::STASH_LIST, timeout).map_err(|e| e.to_string())?;
+            facts.stashes = git::parse_stashes(&out);
+        }
+    }
+    let tips: Vec<Tip> = mine
+        .iter()
+        .filter_map(|(rec, look)| tip(repo, rec, look, &facts.merged))
+        .collect();
+    if !tips.is_empty() {
+        facts.only_here = only_here(common, &tips, timeout).map_err(|e| e.to_string());
+    }
+    Ok(facts)
+}
+
+/// A HEAD whose commits that no other ref holds are evidence: a branch whose upstream is
+/// gone, and a record whose folder is missing or unusable.
+struct Tip<'a> {
+    admin: &'a Path,
+    oid: String,
+    branch: Option<&'a str>,
+}
+
+fn tip<'a>(
+    repo: &Repo,
+    rec: &'a Record,
+    look: &'a Look,
+    merged: &HashMap<String, String>,
+) -> Option<Tip<'a>> {
+    let (oid, branch) = match look {
+        Look::Status(_, s) => {
+            let gone = s.upstream.is_some() && s.ahead_behind.is_none();
+            let oid = s.oid.clone()?;
+            if !gone || merged.contains_key(&oid) {
+                return None;
+            }
+            (oid, s.branch.as_deref())
+        }
+        Look::Missing | Look::NoGitLink(_) | Look::LinkElsewhere { .. } => match &rec.head {
+            RecordHead::Branch(b) => {
+                let r = repo.refs.get(&format!("refs/heads/{b}"))?;
+                (r.oid.clone(), Some(b.as_str()))
+            }
+            RecordHead::Detached(oid) => (oid.clone(), None),
+            RecordHead::Unreadable => return None,
+        },
+        Look::Protected { .. } | Look::Failed { .. } => return None,
+    };
+    Some(Tip {
+        admin: &rec.admin,
+        oid,
+        branch,
+    })
+}
+
+/// Counts, for each tip, the commits that no branch, remote branch or tag holds but the tip's
+/// own branch, in one `rev-list` for the repo: it lists every commit the tips hold that no
+/// other ref does, with its parents, and each tip's share is walked from that list. Another
+/// detached tip does not count as holding a commit, since pruning its record drops it too.
+fn only_here(
+    common: &Path,
+    tips: &[Tip],
+    timeout: Duration,
+) -> anyhow::Result<HashMap<PathBuf, u32>> {
+    // Before --branches, an exclude pattern is a branch name without refs/heads/.
+    let excludes: Vec<String> = tips
+        .iter()
+        .filter_map(|t| t.branch)
+        .map(|b| format!("--exclude={b}"))
+        .collect();
+    let mut args = vec!["rev-list", "--parents"];
+    args.extend(tips.iter().map(|t| t.oid.as_str()));
+    args.push("--not");
+    args.extend(excludes.iter().map(String::as_str));
+    args.extend(["--branches", "--remotes", "--tags"]);
+    let out = git::stdout(common, &args, timeout)?;
+    let parents: HashMap<&str, Vec<&str>> = out
+        .lines()
+        .filter_map(|l| {
+            let mut ids = l.split(' ');
+            Some((ids.next()?, ids.collect()))
+        })
+        .collect();
+    let reach: Vec<HashSet<&str>> = tips
+        .iter()
+        .map(|t| {
+            let mut seen = HashSet::new();
+            let mut todo: Vec<&str> = parents
+                .get_key_value(t.oid.as_str())
+                .map(|(k, _)| *k)
+                .into_iter()
+                .collect();
+            while let Some(c) = todo.pop() {
+                if seen.insert(c) {
+                    todo.extend(parents[c].iter().filter(|p| parents.contains_key(*p)));
+                }
+            }
+            seen
+        })
+        .collect();
+    let mut on_branches: HashMap<&str, u32> = HashMap::new();
+    for (_, set) in tips.iter().zip(&reach).filter(|(t, _)| t.branch.is_some()) {
+        for c in set {
+            *on_branches.entry(c).or_default() += 1;
+        }
+    }
+    Ok(tips
+        .iter()
+        .zip(&reach)
+        .map(|(t, set)| {
+            let own = u32::from(t.branch.is_some());
+            let alone = set
+                .iter()
+                .filter(|c| on_branches.get(*c).copied().unwrap_or(0) == own)
+                .count() as u32;
+            (t.admin.to_path_buf(), alone)
+        })
+        .collect())
+}
+
 fn worktree(
     repo: &Repo,
-    w: &ListedWorktree,
-    state: WorktreeState,
+    rec: &Record,
+    look: Look,
+    facts: &Result<RepoFacts, String>,
     creators: &[Box<dyn CreatorSource>],
 ) -> Worktree {
-    let path = canonical(&w.path);
-    let admin = repo.admin.get(&w.path).cloned();
+    let record_head = match &rec.head {
+        RecordHead::Branch(name) => Head::Branch {
+            name: name.clone(),
+            oid: repo
+                .refs
+                .get(&format!("refs/heads/{name}"))
+                .map(|r| r.oid.clone()),
+        },
+        RecordHead::Detached(oid) => Head::Detached { oid: oid.clone() },
+        RecordHead::Unreadable => Head::Unknown,
+    };
+    let detached = matches!(rec.head, RecordHead::Detached(_));
+    let lock = rec.lock.as_ref();
+    let not_read = |error: String| WorktreeState::NotRead(NotRead::Failed { error });
+    // A count is evidence everywhere but on a missing detached HEAD, where it decides.
+    let (only_here, count_error) = match facts.as_ref().map(|f| &f.only_here) {
+        Ok(Ok(counts)) => (counts.get(&rec.admin).copied(), None),
+        Ok(Err(e)) | Err(e) => (None, Some(e.clone())),
+    };
+    let shown = rec.path.clone().unwrap_or_else(|| rec.admin.clone());
+    let (path, head, state) = match look {
+        Look::Protected { path, folder } => (
+            path,
+            record_head,
+            WorktreeState::NotRead(NotRead::ProtectedFolder { folder }),
+        ),
+        Look::Failed { path, error } => (path, record_head, not_read(error)),
+        Look::Missing if matches!(rec.head, RecordHead::Unreadable) => (
+            shown,
+            record_head,
+            not_read("its record's HEAD file could not be read".into()),
+        ),
+        Look::Missing => match count_error.filter(|_| detached) {
+            Some(e) => (shown, record_head, not_read(e)),
+            None => (
+                shown,
+                record_head,
+                judge(
+                    Reading::Missing {
+                        detached,
+                        only_here,
+                    },
+                    lock,
+                ),
+            ),
+        },
+        Look::NoGitLink(path) => (
+            path,
+            record_head,
+            judge(Reading::NoGitLink { only_here }, lock),
+        ),
+        Look::LinkElsewhere { path, gitdir } => (
+            path,
+            record_head,
+            judge(Reading::LinkElsewhere { gitdir, only_here }, lock),
+        ),
+        Look::Status(path, status) => {
+            let head = match (&status.branch, &status.oid) {
+                (Some(name), oid) => Head::Branch {
+                    name: name.clone(),
+                    oid: oid.clone(),
+                },
+                (None, Some(oid)) => Head::Detached { oid: oid.clone() },
+                (None, None) => Head::Unknown,
+            };
+            let state = match facts {
+                Ok(f) => judge(
+                    Reading::Present(git_facts(repo, &status, f, only_here)),
+                    lock,
+                ),
+                Err(e) => not_read(e.clone()),
+            };
+            (path, head, state)
+        }
+    };
     Worktree {
-        creator: creator::attribute(creators, &path, w.locked.as_deref()),
+        creator: creator::attribute(creators, &path, lock.and_then(|l| l.reason.as_deref())),
         path,
-        repo: repo.main.clone().unwrap_or_else(|| repo.common.clone()),
-        head: head(w),
+        repo: repo.shown_as.clone(),
+        head,
         state,
-        lock: w.locked.as_ref().map(|r| Lock {
-            reason: (!r.is_empty()).then(|| r.clone()),
-        }),
+        lock: rec.lock.clone(),
         size: None,
-        created_at: admin.and_then(|a| {
-            let born = std::fs::metadata(a).ok()?.created().ok()?;
-            Some(born.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64)
-        }),
+        created_at: rec.created_at,
     }
 }
 
-/// The one git call made per worktree; the rest is read per repo in `list_repo`.
-fn git_facts(repo: &Repo, path: &Path, head: &Head, timeout: Duration) -> anyhow::Result<GitFacts> {
-    let (changed, untracked) =
-        git::count_status(&git::stdout(path, &["status", "--porcelain"], timeout)?);
-    let changes = if changed + untracked == 0 {
-        Changes::Clean
-    } else {
-        Changes::Dirty { changed, untracked }
+fn git_facts(repo: &Repo, s: &git::Status, f: &RepoFacts, only_here: Option<u32>) -> GitFacts {
+    let changes = match (s.changed, s.untracked) {
+        (0, 0) => Changes::Clean,
+        (changed, untracked) => Changes::Dirty { changed, untracked },
     };
-    let branch_ref = match head {
-        Head::Branch { name, .. } => repo.refs.get(&format!("refs/heads/{name}")),
-        _ => None,
+    let merge = match (&s.oid, &repo.default) {
+        (None, _) => Merge::Unborn,
+        (Some(oid), _) if f.merged.contains_key(oid) => Merge::Merged {
+            into: f.merged[oid].clone(),
+        },
+        (Some(_), Some(d)) => Merge::Unmerged {
+            into: d.refs[0].0.clone(),
+        },
+        (Some(_), None) => Merge::NoDefaultBranch,
     };
-    let upstream = match branch_ref.and_then(|r| Some((r.upstream.as_deref()?, r.upstream_gone))) {
-        None => Upstream::None,
-        Some((up, gone)) => {
-            let name = up
-                .strip_prefix("refs/remotes/")
-                .or_else(|| up.strip_prefix("refs/heads/"))
-                .unwrap_or(up)
-                .to_string();
-            if gone {
-                Upstream::Gone { name }
+    let upstream = match (&s.upstream, s.ahead_behind) {
+        (None, _) => Upstream::None,
+        (Some(name), None) => Upstream::Gone { name: name.clone() },
+        (Some(name), Some((ahead, behind))) => {
+            // A remote branch only if the branch's config names the same ref under
+            // refs/remotes; git prints both kinds by their short names.
+            let configured = s
+                .branch
+                .as_ref()
+                .and_then(|b| repo.refs.get(&format!("refs/heads/{b}")))
+                .and_then(|r| r.upstream.as_deref());
+            if configured == Some(&format!("refs/remotes/{name}")) {
+                Upstream::Tracking {
+                    name: name.clone(),
+                    ahead,
+                    behind,
+                }
             } else {
-                Upstream::Tracking { name }
+                Upstream::Local { name: name.clone() }
             }
         }
     };
-    let oid = head.oid().unwrap_or_default();
-    let merge = match (&repo.default, repo.merged.get(oid)) {
-        (_, Some(into)) => Merge::Merged { into: into.clone() },
-        (Some(d), None) => Merge::Unmerged {
-            into: d.refs[0].0.clone(),
-        },
-        (None, None) => Merge::NoDefaultBranch,
-    };
-    Ok(GitFacts {
+    // An entry names its branch; one made on a detached HEAD is matched by its commit.
+    let stashes = f
+        .stashes
+        .iter()
+        .filter(|st| match &st.branch {
+            Some(b) => s.branch.as_ref() == Some(b),
+            None => s.oid.as_ref() == Some(&st.base),
+        })
+        .count() as u32;
+    GitFacts {
         changes,
         merge,
         upstream,
-        last_commit: repo.commit_times.get(oid).copied(),
-    })
+        stashes,
+        only_here,
+        last_commit: s.oid.as_ref().and_then(|o| f.commit_times.get(o)).copied(),
+    }
 }
 
 /// Maps each head reachable from a default ref to that ref's name. `rev-list <heads> --not
@@ -612,4 +919,33 @@ fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + 
     });
     done.sort_by_key(|(i, _)| *i);
     done.into_iter().map(|(_, r)| r).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worktree::tests::{add, commit, new_repo};
+
+    /// HEAD and cleanliness come from one `git status`, so a commit made after the repo was
+    /// listed is never read as merged.
+    #[test]
+    fn a_commit_made_after_listing_is_not_read_as_merged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let app = base.join("code/app");
+        new_repo(&base, &app);
+        let wt = add(&app, "feat-race", "app-race");
+        let timeout = Duration::from_secs(5);
+        let repo = read_repo(&app.join(".git"), timeout);
+        commit(&wt, "late.txt");
+
+        let rec = &repo.records[0];
+        let look = look(rec, &Protected::new(&base), timeout);
+        let facts = repo_facts(&repo, &[(rec, &look)], timeout);
+        let w = worktree(&repo, rec, look, &facts, &[]);
+        let WorktreeState::Active(f) = &w.state else {
+            panic!("{:?}", w.state);
+        };
+        assert!(matches!(f.merge, Merge::Unmerged { .. }), "{f:?}");
+    }
 }

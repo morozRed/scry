@@ -1,64 +1,62 @@
 //! The Worktrees view as plain data: one row per worktree with a status word, the sentence
 //! that explains it and the evidence behind it. Skins only draw this.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
 
-use super::{Changes, Head, Merge, Orphan, Upstream, Worktree, WorktreeScan, WorktreeState};
+use super::{
+    Changes, Concern, GitFacts, Head, KeptBy, Merge, NotRead, Upstream, Worktree, WorktreeScan,
+    WorktreeState,
+};
 use crate::view::human_bytes;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
-    /// git cannot use it any more; its folder or its record is left behind.
-    Orphaned,
-    /// Clean, unlocked, and merged into the default branch.
-    Merged,
-    /// Clean, unlocked, and its upstream branch is gone.
-    Gone,
-    /// Has changed or untracked files.
+    /// Provably safe to delete.
+    CanGo,
+    /// Only git's record is left, and pruning it frees almost nothing.
+    CanPrune,
+    /// Looks stale, but may hold work.
+    NeedsLook,
+    /// Has uncommitted changes.
     Dirty,
+    /// Clean, and locked.
     Locked,
-    /// Clean, with commits the default branch lacks.
+    /// Clean, with work not yet merged or pushed.
     Active,
-    Unknown,
+    NotRead,
 }
 
 impl Status {
     pub fn word(self) -> &'static str {
         match self {
-            Status::Orphaned => "orphaned",
-            Status::Merged => "merged",
-            Status::Gone => "gone",
+            Status::CanGo => "can go",
+            Status::CanPrune => "can prune",
+            Status::NeedsLook => "needs a look",
             Status::Dirty => "dirty",
             Status::Locked => "locked",
             Status::Active => "active",
-            Status::Unknown => "unknown",
+            Status::NotRead => "not read",
         }
     }
 
-    /// Deleting it loses no work.
+    /// Deleting the folder loses nothing.
     pub fn removable(self) -> bool {
-        matches!(self, Status::Orphaned | Status::Merged | Status::Gone)
+        self == Status::CanGo
     }
 
     pub fn of(w: &Worktree) -> Status {
-        let facts = match &w.state {
-            WorktreeState::Orphaned(_) => return Status::Orphaned,
-            WorktreeState::Unreadable { .. } => return Status::Unknown,
-            WorktreeState::Present(f) => f,
-        };
-        if matches!(facts.changes, Changes::Dirty { .. }) {
-            Status::Dirty
-        } else if w.lock.is_some() {
-            Status::Locked
-        } else if matches!(facts.merge, Merge::Merged { .. }) {
-            Status::Merged
-        } else if matches!(facts.upstream, Upstream::Gone { .. }) {
-            Status::Gone
-        } else {
-            Status::Active
+        match &w.state {
+            WorktreeState::CanGo(_) => Status::CanGo,
+            WorktreeState::CanPrune(_) => Status::CanPrune,
+            WorktreeState::NeedsLook { .. } => Status::NeedsLook,
+            WorktreeState::Dirty(_) => Status::Dirty,
+            WorktreeState::Locked(_) => Status::Locked,
+            WorktreeState::Active(_) => Status::Active,
+            WorktreeState::NotRead(_) => Status::NotRead,
         }
     }
 }
@@ -71,7 +69,9 @@ pub struct WorktreeRow {
     /// With the home folder written as `~`.
     pub path: String,
     pub branch: String,
+    /// None when the folder was not sized.
     pub allocated: Option<u64>,
+    /// At least this many bytes come back at once on delete. None when not sized.
     pub reclaimable: Option<u64>,
     pub creator: String,
     /// Short age of HEAD's commit, such as `3d`.
@@ -85,8 +85,15 @@ pub struct WorktreeRow {
 pub struct WorktreesView {
     pub summary: String,
     pub rows: Vec<WorktreeRow>,
-    /// Bytes freed by deleting every removable worktree.
+    /// Rows per status.
+    pub counts: BTreeMap<Status, usize>,
+    /// Repos with at least one row.
+    pub repos: usize,
+    /// At least this many bytes come back by deleting every worktree that can go and was
+    /// sized.
     pub reclaimable: u64,
+    /// Worktrees that can go but were not sized, so `reclaimable` leaves them out.
+    pub unsized_can_go: usize,
     /// Entries the size walk could not read, over all rows.
     pub skipped: u64,
 }
@@ -103,8 +110,13 @@ impl WorktreesView {
                 &b.name,
             ))
         });
-        let removable: Vec<&WorktreeRow> = rows.iter().filter(|r| r.status.removable()).collect();
-        let reclaimable = removable.iter().filter_map(|r| r.reclaimable).sum();
+        let mut counts = BTreeMap::new();
+        for r in &rows {
+            *counts.entry(r.status).or_insert(0) += 1;
+        }
+        let can_go: Vec<&WorktreeRow> = rows.iter().filter(|r| r.status.removable()).collect();
+        let reclaimable = can_go.iter().filter_map(|r| r.reclaimable).sum();
+        let unsized_can_go = can_go.iter().filter(|r| r.reclaimable.is_none()).count();
         let skipped = scan
             .worktrees
             .iter()
@@ -114,28 +126,38 @@ impl WorktreesView {
         let mut repos: Vec<&str> = rows.iter().map(|r| r.repo.as_str()).collect();
         repos.sort_unstable();
         repos.dedup();
-        let mut summary = match (rows.len(), removable.len()) {
-            (0, _) => format!(
-                "No linked worktrees in {} repos under {}.",
-                scan.repos,
+
+        let mut summary = if rows.is_empty() {
+            format!(
+                "No linked worktrees in {} under {}.",
+                count(scan.repos, "repo"),
                 list_paths(&scan.roots, home)
-            ),
-            (n, 0) => format!(
-                "{} in {}; none is merged, gone or orphaned.",
-                count(n, "worktree"),
-                count(repos.len(), "repo")
-            ),
-            (n, k) if rows.iter().all(|r| r.reclaimable.is_none()) => format!(
-                "{} in {}; {k} can go.",
-                count(n, "worktree"),
-                count(repos.len(), "repo")
-            ),
-            (n, k) => format!(
-                "{} in {}; {k} can go and free {}.",
-                count(n, "worktree"),
+            )
+        } else {
+            let parts: Vec<String> = counts
+                .iter()
+                .map(|(&status, &n)| match status {
+                    Status::CanGo => match (can_go.len() - unsized_can_go, unsized_can_go) {
+                        (0, _) => format!("{n} can go (not sized)"),
+                        (_, 0) => format!("{n} can go and free at least {}", bytes(reclaimable)),
+                        (_, k) => format!(
+                            "{n} can go and free at least {} ({k} of them not sized)",
+                            bytes(reclaimable)
+                        ),
+                    },
+                    Status::CanPrune => format!("{n} can be pruned"),
+                    Status::NeedsLook if n == 1 => "1 needs a look".into(),
+                    Status::NeedsLook => format!("{n} need a look"),
+                    other => format!("{n} {}", other.word()),
+                })
+                .collect();
+            format!(
+                "{} in {} ({} scanned): {}.",
+                count(rows.len(), "worktree"),
                 count(repos.len(), "repo"),
-                bytes(reclaimable)
-            ),
+                scan.repos,
+                parts.join(", ")
+            )
         };
         if skipped > 0 {
             summary.push_str(&format!(
@@ -145,19 +167,31 @@ impl WorktreesView {
         }
         WorktreesView {
             summary,
+            repos: repos.len(),
             rows,
+            counts,
             reclaimable,
+            unsized_can_go,
             skipped,
         }
     }
 }
 
+/// The size, when the walk read the folder.
+fn sized(w: &Worktree) -> Option<&crate::size::SubtreeSize> {
+    w.size.as_ref().filter(|s| s.error.is_none())
+}
+
+fn folder_gone(w: &Worktree) -> bool {
+    match &w.state {
+        WorktreeState::CanPrune(_) => true,
+        WorktreeState::NeedsLook { concerns, .. } => concerns.contains(&Concern::FolderMissing),
+        _ => false,
+    }
+}
+
 fn row(w: &Worktree, now: i64, home: &Path) -> WorktreeRow {
     let status = Status::of(w);
-    let facts = match &w.state {
-        WorktreeState::Present(f) => Some(f),
-        _ => None,
-    };
     WorktreeRow {
         status,
         name: w.name(),
@@ -168,146 +202,210 @@ fn row(w: &Worktree, now: i64, home: &Path) -> WorktreeRow {
             Head::Detached { oid } => format!("({})", short(oid)),
             Head::Unknown => String::new(),
         },
-        allocated: w.size.as_ref().map(|s| s.size.allocated),
-        reclaimable: w.size.as_ref().map(|s| s.size.reclaimable),
+        allocated: sized(w).map(|s| s.size.allocated),
+        reclaimable: sized(w).map(|s| s.size.reclaimable),
         creator: w.creator.agent.map_or("unknown", |a| a.label()).to_string(),
-        last_commit: facts
+        last_commit: w
+            .state
+            .facts()
             .and_then(|f| f.last_commit)
             .map(|t| short_age(now - t)),
-        sentence: sentence(w, status, now, home),
+        sentence: sentence(w, now, home),
         evidence: evidence(w, now, home),
         worktree: w.clone(),
     }
 }
 
-fn sentence(w: &Worktree, status: Status, now: i64, home: &Path) -> String {
+fn sentence(w: &Worktree, now: i64, home: &Path) -> String {
     let name = w.name();
-    let frees = match &w.size {
-        Some(s) if s.error.is_none() => {
-            format!("; deleting it frees {}", bytes(s.size.reclaimable))
-        }
-        _ => String::new(),
+    let frees = match sized(w) {
+        Some(s) => format!("; deleting it frees at least {}", bytes(s.size.reclaimable)),
+        None => String::new(),
     };
-    let prune = if w.lock.is_some() {
-        "it is locked, so `git worktree prune` keeps the record"
-    } else {
-        "`git worktree prune` clears the record"
-    };
-    let repo = w.repo_name();
-    let facts = match &w.state {
-        WorktreeState::Orphaned(Orphan::Missing { .. }) => {
-            return format!("{name} is registered in {repo} but its folder is gone; {prune}.");
+    match &w.state {
+        WorktreeState::CanGo(safe) => match safe.kept_by() {
+            KeptBy::DefaultBranch { name: into } => {
+                format!("{name} is merged into {into} and clean{frees}.")
+            }
+            KeptBy::Upstream { name: up } => {
+                format!("{name} is clean and every commit is on {up}{frees}.")
+            }
+        },
+        WorktreeState::CanPrune(_) => format!(
+            "{name} is registered in {} but its folder is gone; `git worktree prune` removes \
+             only the record and frees almost nothing.",
+            w.repo_name()
+        ),
+        WorktreeState::NeedsLook { concerns, .. } => {
+            let parts: Vec<String> = concerns.iter().map(|c| concern(w, c, home)).collect();
+            format!("{name} needs a look: {}.", and_list(&parts))
         }
-        WorktreeState::Orphaned(Orphan::Unusable { .. }) => {
-            let folder = match &w.size {
-                Some(s) if s.error.is_none() => {
-                    format!(
-                        ", and deleting the folder frees {}",
-                        bytes(s.size.reclaimable)
-                    )
-                }
-                _ => String::new(),
+        WorktreeState::Dirty(f) => {
+            let Changes::Dirty { changed, untracked } = f.changes else {
+                return format!("{name} has uncommitted changes.");
             };
-            return format!(
-                "{name} is registered in {repo} but git can no longer use its folder; {prune}{folder}."
-            );
-        }
-        WorktreeState::Orphaned(Orphan::BrokenPointer { gitdir }) => {
-            return format!(
-                "{name}'s .git file points at {}, which is gone{frees}.",
-                tilde(gitdir, home)
-            );
-        }
-        WorktreeState::Unreadable { error } => {
-            return format!("git could not read {name}: {error}.");
-        }
-        WorktreeState::Present(f) => f,
-    };
-    match (status, &facts.changes, &facts.merge, &facts.upstream) {
-        (Status::Dirty, Changes::Dirty { changed, untracked }, merge, _) => {
-            let what = changes_phrase(*changed, *untracked);
+            let what = changes_phrase(changed, untracked);
             let them = if changed + untracked == 1 {
                 "it"
             } else {
                 "them"
             };
-            match merge {
+            match &f.merge {
                 Merge::Merged { into } => format!(
                     "{name} is merged into {into} but has {what}; deleting it would lose {them}."
                 ),
                 _ => format!("{name} has {what}; deleting it would lose {them}."),
             }
         }
-        (Status::Locked, ..) => {
-            let by = match w.lock.as_ref().and_then(|l| l.reason.as_deref()) {
-                Some(r) if r.starts_with("claude agent ") => match claude_lock_pid(r) {
-                    Some(pid) => format!(" by a Claude Code agent (pid {pid})"),
-                    None => " by a Claude Code agent".into(),
-                },
-                Some(r) => format!(" (\"{r}\")"),
-                None => String::new(),
-            };
-            format!("{name} is locked{by}; git keeps it until it is unlocked.")
+        WorktreeState::Locked(_) => {
+            format!(
+                "{name} is locked{}; git keeps it until it is unlocked.",
+                locked_by(w)
+            )
         }
-        (Status::Merged, _, Merge::Merged { into }, _) => {
-            format!("{name} is merged into {into} and clean{frees}.")
+        WorktreeState::Active(f) => active(&name, f, now),
+        WorktreeState::NotRead(NotRead::ProtectedFolder { folder }) => format!(
+            "{name} was not read: it leads into {}, which macOS asks permission for.",
+            tilde(folder, home)
+        ),
+        WorktreeState::NotRead(NotRead::Failed { error }) => {
+            format!("{name} could not be read: {error}.")
         }
-        (Status::Gone, _, _, Upstream::Gone { name: up }) => {
-            format!("{name} tracks {up}, which is gone, and is clean{frees}.")
-        }
-        (_, _, Merge::Unmerged { into }, _) => match facts.last_commit {
-            Some(t) => format!(
-                "{name} has commits not in {into}; its last commit was {}.",
-                long_age(now - t)
-            ),
-            None => format!("{name} has commits not in {into}."),
-        },
+    }
+}
+
+fn active(name: &str, f: &GitFacts, now: i64) -> String {
+    let when = f
+        .last_commit
+        .map(|t| format!("; its last commit was {}", long_age(now - t)))
+        .unwrap_or_default();
+    match (&f.merge, &f.upstream) {
+        (
+            _,
+            Upstream::Tracking {
+                name: up, ahead, ..
+            },
+        ) if *ahead > 0 => format!(
+            "{name} has {} not pushed to {up}{when}.",
+            count(*ahead as usize, "commit")
+        ),
+        (Merge::Unmerged { into }, _) => format!("{name} has commits not in {into}{when}."),
+        (Merge::Unborn, _) => format!("{name} has no commit yet."),
         _ => format!("{name} is clean, and its repo has no main branch to compare it with."),
+    }
+}
+
+fn concern(w: &Worktree, c: &Concern, home: &Path) -> String {
+    let holds = match sized(w) {
+        Some(s) => format!(" holds {}", count(s.files as usize, "file")),
+        None => String::new(),
+    };
+    match c {
+        Concern::UpstreamGone { upstream } => format!("its upstream {upstream} is gone"),
+        Concern::OnlyHere { commits } => format!(
+            "{} {} nowhere else",
+            count(*commits as usize, "commit"),
+            if *commits == 1 { "exists" } else { "exist" }
+        ),
+        Concern::Stashed { entries } => format!(
+            "{} {} made on its branch",
+            count(*entries as usize, "stash entry"),
+            if *entries == 1 { "was" } else { "were" }
+        ),
+        Concern::Locked { .. } => format!("it is locked{}", locked_by(w)),
+        Concern::FolderMissing => "its folder is gone".into(),
+        Concern::NoGitLink if holds.is_empty() => "its folder has no .git link".into(),
+        Concern::NoGitLink => format!("its folder has no .git link but{holds}"),
+        Concern::LinkElsewhere { gitdir } => format!(
+            "its .git link points at {} instead of its own record",
+            tilde(gitdir, home)
+        ),
+        Concern::BrokenLink { gitdir } if holds.is_empty() => {
+            format!(
+                "its .git link points at {}, which is gone",
+                tilde(gitdir, home)
+            )
+        }
+        Concern::BrokenLink { gitdir } => format!(
+            "its .git link points at {}, which is gone, and its folder{holds}",
+            tilde(gitdir, home)
+        ),
+    }
+}
+
+fn locked_by(w: &Worktree) -> String {
+    match w.lock.as_ref().and_then(|l| l.reason.as_deref()) {
+        Some(r) if r.starts_with("claude agent ") => match claude_lock_pid(r) {
+            Some(pid) => format!(" by a Claude Code agent (pid {pid})"),
+            None => " by a Claude Code agent".into(),
+        },
+        Some(r) => format!(" (\"{r}\")"),
+        None => String::new(),
     }
 }
 
 fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
     let mut out = vec![format!("path {}", tilde(&w.path, home))];
     match &w.head {
-        Head::Branch { name, oid } => out.push(format!("branch {name} at {}", short(oid))),
+        Head::Branch {
+            name,
+            oid: Some(oid),
+        } => out.push(format!("branch {name} at {}", short(oid))),
+        Head::Branch { name, oid: None } => out.push(format!("branch {name}, with no commit")),
         Head::Detached { oid } => out.push(format!("detached at {}", short(oid))),
         Head::Unknown => {}
     }
+    if let Some(f) = w.state.facts() {
+        facts_evidence(f, now, &mut out);
+    }
     match &w.state {
-        WorktreeState::Orphaned(Orphan::Missing { git_says, .. }) => out.push(match git_says {
-            Some(why) => format!("git worktree list: prunable, {why}"),
-            None => "the folder does not exist".into(),
-        }),
-        WorktreeState::Orphaned(Orphan::Unusable { git_says, .. }) => out.push(match git_says {
-            Some(why) => format!("git worktree list: prunable, {why}"),
-            None => "the folder has no .git file".into(),
-        }),
-        WorktreeState::Orphaned(Orphan::BrokenPointer { gitdir }) => out.push(format!(
-            ".git points at {}, which does not exist",
-            tilde(gitdir, home)
-        )),
-        WorktreeState::Unreadable { error } => out.push(error.clone()),
-        WorktreeState::Present(f) => {
-            out.push(match f.changes {
-                Changes::Clean => "git status: clean".into(),
-                Changes::Dirty { changed, untracked } => {
-                    format!("git status: {changed} changed, {untracked} untracked")
-                }
-            });
-            out.push(match &f.merge {
-                Merge::Merged { into } => format!("HEAD is in {into}"),
-                Merge::Unmerged { into } => format!("HEAD has commits not in {into}"),
-                Merge::NoDefaultBranch => "no origin/HEAD, main or master to compare with".into(),
-            });
-            match &f.upstream {
-                Upstream::None => {}
-                Upstream::Tracking { name } => out.push(format!("upstream {name}")),
-                Upstream::Gone { name } => out.push(format!("upstream {name} is gone")),
-            }
-            if let Some(t) = f.last_commit {
-                out.push(format!("last commit {}", long_age(now - t)));
+        WorktreeState::CanGo(safe) => {
+            let (KeptBy::DefaultBranch { name } | KeptBy::Upstream { name }) = safe.kept_by();
+            out.push(format!(
+                "a valid, unlocked worktree with no changes and no stash entries; {name} holds \
+                 every commit of HEAD"
+            ));
+        }
+        WorktreeState::CanPrune(p) => {
+            out.push("the folder does not exist".into());
+            if let (Some(n), Head::Branch { name, .. }) =
+                (p.branch_only().filter(|&n| n > 0), &w.head)
+            {
+                out.push(format!(
+                    "branch {name} keeps {} that {} nowhere else; pruning keeps the branch",
+                    count(n as usize, "commit"),
+                    if n == 1 { "exists" } else { "exist" }
+                ));
             }
         }
+        WorktreeState::NeedsLook { concerns, facts } => {
+            for c in concerns {
+                match c {
+                    Concern::FolderMissing => out.push("the folder does not exist".into()),
+                    Concern::NoGitLink => out.push("the folder has no .git file".into()),
+                    Concern::LinkElsewhere { gitdir } => out.push(format!(
+                        ".git points at {}, not at its own record",
+                        tilde(gitdir, home)
+                    )),
+                    Concern::BrokenLink { gitdir } => out.push(format!(
+                        ".git points at {}, which does not exist",
+                        tilde(gitdir, home)
+                    )),
+                    Concern::OnlyHere { commits } if facts.is_none() => out.push(format!(
+                        "{} {} nowhere else",
+                        count(*commits as usize, "commit"),
+                        if *commits == 1 { "exists" } else { "exist" }
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        WorktreeState::NotRead(NotRead::ProtectedFolder { folder }) => out.push(format!(
+            "not read: protected folder {}",
+            tilde(folder, home)
+        )),
+        WorktreeState::NotRead(NotRead::Failed { error }) => out.push(format!("not read: {error}")),
+        WorktreeState::Dirty(_) | WorktreeState::Locked(_) | WorktreeState::Active(_) => {}
     }
     if let Some(lock) = &w.lock {
         out.push(match &lock.reason {
@@ -324,15 +422,20 @@ fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
     });
     if let Some(s) = &w.size {
         match &s.error {
+            Some(_) if folder_gone(w) => {}
             Some(e) => out.push(format!("not sized: {e}")),
             None => {
                 let mut line = format!(
-                    "{} on disk, {} freed at once by a delete",
+                    "{} on disk in {}; a delete frees at least {} at once",
                     bytes(s.size.allocated),
+                    count(s.files as usize, "file"),
                     bytes(s.size.reclaimable)
                 );
                 if s.size.reclaimable < s.size.allocated {
-                    line.push_str("; the rest is shared with clones, snapshots or hard links");
+                    line.push_str(
+                        "; the rest is shared with clones, snapshots or hard links, or held \
+                         by clones that all sit inside it",
+                    );
                 }
                 out.push(line);
                 if s.skipped > 0 {
@@ -350,6 +453,50 @@ fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
     out
 }
 
+fn facts_evidence(f: &GitFacts, now: i64, out: &mut Vec<String>) {
+    out.push(match f.changes {
+        Changes::Clean => "git status: clean, untracked and submodule changes included".into(),
+        Changes::Dirty { changed, untracked } => {
+            format!("git status: {}", changes_phrase(changed, untracked))
+        }
+    });
+    out.push(match &f.merge {
+        Merge::Merged { into } => format!("HEAD is in {into}"),
+        Merge::Unmerged { into } => format!("HEAD has commits not in {into}"),
+        Merge::Unborn => "HEAD has no commit yet".into(),
+        Merge::NoDefaultBranch => "no origin/HEAD, main or master to compare with".into(),
+    });
+    match &f.upstream {
+        Upstream::None => out.push("no upstream".into()),
+        Upstream::Tracking {
+            name,
+            ahead,
+            behind,
+        } => out.push(format!("upstream {name}: {ahead} ahead, {behind} behind")),
+        Upstream::Local { name } => out.push(format!("upstream {name} is a local branch")),
+        Upstream::Gone { name } => out.push(format!(
+            "upstream {name} is gone; a squash merge and a closed pull request look the same, \
+             so this is not read as merged"
+        )),
+    }
+    if f.stashes > 0 {
+        out.push(format!(
+            "{} made on its branch or at its HEAD",
+            count(f.stashes as usize, "stash entry")
+        ));
+    }
+    if let Some(n) = f.only_here {
+        out.push(format!(
+            "{} {} nowhere else",
+            count(n as usize, "commit"),
+            if n == 1 { "exists" } else { "exist" }
+        ));
+    }
+    if let Some(t) = f.last_commit {
+        out.push(format!("last commit {}", long_age(now - t)));
+    }
+}
+
 /// Claude Code writes "claude agent <name> (pid <pid> start …)".
 fn claude_lock_pid(reason: &str) -> Option<u32> {
     let rest = reason.split("(pid ").nth(1)?;
@@ -361,17 +508,33 @@ fn claude_lock_pid(reason: &str) -> Option<u32> {
 
 fn changes_phrase(changed: u32, untracked: u32) -> String {
     match (changed, untracked) {
-        (c, 0) => count(c as usize, "changed file"),
-        (0, u) => count(u as usize, "untracked file"),
-        (c, u) => format!("{} and {u} untracked", count(c as usize, "changed file")),
+        (c, 0) => count(c as usize, "changed entry"),
+        (0, u) => count(u as usize, "untracked entry"),
+        (c, u) => format!(
+            "{} and {}",
+            count(c as usize, "changed entry"),
+            count(u as usize, "untracked entry")
+        ),
+    }
+}
+
+fn and_list(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
 fn count(n: usize, noun: &str) -> String {
-    match (n, noun) {
-        (1, _) => format!("1 {noun}"),
-        (_, "entry") => format!("{n} entries"),
-        _ => format!("{n} {noun}s"),
+    // "entry" becomes "entries", but "day" becomes "days".
+    let stem = noun
+        .strip_suffix('y')
+        .filter(|s| !s.ends_with(['a', 'e', 'o', 'u']));
+    match stem {
+        _ if n == 1 => format!("1 {noun}"),
+        Some(stem) => format!("{n} {stem}ies"),
+        None => format!("{n} {noun}s"),
     }
 }
 

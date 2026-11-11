@@ -138,8 +138,8 @@ mod tests {
     #[test]
     fn path_convention_comes_first_and_a_lock_reason_adds_evidence() {
         let c = who(
-            "/Users/dev/sources/scry/.claude/worktrees/agent-a46",
-            Some("claude agent agent-a46 (pid 1654 start Wed Nov 11 16:14:45 2026)"),
+            "/Users/dev/code/app/.claude/worktrees/agent-1234abcd",
+            Some("claude agent agent-1234abcd (pid 4242 start Mon Jan  5 09:00:00 2026)"),
         );
         assert_eq!(c.agent, Some(Agent::ClaudeCode));
         assert_eq!(c.evidence.len(), 2);
@@ -149,13 +149,13 @@ mod tests {
             "{c:?}"
         );
 
-        let c = who("/Users/dev/.codex/worktrees/1c11/app", None);
+        let c = who("/Users/dev/.codex/worktrees/0f0f/app", None);
         assert_eq!(c.agent, Some(Agent::Codex));
 
-        let c = who("/Users/dev/sources/app-wt", Some("manual"));
+        let c = who("/Users/dev/code/app-wt", Some("manual"));
         assert_eq!(c, ProbableCreator::default(), "unknown carries no evidence");
 
-        let c = who("/Users/dev/sources/x/.claude/worktrees", None);
+        let c = who("/Users/dev/code/x/.claude/worktrees", None);
         assert_eq!(c.agent, None, "the folder itself is not a worktree");
     }
 }

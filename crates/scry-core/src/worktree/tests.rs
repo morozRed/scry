@@ -1,17 +1,27 @@
-//! Builds real repos and worktrees in a temporary home and checks what a scan reports.
+//! Builds real repos and worktrees in a temporary home, one for each state, and checks what a
+//! scan and the Worktrees view say about each.
 
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::view::{Status, WorktreesView};
+use super::view::{WorktreeRow, WorktreesView};
 use super::*;
 
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+/// Runs git to build a fixture, away from the user's config and from any `GIT_*` variable.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let mut cmd = Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key.as_bytes().starts_with(b"GIT_") {
+            cmd.env_remove(key);
+        }
+    }
+    let out = cmd
         .arg("-C")
         .arg(dir)
         .args([
@@ -37,6 +47,7 @@ fn git(dir: &Path, args: &[&str]) {
         dir.display(),
         String::from_utf8_lossy(&out.stderr)
     );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 fn write(path: &Path, text: &str) {
@@ -58,7 +69,46 @@ fn s(p: &Path) -> &str {
     p.to_str().unwrap()
 }
 
-/// A home with one repo under `code/` and one worktree in each state.
+pub(super) fn commit(dir: &Path, file: &str) {
+    write(&dir.join(file), &format!("{file}\n"));
+    git(dir, &["add", file]);
+    git(dir, &["commit", "-qm", file]);
+}
+
+/// A clone at `dir` of a bare remote that holds one commit on `main`.
+pub(super) fn new_repo(base: &Path, dir: &Path) {
+    let name = dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\n', "-");
+    let seed = base.join(format!("seed-{name}"));
+    let remote = base.join(format!("{name}.git"));
+    write(&seed.join("README"), "hello\n");
+    write(&seed.join(".gitignore"), "node_modules/\n");
+    git(base, &["init", "-q", s(&seed)]);
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-qm", "first"]);
+    git(base, &["clone", "-q", "--bare", s(&seed), s(&remote)]);
+    fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    git(base, &["clone", "-q", s(&remote), s(dir)]);
+}
+
+/// A worktree of `repo` on a new branch, in the folder beside it called `name`.
+pub(super) fn add(repo: &Path, branch: &str, name: &str) -> PathBuf {
+    let path = repo.parent().unwrap().join(name);
+    git(repo, &["worktree", "add", "-q", "-b", branch, s(&path)]);
+    path
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A home with one repo under `code/` and a worktree in each state.
 struct Fixture {
     _tmp: tempfile::TempDir,
     home: PathBuf,
@@ -69,34 +119,22 @@ fn fixture() -> Fixture {
     let base = tmp.path().canonicalize().unwrap();
     let home = base.join("home");
     let code = home.join("code");
-    let seed = base.join("seed");
-    let remote = base.join("remote.git");
     let app = code.join("app");
+    new_repo(&base, &app);
 
-    write(&seed.join("README"), "hello\n");
-    write(&seed.join(".gitignore"), "node_modules/\n");
-    git(&base, &["init", "-q", s(&seed)]);
-    git(&seed, &["add", "."]);
-    git(&seed, &["commit", "-qm", "first"]);
-    git(&base, &["clone", "-q", "--bare", s(&seed), s(&remote)]);
-    fs::create_dir_all(&code).unwrap();
-    git(&code, &["clone", "-q", s(&remote), "app"]);
+    // A submodule has a .git file too, and is not a worktree.
+    let lib = base.join("lib");
+    write(&lib.join("lib.rs"), "\n");
+    git(&base, &["init", "-q", s(&lib)]);
+    git(&lib, &["add", "."]);
+    git(&lib, &["commit", "-qm", "lib"]);
+    git(&app, &["submodule", "add", "-q", s(&lib), "vendor/lib"]);
+    git(&app, &["commit", "-qm", "add lib"]);
+    git(&app, &["push", "-q", "origin", "main"]);
 
     // Merged: a branch with a commit, merged into main and pushed.
-    git(
-        &app,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feat-merged",
-            "../app-merged",
-        ],
-    );
-    write(&code.join("app-merged/feature.txt"), "done\n");
-    git(&code.join("app-merged"), &["add", "."]);
-    git(&code.join("app-merged"), &["commit", "-qm", "feature"]);
+    let merged = add(&app, "feat-merged", "app-merged");
+    commit(&merged, "feature.txt");
     git(
         &app,
         &["merge", "-q", "--no-ff", "feat-merged", "-m", "merge"],
@@ -105,8 +143,8 @@ fn fixture() -> Fixture {
 
     // pnpm-style: a dependency cloned from a store outside the worktree.
     write_mib(&base.join("store/pkg/index.js"), 1);
-    write_mib(&code.join("app-merged/node_modules/own.bin"), 2);
-    let clone_to = code.join("app-merged/node_modules/pkg/index.js");
+    write_mib(&merged.join("node_modules/own.bin"), 2);
+    let clone_to = merged.join("node_modules/pkg/index.js");
     fs::create_dir_all(clone_to.parent().unwrap()).unwrap();
     let c = |p: &Path| CString::new(p.as_os_str().as_bytes()).unwrap();
     let rc = unsafe {
@@ -118,56 +156,67 @@ fn fixture() -> Fixture {
     };
     assert_eq!(rc, 0, "clonefile: {}", std::io::Error::last_os_error());
 
-    // Dirty: one tracked change, one untracked file.
-    git(
-        &app,
-        &["worktree", "add", "-q", "-b", "feat-dirty", "../app-dirty"],
-    );
-    write(&code.join("app-dirty/README"), "changed\n");
-    write(&code.join("app-dirty/new.txt"), "new\n");
+    // Dirty: a tracked change, an untracked file and an untracked folder.
+    let dirty = add(&app, "feat-dirty", "app-dirty");
+    write(&dirty.join("README"), "changed\n");
+    write(&dirty.join("new.txt"), "new\n");
+    write(&dirty.join("newdir/a"), "a\n");
+    write(&dirty.join("newdir/b"), "b\n");
 
-    // Upstream gone: pushed with tracking, then deleted on the remote and pruned here.
-    git(
-        &app,
-        &["worktree", "add", "-q", "-b", "feat-gone", "../app-gone"],
-    );
-    write(&code.join("app-gone/gone.txt"), "x\n");
-    git(&code.join("app-gone"), &["add", "."]);
-    git(&code.join("app-gone"), &["commit", "-qm", "gone"]);
-    git(
-        &code.join("app-gone"),
-        &["push", "-q", "-u", "origin", "feat-gone"],
-    );
+    // Pushed: every commit is on its upstream, which still exists.
+    let pushed = add(&app, "feat-pushed", "app-pushed");
+    commit(&pushed, "pushed.txt");
+    git(&pushed, &["push", "-q", "-u", "origin", "feat-pushed"]);
+
+    // Ahead: pushed, then one more commit that only this worktree has.
+    let ahead = add(&app, "feat-ahead", "app-ahead");
+    commit(&ahead, "ahead.txt");
+    git(&ahead, &["push", "-q", "-u", "origin", "feat-ahead"]);
+    commit(&ahead, "ahead2.txt");
+
+    // Upstream gone: pushed with tracking, then deleted on the remote and pruned here. Its
+    // commit was never merged, as after a pull request closed without merging.
+    let gone = add(&app, "feat-gone", "app-gone");
+    commit(&gone, "gone.txt");
+    git(&gone, &["push", "-q", "-u", "origin", "feat-gone"]);
     git(&app, &["push", "-q", "origin", "--delete", "feat-gone"]);
     git(&app, &["fetch", "-q", "--prune"]);
 
-    // Orphaned: registered, folder deleted.
-    git(
-        &app,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feat-orphan",
-            "../app-orphan",
-        ],
-    );
-    fs::remove_dir_all(code.join("app-orphan")).unwrap();
+    // Stashed: merged and clean, but its edit was stashed on its branch.
+    let stash = add(&app, "feat-stash", "app-stash");
+    write(&stash.join("README"), "stashed\n");
+    git(&stash, &["stash", "-q"]);
 
-    // Orphaned: registered, folder left behind without its .git file.
+    // Registered, folder deleted. Its branch keeps a commit no other ref has.
+    let orphan = add(&app, "feat-orphan", "app-orphan");
+    commit(&orphan, "orphan.txt");
+    fs::remove_dir_all(&orphan).unwrap();
+
+    // Registered, folder left behind without its .git file but with edits in it.
+    let unusable = add(&app, "feat-unusable", "app-unusable");
+    write(&unusable.join("README"), "edited\n");
+    write(&unusable.join("notes.txt"), "notes\n");
+    fs::remove_file(unusable.join(".git")).unwrap();
+
+    // Locked by hand, folder missing, as when it sits on a drive that is not mounted.
+    let away = add(&app, "feat-away", "app-away");
     git(
         &app,
         &[
             "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feat-unusable",
-            "../app-unusable",
+            "lock",
+            "--reason",
+            "on an external drive",
+            s(&away),
         ],
     );
-    fs::remove_file(code.join("app-unusable/.git")).unwrap();
+    fs::remove_dir_all(&away).unwrap();
+
+    // Detached, with a commit no branch has, folder deleted: pruning the record loses it.
+    let lost = code.join("app-lost");
+    git(&app, &["worktree", "add", "-q", "--detach", s(&lost)]);
+    commit(&lost, "lost.txt");
+    fs::remove_dir_all(&lost).unwrap();
 
     // A Claude Code subagent's worktree, locked the way Claude Code locks it.
     git(
@@ -187,7 +236,7 @@ fn fixture() -> Fixture {
             "worktree",
             "lock",
             "--reason",
-            "claude agent agent-abc (pid 42 start Wed Nov 11 16:14:45 2026)",
+            "claude agent agent-abc (pid 4242 start Mon Jan  5 09:00:00 2026)",
             ".claude/worktrees/agent-abc",
         ],
     );
@@ -207,26 +256,28 @@ fn fixture() -> Fixture {
         ],
     );
 
-    // A submodule has a .git file too, and is not a worktree.
-    let lib = base.join("lib");
-    write(&lib.join("lib.rs"), "\n");
-    git(&base, &["init", "-q", s(&lib)]);
-    git(&lib, &["add", "."]);
-    git(&lib, &["commit", "-qm", "lib"]);
-    git(&app, &["submodule", "add", "-q", s(&lib), "vendor/lib"]);
-    git(&app, &["commit", "-qm", "add lib"]);
-
-    // A .git file that points at a repo deleted long ago.
+    // A .git file that points at a repo deleted long ago, next to files that may be work.
     write(
         &code.join("stale/.git"),
         &format!("gitdir: {}\n", s(&base.join("gone/.git/worktrees/stale"))),
     );
+    write(&code.join("stale/draft.md"), "draft\n");
+
+    // Clean by git's default status, but with an untracked file the repo's config hides.
+    let hidden = add(&app, "feat-hidden", "app-hidden");
+    write(&hidden.join("secret.txt"), "work\n");
+    // Clean by git's default status, but with an edit inside a submodule.
+    let sub = add(&app, "feat-sub", "app-sub");
+    git(&sub, &["submodule", "update", "--init", "-q"]);
+    write(&sub.join("vendor/lib/lib.rs"), "edited\n");
+    git(&app, &["config", "status.showUntrackedFiles", "no"]);
+    git(&app, &["config", "diff.ignoreSubmodules", "all"]);
 
     Fixture { _tmp: tmp, home }
 }
 
 /// The second root starts inside the checkout, so the walk meets the submodule's `.git` file
-/// and has to ask git what it is.
+/// and has to tell it from a worktree.
 fn scan_fixture(f: &Fixture) -> WorktreeScan {
     let roots = vec![f.home.join("code"), f.home.join("code/app/vendor")];
     let mut scan = scan(&ScanOptions::new(&f.home, roots));
@@ -234,105 +285,258 @@ fn scan_fixture(f: &Fixture) -> WorktreeScan {
     scan
 }
 
-fn find<'a>(scan: &'a WorktreeScan, name: &str) -> &'a Worktree {
-    scan.worktrees
-        .iter()
-        .find(|w| w.name() == name)
-        .unwrap_or_else(|| {
-            let names: Vec<String> = scan.worktrees.iter().map(Worktree::name).collect();
-            panic!("{name} not in {names:?}")
-        })
+fn view(f: &Fixture) -> WorktreesView {
+    WorktreesView::new(&scan_fixture(f), now(), &f.home)
 }
 
-fn facts(w: &Worktree) -> &GitFacts {
-    match &w.state {
-        WorktreeState::Present(f) => f,
-        other => panic!("{} is {other:?}", w.name()),
+fn row<'a>(v: &'a WorktreesView, name: &str) -> &'a WorktreeRow {
+    v.rows.iter().find(|r| r.name == name).unwrap_or_else(|| {
+        let names: Vec<&str> = v.rows.iter().map(|r| r.name.as_str()).collect();
+        panic!("{name:?} not in {names:?}")
+    })
+}
+
+fn says(r: &WorktreeRow, text: &str) -> bool {
+    r.sentence.contains(text) || r.evidence.iter().any(|e| e.contains(text))
+}
+
+#[test]
+fn reads_each_state_and_skips_the_submodule() {
+    let f = fixture();
+    let scan = scan_fixture(&f);
+    assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
+    let v = WorktreesView::new(&scan, now(), &f.home);
+    let words: Vec<(&str, &str)> = v
+        .rows
+        .iter()
+        .map(|r| (r.name.as_str(), r.status.word()))
+        .collect();
+    let mut want = vec![
+        ("app-merged", "can go"),
+        ("1a2b/app", "can go"),
+        ("app-pushed", "can go"),
+        ("app-orphan", "can prune"),
+        ("app-gone", "needs a look"),
+        ("app-stash", "needs a look"),
+        ("app-unusable", "needs a look"),
+        ("app-away", "needs a look"),
+        ("app-lost", "needs a look"),
+        ("stale", "needs a look"),
+        ("app-dirty", "dirty"),
+        ("app-hidden", "dirty"),
+        ("app-sub", "dirty"),
+        ("agent-abc", "locked"),
+        ("app-ahead", "active"),
+    ];
+    let mut got = words.clone();
+    want.sort();
+    got.sort();
+    assert_eq!(got, want, "the submodule is not a worktree");
+    assert_eq!(row(&v, "stale").repo, "gone");
+    assert!(
+        scan.worktrees
+            .iter()
+            .find(|w| w.name() == "agent-abc")
+            .unwrap()
+            .created_at
+            .is_some()
+    );
+}
+
+#[test]
+fn hidden_untracked_files_and_submodule_edits_count_as_changes() {
+    let f = fixture();
+    let v = view(&f);
+    for name in ["app-hidden", "app-sub"] {
+        let r = row(&v, name);
+        assert!(!r.status.removable(), "{name}: {}", r.sentence);
+        assert_eq!(r.status.word(), "dirty", "{name}: {}", r.sentence);
+    }
+    assert!(
+        row(&v, "app-hidden")
+            .sentence
+            .contains("has 1 untracked entry;"),
+        "{}",
+        row(&v, "app-hidden").sentence
+    );
+    assert!(
+        row(&v, "app-sub").sentence.contains("has 1 changed entry;"),
+        "{}",
+        row(&v, "app-sub").sentence
+    );
+}
+
+#[test]
+fn can_go_only_with_proof_from_the_default_branch_or_a_live_upstream() {
+    let f = fixture();
+    let v = view(&f);
+    let mut removable: Vec<&str> = v
+        .rows
+        .iter()
+        .filter(|r| r.status.removable())
+        .map(|r| r.name.as_str())
+        .collect();
+    removable.sort();
+    assert_eq!(removable, ["1a2b/app", "app-merged", "app-pushed"]);
+    assert!(
+        row(&v, "app-pushed")
+            .sentence
+            .starts_with("app-pushed is clean and every commit is on origin/feat-pushed;"),
+        "{}",
+        row(&v, "app-pushed").sentence
+    );
+    assert!(
+        says(
+            row(&v, "app-ahead"),
+            "1 commit not pushed to origin/feat-ahead"
+        ),
+        "{:?}",
+        row(&v, "app-ahead")
+    );
+    let stash = row(&v, "app-stash");
+    assert_eq!(
+        stash.sentence,
+        "app-stash needs a look: 1 stash entry was made on its branch."
+    );
+}
+
+#[test]
+fn an_orphan_is_never_removable_without_proof() {
+    let f = fixture();
+    let v = view(&f);
+    for (name, why) in [
+        ("app-unusable", "its folder has no .git link but holds "),
+        ("stale", "which is gone"),
+        ("app-away", "locked: on an external drive"),
+        ("app-lost", "1 commit exists nowhere else"),
+    ] {
+        let r = row(&v, name);
+        assert!(!r.status.removable(), "{name}: {}", r.sentence);
+        assert_eq!(r.status.word(), "needs a look", "{name}: {}", r.sentence);
+        assert!(says(r, why), "{name} should say {why:?}: {r:?}");
     }
 }
 
 #[test]
-fn reads_each_worktree_state_and_skips_the_submodule() {
+fn a_missing_folder_can_be_pruned_and_frees_nothing() {
     let f = fixture();
-    let scan = scan_fixture(&f);
-    assert!(scan.warnings.is_empty(), "{:?}", scan.warnings);
-    let names: Vec<String> = scan.worktrees.iter().map(Worktree::name).collect();
-    assert_eq!(scan.worktrees.len(), 8, "{names:?}");
+    let v = view(&f);
+    let r = row(&v, "app-orphan");
+    assert!(!r.status.removable(), "{}", r.sentence);
+    assert_eq!(r.status.word(), "can prune");
+    assert_eq!(r.reclaimable, None);
+    assert_eq!(
+        r.sentence,
+        "app-orphan is registered in app but its folder is gone; `git worktree prune` removes \
+         only the record and frees almost nothing."
+    );
     assert!(
-        !names.iter().any(|n| n.contains("lib")),
-        "the submodule is not a worktree: {names:?}"
-    );
-
-    let merged = find(&scan, "app-merged");
-    assert_eq!(Status::of(merged), Status::Merged);
-    assert_eq!(
-        facts(merged).merge,
-        Merge::Merged {
-            into: "origin/main".into()
-        }
-    );
-    assert_eq!(facts(merged).changes, Changes::Clean);
-    assert!(facts(merged).last_commit.is_some());
-
-    let dirty = find(&scan, "app-dirty");
-    assert_eq!(Status::of(dirty), Status::Dirty);
-    assert_eq!(
-        facts(dirty).changes,
-        Changes::Dirty {
-            changed: 1,
-            untracked: 1
-        }
-    );
-
-    let gone = find(&scan, "app-gone");
-    assert_eq!(Status::of(gone), Status::Gone);
-    assert_eq!(
-        facts(gone).upstream,
-        Upstream::Gone {
-            name: "origin/feat-gone".into()
-        }
-    );
-    assert!(matches!(facts(gone).merge, Merge::Unmerged { .. }));
-
-    let orphan = find(&scan, "app-orphan");
-    assert!(
-        matches!(
-            &orphan.state,
-            WorktreeState::Orphaned(Orphan::Missing {
-                git_says: Some(_),
-                admin_dir: Some(_)
-            })
+        says(
+            r,
+            "branch feat-orphan keeps 1 commit that exists nowhere else"
         ),
         "{:?}",
-        orphan.state
+        r.evidence
     );
-    assert!(orphan.size.is_none());
+}
 
-    let unusable = find(&scan, "app-unusable");
-    assert!(matches!(
-        unusable.state,
-        WorktreeState::Orphaned(Orphan::Unusable { .. })
-    ));
-    assert!(unusable.size.is_some());
+#[test]
+fn a_gone_upstream_needs_a_look_and_is_never_called_merged() {
+    let f = fixture();
+    let v = view(&f);
+    let r = row(&v, "app-gone");
+    assert!(!r.status.removable(), "{}", r.sentence);
+    assert_eq!(
+        r.sentence,
+        "app-gone needs a look: its upstream origin/feat-gone is gone and 1 commit exists \
+         nowhere else."
+    );
+    assert!(
+        says(r, "a squash merge and a closed pull request look the same"),
+        "{r:?}"
+    );
+    assert!(
+        !r.evidence.iter().any(|e| e.starts_with("HEAD is in")),
+        "{r:?}"
+    );
+}
 
-    let stale = find(&scan, "stale");
-    assert!(matches!(
-        stale.state,
-        WorktreeState::Orphaned(Orphan::BrokenPointer { .. })
-    ));
-    assert_eq!(stale.repo_name(), "gone");
+#[test]
+fn totals_count_only_what_can_go_and_say_at_least() {
+    let f = fixture();
+    let mut scan = scan_fixture(&f);
+    let v = WorktreesView::new(&scan, now(), &f.home);
+    let merged = row(&v, "app-merged").reclaimable.expect("sized");
+    let sum: u64 = v
+        .rows
+        .iter()
+        .filter(|r| r.status.removable())
+        .filter_map(|r| r.reclaimable)
+        .sum();
+    assert_eq!(v.reclaimable, sum);
+    assert!(
+        v.summary
+            .starts_with("15 worktrees in 2 repos (2 scanned): 3 can go and free at least "),
+        "{}",
+        v.summary
+    );
+    assert!(
+        row(&v, "app-merged")
+            .sentence
+            .contains("; deleting it frees at least "),
+        "{}",
+        row(&v, "app-merged").sentence
+    );
 
-    let agent = find(&scan, "agent-abc");
-    assert_eq!(Status::of(agent), Status::Locked);
-    assert!(agent.created_at.is_some());
+    // A worktree that could not be sized shows no size and stays out of the total.
+    let i = scan
+        .worktrees
+        .iter()
+        .position(|w| w.name() == "app-merged")
+        .unwrap();
+    scan.worktrees[i].size = Some(crate::size::SubtreeSize {
+        error: Some("not a directory".into()),
+        ..Default::default()
+    });
+    let v = WorktreesView::new(&scan, now(), &f.home);
+    let r = row(&v, "app-merged");
+    assert_eq!((r.allocated, r.reclaimable), (None, None));
+    assert_eq!(v.reclaimable, sum - merged);
+    assert!(v.summary.contains("(1 of them not sized)"), "{}", v.summary);
+}
+
+#[test]
+fn the_view_explains_each_row_in_one_sentence() {
+    let f = fixture();
+    let v = view(&f);
+    let merged = &row(&v, "app-merged").sentence;
+    assert!(
+        merged.starts_with(
+            "app-merged is merged into origin/main and clean; deleting it frees at least "
+        ),
+        "{merged}"
+    );
+    assert_eq!(
+        row(&v, "app-dirty").sentence,
+        "app-dirty is merged into origin/main but has 1 changed entry and 2 untracked \
+         entries; deleting it would lose them."
+    );
+    assert_eq!(
+        row(&v, "agent-abc").sentence,
+        "agent-abc is locked by a Claude Code agent (pid 4242); git keeps it until it is \
+         unlocked."
+    );
+    assert!(row(&v, "app-merged").path.starts_with("~/code/"));
+    assert_eq!(v.rows[0].status.word(), "can go", "what can go ranks first");
 }
 
 #[test]
 fn names_the_creator_by_path_and_lock_reason() {
     let f = fixture();
     let scan = scan_fixture(&f);
+    let find = |name: &str| scan.worktrees.iter().find(|w| w.name() == name).unwrap();
 
-    let agent = find(&scan, "agent-abc");
+    let agent = find("agent-abc");
     assert_eq!(agent.creator.agent, Some(Agent::ClaudeCode));
     assert_eq!(
         agent.creator.evidence,
@@ -341,23 +545,24 @@ fn names_the_creator_by_path_and_lock_reason() {
                 convention: ".claude/worktrees/agent-*".into()
             },
             CreatorEvidence::LockReason {
-                reason: "claude agent agent-abc (pid 42 start Wed Nov 11 16:14:45 2026)".into()
+                reason: "claude agent agent-abc (pid 4242 start Mon Jan  5 09:00:00 2026)".into()
             },
         ]
     );
-
-    let codex = find(&scan, "1a2b/app");
-    assert_eq!(codex.creator.agent, Some(Agent::Codex));
-    assert!(matches!(Status::of(codex), Status::Merged));
-
-    assert_eq!(find(&scan, "app-dirty").creator, ProbableCreator::default());
+    assert_eq!(find("1a2b/app").creator.agent, Some(Agent::Codex));
+    assert_eq!(find("app-dirty").creator, ProbableCreator::default());
 }
 
 #[test]
 fn a_cloned_dependency_is_allocated_but_not_reclaimable() {
     let f = fixture();
     let scan = scan_fixture(&f);
-    let size = find(&scan, "app-merged").size.clone().expect("sized");
+    let w = scan
+        .worktrees
+        .iter()
+        .find(|w| w.name() == "app-merged")
+        .unwrap();
+    let size = w.size.clone().expect("sized");
     let mib = 1 << 20;
     assert!(size.size.allocated >= 2 * mib, "{size:?}");
     assert!(
@@ -367,43 +572,243 @@ fn a_cloned_dependency_is_allocated_but_not_reclaimable() {
     assert_eq!(size.skipped, 0);
 }
 
-#[test]
-fn the_view_explains_each_row_in_one_sentence() {
-    let f = fixture();
-    let scan = scan_fixture(&f);
-    let view = WorktreesView::new(&scan, i64::MAX / 2, &f.home);
-    let row = |name: &str| view.rows.iter().find(|r| r.name == name).unwrap();
+/// Makes `dirs` unreadable while `f` runs, as macOS does to an app it has not asked yet.
+fn locked_away<T>(dirs: &[&Path], f: impl FnOnce() -> T) -> T {
+    let mode = |d: &Path, m| fs::set_permissions(d, fs::Permissions::from_mode(m)).unwrap();
+    dirs.iter().for_each(|d| mode(d, 0o000));
+    let out = f();
+    dirs.iter().for_each(|d| mode(d, 0o755));
+    out
+}
 
-    let merged = &row("app-merged").sentence;
+#[test]
+fn never_reads_inside_desktop_documents_or_downloads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let code = home.join("code");
+    let [desktop, documents, downloads] =
+        ["Desktop", "Documents", "Downloads"].map(|d| home.join(d));
+    for d in [&desktop, &documents, &downloads] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let app = code.join("app");
+    new_repo(&base, &app);
+
+    // Worktrees of a readable repo kept on the Desktop: by its own path, through a symlink,
+    // and through a path cased differently, which names the same folder on APFS.
+    git(
+        &app,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "desk",
+            s(&desktop.join("wt-desk")),
+        ],
+    );
+    std::os::unix::fs::symlink(&desktop, code.join("desk-link")).unwrap();
+    git(
+        &app,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "link",
+            s(&code.join("desk-link/wt-link")),
+        ],
+    );
+    let same = |a: &Path, b: &Path| match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    };
+    let case_blind = same(&home.join("desktop"), &desktop);
+    if case_blind {
+        git(
+            &app,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "case",
+                s(&home.join("desktop/wt-case")),
+            ],
+        );
+    }
+
+    // A Codex worktree whose repo sits in Documents.
+    let proj = documents.join("proj");
+    new_repo(&base, &proj);
+    let codex = home.join(".codex/worktrees/9z");
+    fs::create_dir_all(&codex).unwrap();
+    git(
+        &proj,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "task",
+            s(&codex.join("proj")),
+        ],
+    );
+
+    // A repo in Downloads, named as a root.
+    let dl = downloads.join("dl");
+    new_repo(&base, &dl);
+    add(&dl, "dl-task", "dl-wt");
+
+    let scan = locked_away(&[&desktop, &documents, &downloads], || {
+        let mut scan = scan(&ScanOptions::new(
+            &home,
+            vec![code.clone(), downloads.clone()],
+        ));
+        measure(&mut scan, &home);
+        scan
+    });
+    let v = WorktreesView::new(&scan, now(), &home);
+
+    let mut inside = vec!["wt-desk", "wt-link"];
+    if case_blind {
+        inside.push("wt-case");
+    }
+    for name in inside.iter().chain(&["9z/proj"]) {
+        let r = row(&v, name);
+        assert!(!r.status.removable(), "{name}: {}", r.sentence);
+        assert_eq!(r.status.word(), "not read", "{name}: {}", r.sentence);
+        assert!(says(r, "not read: protected folder"), "{name}: {r:?}");
+    }
+    for name in inside {
+        let r = row(&v, name);
+        assert_eq!((r.allocated, r.reclaimable), (None, None), "{name}");
+    }
+    // The Codex folder itself is outside, so it is sized; only its repo is not read.
+    assert!(row(&v, "9z/proj").allocated.is_some());
     assert!(
-        merged.starts_with("app-merged is merged into origin/main and clean; deleting it frees "),
-        "{merged}"
-    );
-    assert_eq!(
-        row("app-dirty").sentence,
-        "app-dirty is merged into origin/main but has 1 changed file and 1 untracked; deleting it would lose them."
+        scan.warnings
+            .iter()
+            .any(|w| w.contains("Downloads") && w.contains("protected folder")),
+        "{:?}",
+        scan.warnings
     );
     assert!(
-        row("app-gone")
-            .sentence
-            .starts_with("app-gone tracks origin/feat-gone, which is gone, and is clean"),
-        "{}",
-        row("app-gone").sentence
+        !v.rows.iter().any(|r| r.name.contains("dl")),
+        "{:?}",
+        v.rows
     );
-    assert_eq!(
-        row("app-orphan").sentence,
-        "app-orphan is registered in app but its folder is gone; `git worktree prune` clears the record."
+}
+
+#[test]
+fn a_commit_only_records_hold_is_kept_only_by_a_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let code = home.join("code");
+    let app = code.join("app");
+    new_repo(&base, &app);
+    let detach = |name: &str, at: &str| {
+        let path = code.join(name);
+        git(&app, &["worktree", "add", "-q", "--detach", s(&path), at]);
+        path
+    };
+    let head = |dir: &Path| git(dir, &["rev-parse", "HEAD"]).trim().to_string();
+
+    // Two detached records at one commit no branch has: pruning both would lose it.
+    let one = detach("det-one", "HEAD");
+    commit(&one, "shared.txt");
+    let two = detach("det-two", &head(&one));
+    // A branch and a detached record at one commit: the branch keeps it.
+    let kept = add(&app, "feat-kept", "br-kept");
+    commit(&kept, "kept.txt");
+    let det = detach("det-kept", &head(&kept));
+    for dir in [&one, &two, &kept, &det] {
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    let scan = scan(&ScanOptions::new(&home, vec![code.clone()]));
+    let v = WorktreesView::new(&scan, now(), &home);
+    for name in ["det-one", "det-two"] {
+        let r = row(&v, name);
+        assert_eq!(r.status.word(), "needs a look", "{name}: {}", r.sentence);
+        assert!(says(r, "1 commit exists nowhere else"), "{name}: {r:?}");
+    }
+    assert_eq!(row(&v, "det-kept").status.word(), "can prune");
+    let r = row(&v, "br-kept");
+    assert_eq!(r.status.word(), "can prune");
+    assert!(says(r, "keeps 1 commit that exists nowhere else"), "{r:?}");
+}
+
+#[test]
+fn paths_with_a_newline_are_read_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let code = home.join("code");
+
+    // A repo outside the roots, reached only through its Codex worktree.
+    let odd = base.join("odd\nrepo");
+    new_repo(&base, &odd);
+    let codex = home.join(".codex/worktrees/5e");
+    fs::create_dir_all(&codex).unwrap();
+    git(
+        &odd,
+        &["worktree", "add", "-q", "-b", "task", s(&codex.join("app"))],
     );
-    assert_eq!(
-        row("agent-abc").sentence,
-        "agent-abc is locked by a Claude Code agent (pid 42); git keeps it until it is unlocked."
+    // A worktree whose own folder name holds a newline.
+    let app = code.join("app");
+    new_repo(&base, &app);
+    add(&app, "nl", "new\nline");
+
+    let mut scan = scan(&ScanOptions::new(&home, vec![code.clone()]));
+    measure(&mut scan, &home);
+    let v = WorktreesView::new(&scan, now(), &home);
+    for name in ["app", "new\nline"] {
+        let r = row(&v, name);
+        assert_eq!(r.status.word(), "can go", "{name}: {r:?}");
+    }
+    assert_eq!(row(&v, "app").repo, "odd\nrepo");
+}
+
+/// A git hook runs with `GIT_DIR`, `GIT_INDEX_FILE` and others set. A scan started from one
+/// must still read each repo for itself, so this runs `scan_inside_a_hook` with them set.
+#[test]
+fn ignores_git_variables_from_a_hook() {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "worktree::tests::scan_inside_a_hook",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("GIT_DIR", "/nonexistent/.git")
+        .env("GIT_COMMON_DIR", "/nonexistent/.git")
+        .env("GIT_WORK_TREE", "/nonexistent")
+        .env("GIT_INDEX_FILE", "/nonexistent/.git/index")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(row("app-merged").path.starts_with("~/code/"));
-    assert_eq!(view.rows[0].status, Status::Orphaned, "orphans rank first");
-    assert!(
-        view.summary
-            .starts_with("8 worktrees in 2 repos; 6 can go and free "),
-        "{}",
-        view.summary
-    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("scanned inside a hook"), "{text}");
+}
+
+#[test]
+#[ignore = "run by ignores_git_variables_from_a_hook, with a hook's environment"]
+fn scan_inside_a_hook() {
+    // Run on its own, without the hook's environment, it has nothing to show.
+    if std::env::var_os("GIT_DIR").is_none() {
+        return;
+    }
+    let f = fixture();
+    let v = view(&f);
+    assert!(row(&v, "app-merged").status.removable(), "{:?}", v.rows);
+    assert_eq!(row(&v, "app-dirty").status.word(), "dirty");
+    println!("scanned inside a hook");
 }
