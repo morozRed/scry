@@ -1,0 +1,4 @@
+target/
+fixtures/recorded/
+.audit/
+.claude/

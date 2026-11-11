@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "taken_at_ms": 1762853000000,
+  "viewer_uid": 501,
+  "processes": [
+    {
+      "id": {
+        "pid": 1,
+        "start_us": 1762000000001000
+      },
+      "ppid": 0,
+      "uid": 0,
+      "name": "launchd",
+      "exe": "/sbin/launchd",
+      "footprint": null
+    },
+    {
+      "id": {
+        "pid": 412,
+        "start_us": 1762000000412000
+      },
+      "ppid": 1,
+      "uid": 0,
+      "name": "WindowServer",
+      "exe": "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+      "footprint": null
+    },
+    {
+      "id": {
+        "pid": 725,
+        "start_us": 1762000000725000
+      },
+      "ppid": 1,
+      "uid": 0,
+      "name": "symptomsd",
+      "exe": "/usr/libexec/symptomsd",
+      "footprint": null
+    },
+    {
+      "id": {
+        "pid": 901,
+        "start_us": 1762000000901000
+      },
+      "ppid": 1,
+      "uid": 501,
+      "name": "Ghostty",
+      "exe": "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+      "footprint": 325058560
+    },
+    {
+      "id": {
+        "pid": 1204,
+        "start_us": 1762000001204000
+      },
+      "ppid": 901,
+      "uid": 501,
+      "name": "zsh",
+      "exe": "/bin/zsh",
+      "footprint": 3145728
+    },
+    {
+      "id": {
+        "pid": 1311,
+        "start_us": 1762000001311000
+      },
+      "ppid": 1204,
+      "uid": 501,
+      "name": "claude",
+      "exe": "~/.local/bin/claude",
+      "footprint": 976224256
+    },
+    {
+      "id": {
+        "pid": 1320,
+        "start_us": 1762000001320000
+      },
+      "ppid": 1311,
+      "uid": 501,
+      "name": "node",
+      "exe": "/opt/homebrew/bin/node",
+      "footprint": 432013312
+    },
+    {
+      "id": {
+        "pid": 1321,
+        "start_us": 1762000001321000
+      },
+      "ppid": 1311,
+      "uid": 501,
+      "name": "node",
+      "exe": "/opt/homebrew/bin/node",
+      "footprint": 228589568
+    },
+    {
+      "id": {
+        "pid": 1402,
+        "start_us": 1762000001402000
+      },
+      "ppid": 1,
+      "uid": 501,
+      "name": "codex",
+      "exe": "/opt/homebrew/bin/codex",
+      "footprint": 566231040
+    },
+    {
+      "id": {
+        "pid": 1500,
+        "start_us": 1762000001500000
+      },
+      "ppid": 1,
+      "uid": 501,
+      "name": "tmux",
+      "exe": "/opt/homebrew/bin/tmux",
+      "footprint": 9437184
+    }
+  ]
+}
