@@ -19,8 +19,9 @@ cargo build
 cargo test
 ```
 
-UI tests compare rendered frames with snapshots stored under `src/snapshots/`. When
-you change the UI on purpose, review and accept the new frames:
+UI tests compare rendered frames with snapshots stored in
+`crates/scry/src/snapshots/`. When you change the UI on purpose, review and accept
+the new frames:
 
 ```sh
 cargo install cargo-insta
@@ -47,9 +48,11 @@ warnings as errors, the tests, the smoke test and a scan benchmark.
 Tests, fixtures and screenshots use synthetic data only. Never commit a snapshot
 recorded from your own machine. `scry snapshot` redacts your home directory, but
 process names and paths can still identify you. Recorded snapshots belong in
-`fixtures/recorded/`, which git ignores. `scripts/check-public.sh` fails on your
-home path, user name, host name, email addresses, private-network IPs and
-credentials in tracked files.
+`fixtures/recorded/`, which git ignores. `scripts/check-public.sh` checks tracked
+files and every line your branch adds, because pull requests stay public even after
+a fix. It fails on home paths other than placeholders such as `/Users/dev`, your
+host name, email addresses, private IPv4 and IPv6 addresses, and credentials in
+common formats. It cannot read binary files, so check those by hand.
 
 ## Commits and pull requests
 

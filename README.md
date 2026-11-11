@@ -6,8 +6,8 @@ your Mac.
 Coding agents such as Claude Code and Codex start dev servers, MCP servers and
 headless browsers, create worktrees and fill caches. When a session ends, much of
 that stays behind. Scry traces each of these back to the project and the agent
-session that made it, so you can see what is safe to stop or delete. Agents get
-the same answers through an MCP server.
+session that made it, so you can see what is safe to stop or delete. An MCP server
+that gives agents the same answers is planned.
 
 > **Status:** early development. The process scan and the terminal UI shell work.
 > Ports, agents, disk and worktrees are being built. See the
