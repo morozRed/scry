@@ -22,6 +22,7 @@ for step in \
   "cargo fmt --check" \
   "cargo clippy --all-targets -- -D warnings" \
   "cargo test" \
+  "cargo build" \
   "scripts/pty-smoke.sh $CARGO_TARGET_DIR/debug/scry" \
   "cargo run -q -- bench scan --runs 30"; do
   if sh -c "$step" >>"$LOG" 2>&1; then
