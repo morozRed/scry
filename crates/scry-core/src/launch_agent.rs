@@ -45,7 +45,9 @@ pub enum Launchd {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlistFile {
-    pub text: String,
+    /// As on disk, XML or binary. Install rewrites any plist that is not byte for byte the
+    /// one it renders.
+    pub bytes: Vec<u8>,
     pub mode: u32,
 }
 
@@ -84,7 +86,7 @@ pub fn plan_install(obs: &Observed, desired: &str, restart: bool) -> Vec<Step> {
     if obs.disabled {
         steps.push(Step::Enable);
     }
-    let current = obs.plist.as_ref().filter(|p| p.text == desired);
+    let current = obs.plist.as_ref().filter(|p| p.bytes == desired.as_bytes());
     if current.is_some_and(|p| p.mode != PLIST_MODE) {
         steps.push(Step::FixPlistMode);
     }
@@ -209,8 +211,8 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// The parts of an installed plist that `doctor` checks, read through `plutil` so a plist
-/// edited by hand or saved as binary still parses.
+/// The parts of an installed plist that `doctor` checks, read through `plutil`, which also
+/// reads the binary form that `plutil -convert binary1` or `defaults write` leaves.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlistContents {
     #[serde(rename(deserialize = "Label"))]
@@ -276,11 +278,11 @@ impl LaunchAgent {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("reading {}", self.plist.display())),
         };
-        let mut text = String::new();
-        f.read_to_string(&mut text)
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes)
             .with_context(|| format!("reading {}", self.plist.display()))?;
         let mode = f.metadata()?.permissions().mode() & 0o7777;
-        Ok(Some(PlistFile { text, mode }))
+        Ok(Some(PlistFile { bytes, mode }))
     }
 
     pub fn launchd(&self) -> Result<Launchd> {
@@ -434,7 +436,7 @@ mod tests {
     fn obs(plist: Option<(&str, u32)>, launchd: Launchd) -> Observed {
         Observed {
             plist: plist.map(|(text, mode)| PlistFile {
-                text: text.into(),
+                bytes: text.into(),
                 mode,
             }),
             disabled: false,
@@ -535,6 +537,36 @@ mod tests {
         assert!(agent.target().ends_with(&format!("/{}", label(&a))));
     }
 
+    #[test]
+    fn spellings_of_one_scry_home_share_one_label() {
+        use crate::paths::normalize_home;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(&home, tmp.path().join("link")).unwrap();
+        let real = fs::canonicalize(&home).unwrap();
+        let label_of = |h: &Path| label(&Paths::new("/Users/dev".into(), Some(h.into())));
+        let (h, t) = (home.display(), tmp.path().display());
+        for spelling in [
+            format!("{h}"),
+            format!("{h}/"),
+            format!("{h}//."),
+            format!("{t}/link/"),
+            format!("{}", real.display()),
+        ] {
+            let normal = normalize_home(Path::new(&spelling)).unwrap();
+            assert_eq!(normal, real, "{spelling}");
+            assert_eq!(label_of(&normal), label_of(&real), "{spelling}");
+        }
+
+        // Not created yet: install creates it, and the label must not change when it does.
+        let new = PathBuf::from(format!("{t}/link/new/"));
+        let before = normalize_home(&new).unwrap();
+        assert_eq!(before, real.join("new"));
+        fs::create_dir(home.join("new")).unwrap();
+        assert_eq!(normalize_home(&new).unwrap(), before);
+    }
+
     fn agent_at(plist: PathBuf) -> LaunchAgent {
         LaunchAgent {
             label: LABEL.into(),
@@ -585,6 +617,51 @@ mod tests {
         assert!(!plain.contains("EnvironmentVariables"));
         fs::write(&agent.plist, "not a plist").unwrap();
         assert_eq!(agent.read_plist(), None);
+    }
+
+    #[test]
+    fn a_binary_plist_is_read_and_replaced() {
+        use Step::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = agent_at(tmp.path().join("p.plist"));
+        let spec = Spec {
+            label: LABEL.into(),
+            program: "/opt/homebrew/bin/scry".into(),
+            log: "/x/daemon.log".into(),
+            scry_home: None,
+        };
+        let desired = render_plist(&spec);
+        fs::write(&agent.plist, &desired).unwrap();
+        let out = Command::new("plutil")
+            .args(["-convert", "binary1"])
+            .arg(&agent.plist)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+
+        let file = agent.plist_file().unwrap().expect("plist read");
+        assert!(file.bytes.starts_with(b"bplist00"), "not UTF-8 text");
+        assert_eq!(
+            agent.read_plist().map(|c| c.args),
+            Some(Spec::args(&spec.program)),
+            "plutil still reads it"
+        );
+        let o = Observed {
+            plist: Some(file),
+            disabled: false,
+            launchd: RUNNING,
+        };
+        assert_eq!(
+            plan_install(&o, &desired, false),
+            [Bootout, WritePlist, Bootstrap]
+        );
+        assert_eq!(plan_uninstall(&o), [Bootout, RemovePlist]);
+
+        agent.apply(&[WritePlist], &desired).unwrap();
+        let rewritten = agent.plist_file().unwrap().unwrap();
+        assert_eq!(rewritten.bytes, desired.as_bytes());
+        agent.apply(&[RemovePlist], "").unwrap();
+        assert_eq!(agent.plist_file().unwrap(), None);
     }
 
     #[test]

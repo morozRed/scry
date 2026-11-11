@@ -272,6 +272,11 @@ pub fn install(paths: &Paths, exe: &Path) -> Result<Installed> {
     })
 }
 
+/// How long install waits for the new daemon. launchd starts a job at most once per 10 s
+/// (its default ThrottleInterval, which the plist keeps), so a job restarted soon after it
+/// started can take 10 s to come back; twice that leaves room to take the lock.
+const RESTART_WAIT: Duration = Duration::from_secs(20);
+
 /// Waits until launchd's job holds the lock and runs `binary` with `config`, and returns
 /// its pid. A restarted job takes a moment to stop, and its successor to take the lock.
 fn wait_until_current(
@@ -280,7 +285,7 @@ fn wait_until_current(
     binary: Option<&Binary>,
     config: &Config,
 ) -> Result<i32> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + RESTART_WAIT;
     loop {
         let pid = match agent.launchd()? {
             Launchd::Loaded { pid } => pid,
@@ -647,6 +652,21 @@ mod tests {
         let moved = Paths::new("/Users/dev".into(), Some("/tmp/x".into()));
         let why = running.drift(&moved, None, None);
         assert_eq!(why, ["SCRY_HOME changed from unset to /tmp/x"]);
+    }
+
+    #[test]
+    fn install_waits_out_launchds_restart_throttle() {
+        let plist = render_plist(&Spec {
+            label: "x".into(),
+            program: "/x/scry".into(),
+            log: "/x/daemon.log".into(),
+            scry_home: None,
+        });
+        assert!(
+            !plist.contains("ThrottleInterval"),
+            "launchd's 10 s default"
+        );
+        assert!(RESTART_WAIT >= 2 * Duration::from_secs(10));
     }
 
     #[test]

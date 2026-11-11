@@ -112,7 +112,10 @@ fn daemon_samples_refuses_a_second_copy_and_stops_on_sigterm() {
     assert_eq!(status["installed"], false);
     assert_eq!(status["running"]["pid"], first.id());
     assert_eq!(status["running"]["interval_secs"], 1);
-    assert_eq!(status["running"]["scry_home"], home.to_str().unwrap());
+    assert_eq!(
+        status["running"]["scry_home"],
+        std::fs::canonicalize(home).unwrap().to_str().unwrap()
+    );
     assert_eq!(
         status["running"]["binary"]["path"],
         std::fs::canonicalize(env!("CARGO_BIN_EXE_scry"))
@@ -228,6 +231,33 @@ fn a_newer_store_is_refused_untouched_and_install_is_never_the_fix() {
 
     assert_eq!(std::fs::read(&db).unwrap(), before, "same bytes");
     assert_eq!(mode(&db), 0o644, "same mode");
+}
+
+#[test]
+fn every_spelling_of_scry_home_names_one_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::os::unix::fs::symlink(&home, tmp.path().join("link")).unwrap();
+    let real = std::fs::canonicalize(&home).unwrap();
+    let agent = |spelling: &str| {
+        let s = json(
+            &scry(Path::new(spelling))
+                .args(["daemon", "status", "--json"])
+                .output()
+                .unwrap(),
+        );
+        (s["label"].clone(), s["plist"].clone())
+    };
+    let want = agent(real.to_str().unwrap());
+    let h = home.display();
+    for spelling in [
+        format!("{h}"),
+        format!("{h}/"),
+        format!("{}/link", tmp.path().display()),
+    ] {
+        assert_eq!(agent(&spelling), want, "{spelling}");
+    }
 }
 
 #[test]

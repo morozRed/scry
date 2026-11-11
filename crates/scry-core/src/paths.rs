@@ -17,7 +17,8 @@ pub struct Paths {
     pub state: PathBuf,
     /// The user's home, for `~` in config values and the LaunchAgents directory.
     pub user_home: PathBuf,
-    /// Set when `SCRY_HOME` is in effect. The LaunchAgent carries it to the daemon.
+    /// Set when `SCRY_HOME` is in effect, as `normalize_home` spells it. The LaunchAgent
+    /// carries it to the daemon.
     pub scry_home: Option<PathBuf>,
 }
 
@@ -27,7 +28,7 @@ impl Paths {
             bail!("cannot tell the home directory");
         };
         let scry_home = match std::env::var_os(HOME_ENV) {
-            Some(h) if !h.is_empty() => Some(std::path::absolute(PathBuf::from(h))?),
+            Some(h) if !h.is_empty() => Some(normalize_home(Path::new(&h))?),
             _ => None,
         };
         Ok(Paths::new(user_home, scry_home))
@@ -89,6 +90,33 @@ impl Paths {
             Err(_) => p.display().to_string(),
         }
     }
+}
+
+/// One spelling per directory for `SCRY_HOME`: absolute, without a trailing slash, and with
+/// symlinks resolved as far as the path exists, so `/tmp/x/` and `/private/tmp/x` agree.
+/// The LaunchAgent label is a hash of it, and two labels for one state directory would
+/// leave a second job that cannot take the lock.
+pub fn normalize_home(raw: &Path) -> Result<PathBuf> {
+    let abs = std::path::absolute(raw)
+        .with_context(|| format!("resolving {HOME_ENV}={}", raw.display()))?;
+    // Resolving the deepest part that exists keeps the result the same once install
+    // creates the rest.
+    for base in abs.ancestors() {
+        match fs::canonicalize(base) {
+            Ok(real) => {
+                let rest = abs.strip_prefix(base).expect("an ancestor is a prefix");
+                return Ok(real.join(rest).components().collect());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("resolving {HOME_ENV}={}", raw.display()));
+            }
+        }
+    }
+    bail!(
+        "resolving {HOME_ENV}={}: no part of it exists",
+        raw.display()
+    )
 }
 
 pub fn private_dir(dir: &Path) -> Result<()> {
