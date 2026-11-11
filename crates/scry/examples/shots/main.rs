@@ -11,8 +11,9 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use scry::tui::app::{App, Source};
 use scry::tui::theme::{Colors, Look, Rgb, SHIPPED, Theme};
 use scry::tui::ui;
-use scry_core::view::{Board, Load};
-use svg::{Palette, TERMINAL_BASIC, TOMORROW_NIGHT};
+use scry_core::view::agents::AgentRow;
+use scry_core::view::{Board, Detail, Evidence, Load, State};
+use svg::{Palette, SOLARIZED_LIGHT, TERMINAL_BASIC, TOMORROW_NIGHT};
 
 const SIZES: [(u16, u16); 2] = [(80, 24), (120, 40)];
 const PALETTES: [&Palette; 2] = [&TERMINAL_BASIC, &TOMORROW_NIGHT];
@@ -22,18 +23,19 @@ fn main() -> anyhow::Result<()> {
     let out = root.join("docs/screens");
     std::fs::create_dir_all(out.join("compare"))?;
     let design = Board::parse(&std::fs::read_to_string(root.join("fixtures/design.json"))?)?;
+    let long = with_leftovers(&design, 20);
+    let shots = Shots { out: &out };
     let mut n = 0;
 
     for (look, name) in [(Look::Native, "native"), (Look::Tinted, "tinted")] {
         for pal in PALETTES {
+            let theme = || Theme::new(look, colors(look, pal));
             for (w, h) in SIZES {
-                let theme = Theme::new(look, colors(look, pal));
                 let file = format!("compare/{name}-{}-{w}x{h}", pal.name);
-                n += shot(&out, &file, &design, theme.clone(), "3jj", pal, w, h)?;
+                n += shots.take(&file, &design, theme(), "3jj", pal, (w, h))?;
             }
-            let theme = Theme::new(look, colors(look, pal));
             let file = format!("compare/{name}-{}-sheet", pal.name);
-            n += shot(&out, &file, &design, theme, "3X", pal, 120, 40)?;
+            n += shots.take(&file, &design, theme(), "3X", pal, (120, 40))?;
         }
     }
 
@@ -48,104 +50,71 @@ fn main() -> anyhow::Result<()> {
         let theme = || Theme::new(SHIPPED, colors(SHIPPED, pal));
         let p = pal.name;
         for (view, keys) in views {
-            for (w, h) in SIZES {
-                n += shot(
-                    &out,
+            for size in SIZES {
+                let (w, h) = size;
+                n += shots.take(
                     &format!("{view}-{p}-{w}x{h}"),
                     &design,
                     theme(),
                     keys,
                     pal,
-                    w,
-                    h,
+                    size,
                 )?;
             }
         }
-        n += shot(
-            &out,
-            &format!("sheet-{p}"),
+        for (name, board, keys, size) in [
+            ("agents-{p}-150x40", &design, "3jj", (150, 40)),
+            ("ports-{p}-150x40", &design, "2jj", (150, 40)),
+            ("sheet-{p}", &design, "3X", (120, 40)),
+            ("sheet-long-{p}", &long, "3X", (80, 24)),
+            ("sheet-long-end-{p}", &long, "3XG", (80, 24)),
+            ("filter-{p}", &design, "3/vite", (80, 24)),
+            ("help-{p}", &design, "3?", (80, 24)),
+        ] {
+            let name = name.replace("{p}", p);
+            n += shots.take(&name, board, theme(), keys, pal, size)?;
+        }
+        let ansi = || Theme::new(SHIPPED, Colors::Ansi);
+        n += shots.take(&format!("ansi-{p}"), &design, ansi(), "3jj", pal, (80, 24))?;
+        n += shots.take(
+            &format!("ansi-{p}-150x40"),
             &design,
-            theme(),
-            "3X",
-            pal,
-            120,
-            40,
-        )?;
-        n += shot(
-            &out,
-            &format!("filter-{p}"),
-            &design,
-            theme(),
-            "3/nxt",
-            pal,
-            80,
-            24,
-        )?;
-        n += shot(
-            &out,
-            &format!("help-{p}"),
-            &design,
-            theme(),
-            "3?",
-            pal,
-            80,
-            24,
-        )?;
-        n += shot(
-            &out,
-            &format!("ansi-{p}"),
-            &design,
-            Theme::new(SHIPPED, Colors::Ansi),
+            ansi(),
             "3jj",
             pal,
-            80,
-            24,
+            (150, 40),
         )?;
         let mut states = design.clone();
-        states.ports = Load::Loading;
-        n += shot(
-            &out,
-            &format!("state-loading-{p}"),
-            &states,
-            theme(),
-            "2",
-            pal,
-            80,
-            24,
-        )?;
-        states.ports = Load::Failed("sysctl net.inet.tcp.pcblist_n returned EPERM.".into());
-        n += shot(
-            &out,
-            &format!("state-failed-{p}"),
-            &states,
-            theme(),
-            "2",
-            pal,
-            80,
-            24,
-        )?;
-        states.ports = Load::Ready(Vec::new());
-        n += shot(
-            &out,
-            &format!("state-empty-{p}"),
-            &states,
-            theme(),
-            "2",
-            pal,
-            80,
-            24,
-        )?;
+        for (state, load) in [
+            ("loading", Load::Loading),
+            (
+                "failed",
+                Load::Failed("sysctl net.inet.tcp.pcblist_n returned EPERM.".into()),
+            ),
+            ("empty", Load::Ready(Vec::new())),
+        ] {
+            states.ports = load;
+            let name = format!("state-{state}-{p}");
+            n += shots.take(&name, &states, theme(), "2", pal, (80, 24))?;
+        }
     }
+    let sol = &SOLARIZED_LIGHT;
+    n += shots.take(
+        "agents-solarized-light-80x24",
+        &design,
+        Theme::new(SHIPPED, colors(SHIPPED, sol)),
+        "3jj",
+        sol,
+        (80, 24),
+    )?;
     let mono = Theme::new(SHIPPED, Colors::Mono);
-    n += shot(
-        &out,
+    n += shots.take(
         "no-color-dark",
         &design,
         mono,
         "3jj",
         &TOMORROW_NIGHT,
-        80,
-        24,
+        (80, 24),
     )?;
 
     println!("Wrote {n} screens to {}.", out.canonicalize()?.display());
@@ -164,32 +133,85 @@ fn colors(look: Look, pal: &Palette) -> Colors {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn shot(
-    out: &Path,
-    name: &str,
-    board: &Board,
-    theme: Theme,
-    keys: &str,
-    pal: &Palette,
-    w: u16,
-    h: u16,
-) -> anyhow::Result<usize> {
-    let mut app = App::new(
-        board.clone(),
-        Source::Fixture(PathBuf::from("design.json")),
-        theme,
-    );
-    for c in keys.chars() {
-        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+/// The design board with one more ended session that left `n` processes, for a reap
+/// sheet longer than the screen.
+fn with_leftovers(design: &Board, n: usize) -> Board {
+    let mut board = design.clone();
+    let Load::Ready(rows) = &mut board.agents else {
+        return board;
+    };
+    let row = |id: String, depth: u8, label: String, pid, state, evidence| AgentRow {
+        id,
+        depth,
+        label,
+        context: (depth == 0).then(|| "acme/batch".into()),
+        pid,
+        ram: Some(48 << 20),
+        ports: vec![],
+        age_s: 5 * 3600,
+        evidence,
+        state: Some(state),
+        detail: Detail::default(),
+    };
+    rows.push(row(
+        "s-batch".into(),
+        0,
+        "claude".into(),
+        None,
+        State::Ended,
+        None,
+    ));
+    for i in 0..n {
+        rows.push(row(
+            format!("w-{i}"),
+            1,
+            format!("node worker-{i:02}"),
+            Some(61000 + i as i32),
+            State::Leftover,
+            Some(Evidence::Stamp),
+        ));
     }
-    let mut term = Terminal::new(TestBackend::new(w, h))?;
-    term.draw(|f| {
-        ui::draw(f, &app);
-    })?;
-    std::fs::write(
-        out.join(format!("{name}.svg")),
-        svg::render(term.backend().buffer(), pal),
-    )?;
-    Ok(1)
+    board
+}
+
+struct Shots<'a> {
+    out: &'a Path,
+}
+
+impl Shots<'_> {
+    fn take(
+        &self,
+        name: &str,
+        board: &Board,
+        theme: Theme,
+        keys: &str,
+        pal: &Palette,
+        (w, h): (u16, u16),
+    ) -> anyhow::Result<usize> {
+        let mut app = App::new(
+            board.clone(),
+            Source::Fixture(PathBuf::from("design.json")),
+            theme,
+        );
+        let mut term = Terminal::new(TestBackend::new(w, h))?;
+        // Keys act on the columns last drawn, as in the real loop.
+        term.draw(|f| {
+            ui::draw(f, &app);
+        })?;
+        for c in keys.chars() {
+            let code = match c {
+                '\n' => KeyCode::Enter,
+                c => KeyCode::Char(c),
+            };
+            app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        term.draw(|f| {
+            ui::draw(f, &app);
+        })?;
+        std::fs::write(
+            self.out.join(format!("{name}.svg")),
+            svg::render(term.backend().buffer(), pal),
+        )?;
+        Ok(1)
+    }
 }

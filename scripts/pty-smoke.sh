@@ -1,6 +1,7 @@
 #!/bin/sh
 # Runs the TUI in a real pty (tmux) and checks the terminal comes back cooked after
-# quit, SIGTERM and Ctrl-Z. Usage: scripts/pty-smoke.sh [path/to/scry]
+# quit, SIGTERM, SIGHUP and Ctrl-Z, then runs scripts/pty-late-reply.py for a terminal
+# that answers the colour query late. Usage: scripts/pty-smoke.sh [path/to/scry]
 set -eu
 
 BIN=$(cd "$(dirname "${1:-target/debug/scry}")" && pwd)/$(basename "${1:-target/debug/scry}")
@@ -47,6 +48,13 @@ kill -TERM "$(tui_pid)"
 check "SIGTERM restores the terminal" "EXIT=0 icanon"
 t send-keys -t smoke clear Enter
 
+# A hang-up sent while the terminal is still open, as `kill -HUP` does.
+t send-keys -t smoke "$RUN" Enter
+wait_for "Nothing needs attention"
+kill -HUP "$(tui_pid)"
+check "SIGHUP restores the terminal" "EXIT=129 icanon"
+t send-keys -t smoke clear Enter
+
 t send-keys -t smoke "$RUN" Enter
 wait_for "Nothing needs attention"
 t send-keys -t smoke C-z
@@ -71,5 +79,7 @@ else
   [ -n "$hup_pid" ] && kill -9 "$hup_pid" 2>/dev/null
   fails=$((fails + 1))
 fi
+
+python3 "$(dirname "$0")/pty-late-reply.py" "$BIN" || fails=$((fails + 1))
 
 [ "$fails" -eq 0 ] && echo "pty smoke: all passed" || { echo "pty smoke: $fails failed"; exit 1; }

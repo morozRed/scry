@@ -57,6 +57,13 @@ pub enum Width {
     Fill(u16),
 }
 
+/// The columns shown in a list this wide, by index.
+pub fn visible(columns: &[Column], list_width: u16) -> Vec<usize> {
+    (0..columns.len())
+        .filter(|&i| columns[i].min_list_width <= list_width)
+        .collect()
+}
+
 impl Column {
     pub const fn fixed(title: &'static str, width: u16) -> Column {
         Column {
@@ -97,6 +104,16 @@ pub struct Row {
     pub target: Option<Target>,
     /// Where `enter` goes, for rows that stand for something in another view.
     pub jump: Option<(Tab, Option<String>)>,
+}
+
+impl Row {
+    /// The state its state column shows, if it has one.
+    pub fn state(&self) -> Option<State> {
+        self.cells.iter().find_map(|c| match c.kind {
+            CellKind::State(s) => Some(s),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -187,29 +204,48 @@ pub struct Shown<'a> {
     pub prefix: String,
     /// Descendants hidden under a folded row.
     pub folded: usize,
-    pub hits: Vec<u32>,
+    /// The row matched the filter itself, rather than being kept as a match's ancestor or
+    /// child. Always true without a filter.
+    pub matched: bool,
+    /// What the filter matched, per cell; empty without a filter.
+    pub hits: Vec<Hits>,
+}
+
+/// Grapheme indices the filter matched in one cell's text and in its context.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hits {
+    pub text: Vec<usize>,
+    pub context: Vec<usize>,
+}
+
+/// What the list is asked to show.
+pub struct Query<'a> {
+    pub sort: Option<Sort>,
+    pub filter: &'a str,
+    pub folded: &'a HashSet<String>,
+    /// The columns on screen. The filter only matches these, so every match it keeps has
+    /// something highlighted.
+    pub columns: &'a [usize],
 }
 
 /// Sorts siblings, applies the filter (keeping a match's ancestors and descendants so the
 /// tree still reads), folds collapsed rows, and draws the tree glyphs.
-pub fn shown<'a>(
-    rows: &'a [Row],
-    sort: Option<Sort>,
-    filter: &str,
-    collapsed: &HashSet<String>,
-) -> Vec<Shown<'a>> {
+pub fn shown<'a>(rows: &'a [Row], q: &Query) -> Vec<Shown<'a>> {
     let tree = rows.iter().any(|r| r.depth > 0);
-    let order = sorted(rows, sort);
+    let order = sorted(rows, q.sort);
     let rows: Vec<&Row> = order.iter().map(|&i| &rows[i]).collect();
     let has_children = |i: usize| rows.get(i + 1).is_some_and(|n| n.depth > rows[i].depth);
 
-    let mut fuzzy = crate::tui::filter::Fuzzy::new(filter);
-    let keep: Vec<bool> = match &mut fuzzy {
-        None => vec![true; rows.len()],
-        Some(f) => {
-            let hit: Vec<bool> = rows.iter().map(|r| f.matches(&haystack(r))).collect();
-            within_matches(&rows, &hit)
-        }
+    let mut fuzzy = crate::tui::filter::Fuzzy::new(q.filter);
+    let found: Vec<Option<Vec<Hits>>> = match &mut fuzzy {
+        None => vec![Some(Vec::new()); rows.len()],
+        Some(f) => rows.iter().map(|r| matches(f, r, q.columns)).collect(),
+    };
+    let hit: Vec<bool> = found.iter().map(Option::is_some).collect();
+    let keep = if fuzzy.is_some() {
+        within_matches(&rows, &hit)
+    } else {
+        hit.clone()
     };
 
     let mut out: Vec<Shown> = Vec::new();
@@ -222,7 +258,7 @@ pub fn shown<'a>(
         if !keep[i] {
             continue;
         }
-        let fold = fuzzy.is_none() && has_children(i) && collapsed.contains(&row.id);
+        let fold = fuzzy.is_none() && has_children(i) && q.folded.contains(&row.id);
         let folded = if fold {
             skip_below = Some(row.depth);
             rows[i + 1..]
@@ -231,10 +267,6 @@ pub fn shown<'a>(
                 .count()
         } else {
             0
-        };
-        let hits = match (&mut fuzzy, row.cells.first()) {
-            (Some(f), Some(c)) => f.hits(&c.text),
-            _ => Vec::new(),
         };
         let marker = match (has_children(i), fold) {
             (true, true) => "▸ ",
@@ -246,7 +278,8 @@ pub fn shown<'a>(
             row,
             prefix: marker.to_string(),
             folded,
-            hits,
+            matched: hit[i],
+            hits: found[i].clone().unwrap_or_default(),
         });
     }
     if tree {
@@ -264,17 +297,31 @@ pub fn is_numeric<'a>(rows: impl IntoIterator<Item = &'a Row>, col: usize) -> bo
         .is_some_and(|c| c.kind == CellKind::Num)
 }
 
-fn haystack(row: &Row) -> String {
-    let mut s = String::new();
-    for c in &row.cells {
-        s.push_str(&c.text);
-        s.push(' ');
-        if let Some(ctx) = &c.context {
-            s.push_str(ctx);
-            s.push(' ');
+/// Matches a row field by field: each shown cell's text, and its context.
+fn matches(f: &mut crate::tui::filter::Fuzzy, row: &Row, columns: &[usize]) -> Option<Vec<Hits>> {
+    let mut fields = Vec::new();
+    let mut owner = Vec::new();
+    for &c in columns {
+        let Some(cell) = row.cells.get(c) else {
+            continue;
+        };
+        fields.push(cell.text.as_str());
+        owner.push((c, false));
+        if let Some(ctx) = &cell.context {
+            fields.push(ctx.as_str());
+            owner.push((c, true));
         }
     }
-    s
+    let found = f.row(&fields)?;
+    let mut hits = vec![Hits::default(); row.cells.len()];
+    for ((c, context), at) in owner.into_iter().zip(found) {
+        if context {
+            hits[c].context = at;
+        } else {
+            hits[c].text = at;
+        }
+    }
+    Some(hits)
 }
 
 /// A row stays if it matched, or sits above or below a row that did.
@@ -408,10 +455,19 @@ mod tests {
             .collect()
     }
 
+    fn query<'a>(sort: Option<Sort>, filter: &'a str, folded: &'a HashSet<String>) -> Query<'a> {
+        Query {
+            sort,
+            filter,
+            folded,
+            columns: &[0, 1],
+        }
+    }
+
     #[test]
     fn guides_follow_depth_and_last_sibling() {
         let rows = tree();
-        let out = shown(&rows, None, "", &HashSet::new());
+        let out = shown(&rows, &query(None, "", &HashSet::new()));
         assert_eq!(
             lines(&out),
             [
@@ -429,7 +485,7 @@ mod tests {
     fn folding_hides_descendants_and_counts_them() {
         let rows = tree();
         let folded = HashSet::from(["claude".to_string()]);
-        let out = shown(&rows, None, "", &folded);
+        let out = shown(&rows, &query(None, "", &folded));
         assert_eq!(lines(&out), ["▸ claude", "▾ codex", "  └ vite"]);
         assert_eq!(out[0].folded, 3);
     }
@@ -438,9 +494,39 @@ mod tests {
     fn filter_keeps_ancestors_and_ignores_folds() {
         let rows = tree();
         let folded = HashSet::from(["claude".to_string()]);
-        let out = shown(&rows, None, "nxt", &folded);
+        let out = shown(&rows, &query(None, "nxt", &folded));
         assert_eq!(lines(&out), ["▾ claude", "  └ npm", "    └ next"]);
-        assert_eq!(out[2].hits, [0, 2, 3]);
+        assert_eq!(out[2].hits[0].text, [0, 2, 3]);
+        assert_eq!(
+            out.iter().map(|s| s.matched).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+    }
+
+    #[test]
+    fn filter_matches_one_column_at_a_time_and_only_shown_ones() {
+        let mut rows = tree();
+        rows[3].cells.push(Cell::text("stamp"));
+        // "chrome" + "stamp" holds c, h, s, t in order, but no single field does.
+        let none = HashSet::new();
+        let q = Query {
+            columns: &[0, 1, 2],
+            ..query(None, "chst", &none)
+        };
+        assert!(shown(&rows, &q).is_empty());
+        // A hidden column does not match.
+        let q = Query {
+            columns: &[0],
+            ..query(None, "stamp", &none)
+        };
+        assert!(shown(&rows, &q).is_empty());
+        let q = Query {
+            columns: &[0, 2],
+            ..query(None, "stamp", &none)
+        };
+        let out = shown(&rows, &q);
+        let chrome = out.iter().find(|s| s.row.id == "chrome").unwrap();
+        assert_eq!(chrome.hits[2].text, [0, 1, 2, 3, 4]);
     }
 
     #[test]
@@ -450,7 +536,7 @@ mod tests {
             column: 1,
             descending: true,
         });
-        let out = shown(&rows, by_ram, "", &HashSet::new());
+        let out = shown(&rows, &query(by_ram, "", &HashSet::new()));
         assert_eq!(
             lines(&out),
             [

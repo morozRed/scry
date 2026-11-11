@@ -51,8 +51,8 @@
           ],
           "sentence": "A Claude Code session in ~/sources/acme/wt-auth ended 2 h ago and left 4 processes running. Together they hold 953M and :3000.",
           "evidence": [
-            "3 by environment stamp, 1 by process tree (all exact)",
-            "X on the Agents view reaps them after a review"
+            "SessionEnd hook at 14:06 (exact)",
+            "3 by environment stamp, 1 by process tree (all exact)"
           ]
         }
       },

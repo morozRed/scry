@@ -11,7 +11,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use scry_core::view::{Board, Load, Tab, Target, Tone};
 
 use super::theme::Theme;
-use super::views::{self, Row, Shown, Sort};
+use super::ui::MIN_W;
+use super::views::{self, Query, Row, Shown, Sort};
 
 const TOAST_FOR: Duration = Duration::from_secs(4);
 const PAGE: isize = 10;
@@ -71,6 +72,18 @@ pub enum Mode {
 pub struct Sheet {
     pub kind: SheetKind,
     pub targets: Vec<Target>,
+    /// First target on screen when they do not all fit; the sheet clamps it.
+    pub offset: Cell<usize>,
+}
+
+impl Sheet {
+    pub fn new(kind: SheetKind, targets: Vec<Target>) -> Sheet {
+        Sheet {
+            kind,
+            targets,
+            offset: Cell::new(0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,6 +126,10 @@ pub struct App {
     pub mode: Mode,
     pub views: [ViewState; 5],
     pub toast: Option<Toast>,
+    /// How wide the list was last drawn, which decides the columns on screen. Keys act on
+    /// what was last drawn.
+    pub list_width: Cell<u16>,
+    late: LateReply,
 }
 
 impl App {
@@ -125,6 +142,8 @@ impl App {
             mode: Mode::Normal,
             views: Default::default(),
             toast: None,
+            list_width: Cell::new(MIN_W),
+            late: LateReply::default(),
         }
     }
 
@@ -140,16 +159,42 @@ impl App {
         (views::view(self.tab).rows)(&self.board)
     }
 
-    pub fn shown<'a>(&self, rows: &'a [Row]) -> Vec<Shown<'a>> {
-        let s = self.state();
-        views::shown(rows, s.sort, &s.filter, &s.folded)
+    /// The columns on screen at the last drawn width.
+    pub fn columns(&self) -> Vec<usize> {
+        views::visible(views::view(self.tab).columns, self.list_width.get())
     }
 
+    /// The sort in effect: none while its column is hidden, so the order never follows a
+    /// column without an arrow on screen.
+    pub fn sort(&self) -> Option<Sort> {
+        let columns = self.columns();
+        self.state().sort.filter(|s| columns.contains(&s.column))
+    }
+
+    fn filtering(&self) -> bool {
+        !self.state().filter.trim().is_empty()
+    }
+
+    pub fn shown<'a>(&self, rows: &'a [Row]) -> Vec<Shown<'a>> {
+        let s = self.state();
+        views::shown(
+            rows,
+            &Query {
+                sort: self.sort(),
+                filter: &s.filter,
+                folded: &s.folded,
+                columns: &self.columns(),
+            },
+        )
+    }
+
+    /// The selected row, or the first row the filter matched when that is gone.
     pub fn cursor(&self, shown: &[Shown]) -> usize {
         let selected = self.state().selected.as_deref();
         shown
             .iter()
             .position(|s| Some(s.row.id.as_str()) == selected)
+            .or_else(|| shown.iter().position(|s| s.matched))
             .unwrap_or(0)
     }
 
@@ -161,15 +206,20 @@ impl App {
         shown.get(self.cursor(&shown)).map(|s| s.row.clone())
     }
 
-    /// Swaps in a new board and returns the ids of rows in the current view that are new
-    /// or changed, so they can be highlighted.
+    /// Swaps in a new board and returns the ids of rows in the current view that are new or
+    /// whose state changed, so they can glow. Numbers that move on every sample, such as
+    /// RAM, do not count.
     pub fn replace_board(&mut self, board: Board) -> Vec<String> {
         let before = self.rows();
         self.board = board;
         match (before, self.rows()) {
             (Load::Ready(old), Load::Ready(new)) => new
                 .iter()
-                .filter(|r| old.iter().find(|o| o.id == r.id) != Some(*r))
+                .filter(|r| {
+                    old.iter()
+                        .find(|o| o.id == r.id)
+                        .is_none_or(|o| o.state() != r.state())
+                })
                 .map(|r| r.id.clone())
                 .collect(),
             _ => Vec::new(),
@@ -185,19 +235,23 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        if key.kind != KeyEventKind::Press {
+        if key.kind != KeyEventKind::Press || self.late.swallow(&key) {
             return Action::None;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            let page = |app: &mut App, by: isize| match app.mode {
+                Mode::Sheet(_) => app.scroll_sheet(by),
+                _ => app.step(by),
+            };
             return match key.code {
                 KeyCode::Char('c') => Action::Quit,
                 KeyCode::Char('z') => Action::Suspend,
                 KeyCode::Char('u') if self.mode == Mode::Filter => {
                     self.state_mut().filter.clear();
-                    Action::Redraw
+                    self.follow_filter()
                 }
-                KeyCode::Char('d') => self.step(PAGE),
-                KeyCode::Char('u') => self.step(-PAGE),
+                KeyCode::Char('d') => page(self, PAGE),
+                KeyCode::Char('u') => page(self, -PAGE),
                 _ => Action::None,
             };
         }
@@ -215,6 +269,7 @@ impl App {
         }
     }
 
+    /// Only `q` and ctrl-c quit, so an extra esc never closes Scry.
     fn on_normal(&mut self, code: KeyCode) -> Action {
         match code {
             KeyCode::Char('q') => Action::Quit,
@@ -222,7 +277,7 @@ impl App {
                 self.state_mut().filter.clear();
                 Action::Redraw
             }
-            KeyCode::Esc => Action::Quit,
+            KeyCode::Esc => Action::None,
             KeyCode::Char('?') => self.enter(Mode::Help),
             KeyCode::Char('/') => self.enter(Mode::Filter),
             KeyCode::Char(c @ '1'..='5') => self.go(Tab::ALL[(c as u8 - b'1') as usize]),
@@ -241,9 +296,11 @@ impl App {
             KeyCode::Char('h') | KeyCode::Left => self.fold(true),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('S') => {
-                let s = &mut self.state_mut().sort;
-                if let Some(sort) = s {
-                    sort.descending = !sort.descending;
+                if let Some(sort) = self.sort() {
+                    self.state_mut().sort = Some(Sort {
+                        descending: !sort.descending,
+                        ..sort
+                    });
                 }
                 Action::Redraw
             }
@@ -263,16 +320,33 @@ impl App {
             KeyCode::Enter => self.enter(Mode::Normal),
             KeyCode::Backspace => {
                 self.state_mut().filter.pop();
-                Action::Redraw
+                self.follow_filter()
             }
             KeyCode::Down => self.step(1),
             KeyCode::Up => self.step(-1),
             KeyCode::Char(c) => {
                 self.state_mut().filter.push(c);
-                Action::Redraw
+                self.follow_filter()
             }
             _ => Action::None,
         }
+    }
+
+    /// Keeps the selection while it still matches, else moves it to the first row that
+    /// does, never to a row kept only as a match's ancestor.
+    fn follow_filter(&mut self) -> Action {
+        if let Load::Ready(rows) = self.rows() {
+            let shown = self.shown(&rows);
+            let selected = self.state().selected.as_deref();
+            let stays = shown
+                .iter()
+                .any(|s| s.matched && Some(s.row.id.as_str()) == selected);
+            let first = shown.iter().find(|s| s.matched).map(|s| s.row.id.clone());
+            if !stays && first.is_some() {
+                self.state_mut().selected = first;
+            }
+        }
+        Action::Redraw
     }
 
     fn on_sheet(&mut self, code: KeyCode) -> Action {
@@ -292,8 +366,26 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Esc | KeyCode::Char('n' | 'q') => self.enter(Mode::Normal),
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_sheet(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_sheet(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_sheet(PAGE),
+            KeyCode::PageUp => self.scroll_sheet(-PAGE),
+            KeyCode::Char('g') | KeyCode::Home => self.scroll_sheet(isize::MIN / 2),
+            KeyCode::Char('G') | KeyCode::End => self.scroll_sheet(isize::MAX / 2),
             _ => Action::None,
         }
+    }
+
+    fn scroll_sheet(&mut self, by: isize) -> Action {
+        let Mode::Sheet(sheet) = &self.mode else {
+            return Action::None;
+        };
+        let last = sheet.targets.len().saturating_sub(1) as isize;
+        let at = sheet.offset.get() as isize;
+        sheet
+            .offset
+            .set(at.saturating_add(by).clamp(0, last) as usize);
+        Action::Redraw
     }
 
     fn enter(&mut self, mode: Mode) -> Action {
@@ -321,7 +413,8 @@ impl App {
         Action::Redraw
     }
 
-    /// Enter folds a parent, or jumps to the row an Overview line stands for.
+    /// Enter jumps to the row an Overview line stands for, or folds and unfolds a parent.
+    /// On a row without children it does nothing.
     fn open(&mut self) -> Action {
         let Some(row) = self.selected_row() else {
             return Action::None;
@@ -335,10 +428,21 @@ impl App {
             }
             return Action::Redraw;
         }
+        let Load::Ready(rows) = self.rows() else {
+            return Action::None;
+        };
+        if !rows
+            .iter()
+            .position(|r| r.id == row.id)
+            .is_some_and(|i| has_children(&rows, i))
+        {
+            return Action::None;
+        }
         let folded = self.state().folded.contains(&row.id);
         self.fold(!folded)
     }
 
+    /// `h` folds a parent, or moves from a child to its parent; `l` unfolds.
     fn fold(&mut self, fold: bool) -> Action {
         let Load::Ready(rows) = self.rows() else {
             return Action::None;
@@ -349,16 +453,26 @@ impl App {
         else {
             return Action::None;
         };
-        let has_children = rows.get(i + 1).is_some_and(|n| n.depth > rows[i].depth);
-        let id = rows[i].id.clone();
-        let state = self.state_mut();
-        if !has_children {
+        if !has_children(&rows, i) {
             if !fold || rows[i].depth == 0 {
                 return Action::None;
             }
             let parent = rows[..i].iter().rev().find(|r| r.depth < rows[i].depth);
-            state.selected = parent.map(|p| p.id.clone());
-        } else if fold {
+            self.state_mut().selected = parent.map(|p| p.id.clone());
+            return Action::Redraw;
+        }
+        // The filter shows every match whatever is folded, so a fold made now would change
+        // nothing on screen until the filter is cleared.
+        if self.filtering() {
+            self.notify(
+                "Folding is off while a filter is applied. esc clears it.",
+                Tone::Quiet,
+            );
+            return Action::Redraw;
+        }
+        let id = rows[i].id.clone();
+        let state = self.state_mut();
+        if fold {
             state.folded.insert(id);
         } else {
             state.folded.remove(&id);
@@ -366,14 +480,16 @@ impl App {
         Action::Redraw
     }
 
-    /// `s` walks the sortable columns, then back to the natural order. Numbers sort largest
-    /// first, words from A.
+    /// `s` walks the sortable columns on screen, then back to the natural order. Numbers
+    /// sort largest first, words from A.
     fn cycle_sort(&mut self) -> Action {
         let columns = views::view(self.tab).columns;
-        let sortable: Vec<usize> = (0..columns.len())
+        let sortable: Vec<usize> = self
+            .columns()
+            .into_iter()
             .filter(|&i| columns[i].sortable)
             .collect();
-        let next = match self.state().sort {
+        let next = match self.sort() {
             None => sortable.first().copied(),
             Some(s) => sortable.iter().copied().find(|&i| i > s.column),
         };
@@ -388,10 +504,7 @@ impl App {
 
     fn ask_stop(&mut self) -> Action {
         match self.selected_row().and_then(|r| r.target) {
-            Some(t) => self.enter(Mode::Sheet(Sheet {
-                kind: SheetKind::Stop,
-                targets: vec![t],
-            })),
+            Some(t) => self.enter(Mode::Sheet(Sheet::new(SheetKind::Stop, vec![t]))),
             None => {
                 self.notify("Nothing on this row can be stopped.", Tone::Quiet);
                 Action::Redraw
@@ -408,9 +521,110 @@ impl App {
             self.notify("No leftovers to reap.", Tone::Ok);
             return Action::Redraw;
         }
-        self.enter(Mode::Sheet(Sheet {
-            kind: SheetKind::Reap,
-            targets,
-        }))
+        self.enter(Mode::Sheet(Sheet::new(SheetKind::Reap, targets)))
+    }
+}
+
+fn has_children(rows: &[Row], i: usize) -> bool {
+    rows.get(i + 1).is_some_and(|n| n.depth > rows[i].depth)
+}
+
+/// Swallows a terminal's colour reply that arrives after the startup query stopped
+/// waiting. Crossterm hands it over as keys: alt-] (ESC ]), then `11;rgb:1d1d/1f1f/2121`,
+/// then ctrl-g (BEL) or alt-\ (ESC \). A key that does not continue that shape ends it
+/// and is handled as usual.
+#[derive(Debug, Default)]
+struct LateReply {
+    seen: Option<String>,
+}
+
+impl LateReply {
+    const LONGEST: usize = 48;
+
+    fn swallow(&mut self, key: &KeyEvent) -> bool {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(seen) = &mut self.seen else {
+            if alt && key.code == KeyCode::Char(']') {
+                self.seen = Some(String::new());
+                return true;
+            }
+            return false;
+        };
+        // `1x;` is in, so the colour has started and may end.
+        let body = seen.len() >= 3;
+        let end = match key.code {
+            KeyCode::Char('g') => ctrl && body,
+            KeyCode::Char('\\') => (alt && body) || seen.ends_with('\x1b'),
+            _ => false,
+        };
+        if end {
+            self.seen = None;
+            return true;
+        }
+        let next = match key.code {
+            KeyCode::Esc if body => Some('\x1b'),
+            KeyCode::Char(c) if !alt && !ctrl && !seen.ends_with('\x1b') => Some(c),
+            _ => None,
+        };
+        let fits = next.is_some_and(|c| match seen.len() {
+            0 => c == '1',
+            1 => c == '0' || c == '1',
+            2 => c == ';',
+            n if n < Self::LONGEST => c == '\x1b' || c.is_ascii_hexdigit() || "rgba:/#".contains(c),
+            _ => false,
+        });
+        match (fits, next) {
+            (true, Some(c)) => {
+                seen.push(c);
+                true
+            }
+            _ => {
+                self.seen = None;
+                false
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(s: &str) -> Vec<KeyEvent> {
+        let mut out = Vec::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            out.push(match c {
+                '\x1b' => match chars.next() {
+                    Some(n) => KeyEvent::new(KeyCode::Char(n), KeyModifiers::ALT),
+                    None => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                },
+                '\x07' => KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                c => KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn a_late_colour_reply_is_swallowed_and_the_next_key_is_not() {
+        let mut late = LateReply::default();
+        for reply in [
+            "\x1b]11;rgb:1d1d/1f1f/2121\x07",
+            "\x1b]10;rgb:c5c5/c8c8/c6c6\x1b\\",
+        ] {
+            assert!(keys(reply).iter().all(|k| late.swallow(k)), "{reply:?}");
+        }
+        assert!(!late.swallow(&keys("q")[0]));
+    }
+
+    #[test]
+    fn keys_that_break_the_shape_go_through() {
+        let mut late = LateReply::default();
+        let k = keys("\x1b]j");
+        assert!(late.swallow(&k[0]));
+        assert!(!late.swallow(&k[1]), "j is not part of a reply");
+        assert!(!late.swallow(&keys("/")[0]));
     }
 }

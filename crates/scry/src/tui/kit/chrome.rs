@@ -38,7 +38,7 @@ pub fn header(f: &mut Frame, area: Rect, theme: &Theme, board: &Board, source: &
             theme.muted,
         )]],
     };
-    let source = Span::styled(format!("{source} "), theme.faint);
+    let source = Span::styled(format!("{source} "), theme.muted);
     let room = area.width as usize;
     for seg in segments {
         if width(&spans) + width(&seg) + 3 > room {
@@ -57,7 +57,7 @@ pub fn header(f: &mut Frame, area: Rect, theme: &Theme, board: &Board, source: &
 
 fn pulse<'a>(theme: &Theme, p: &Pulse) -> Vec<Vec<Span<'a>>> {
     let label = |s: &'static str| Span::styled(s, theme.muted);
-    let warming = || Span::styled("warming up", theme.faint);
+    let warming = || Span::styled("warming up", theme.muted);
     let mut out = Vec::new();
     out.push(match &p.cpu {
         Some(cpu) => {

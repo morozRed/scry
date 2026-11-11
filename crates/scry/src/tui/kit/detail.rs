@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use scry_core::view::Detail;
 
-use super::{fill, width};
+use unicode_width::UnicodeWidthStr;
+
+use super::{fill, pad, width};
 use crate::tui::theme::{Chrome, Theme};
 
 pub fn detail(f: &mut Frame, area: Rect, theme: &Theme, d: &Detail, beside: bool) {
@@ -62,10 +64,10 @@ fn wide<'a>(theme: &Theme, d: &'a Detail, room: usize) -> Vec<Line<'a>> {
 
 fn tall<'a>(theme: &Theme, d: &'a Detail) -> Vec<Line<'a>> {
     let mut lines = vec![Line::styled(d.title.as_str(), theme.strong), Line::raw("")];
-    let pad = d.facts.iter().map(|f| f.label.len()).max().unwrap_or(0) + 2;
+    let cols = d.facts.iter().map(|f| f.label.width()).max().unwrap_or(0) + 2;
     for fact in &d.facts {
         lines.push(Line::from(vec![
-            Span::styled(format!("{:pad$}", fact.label), theme.muted),
+            Span::styled(pad(&fact.label, cols), theme.muted),
             Span::styled(fact.value.as_str(), theme.text),
         ]));
     }
@@ -84,4 +86,30 @@ fn tall<'a>(theme: &Theme, d: &'a Detail) -> Vec<Line<'a>> {
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use scry_core::view::Fact;
+
+    use super::*;
+    use crate::tui::theme::{Colors, Look};
+
+    #[test]
+    fn labels_pad_to_the_widest_in_display_columns() {
+        let fact = |label: &str| Fact {
+            label: label.into(),
+            value: "v".into(),
+        };
+        let d = Detail {
+            title: "t".into(),
+            facts: vec![fact("pid"), fact("東京"), fact("cafe\u{301}")],
+            sentence: "s".into(),
+            evidence: vec![],
+        };
+        let lines = tall(&Theme::new(Look::Tinted, Colors::Mono), &d);
+        for line in &lines[2..5] {
+            assert_eq!(line.spans[0].content.width(), 6, "{line:?}");
+        }
+    }
 }

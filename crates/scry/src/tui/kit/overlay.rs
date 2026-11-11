@@ -5,6 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Row, Table, Wrap};
 use scry_core::view::{human_age, human_bytes};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tui::app::{Sheet, SheetKind};
 use crate::tui::theme::{Chrome, Theme};
@@ -71,20 +72,45 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
         Layout::vertical([Constraint::Length(head), Constraint::Min(1)]).areas(inner);
     f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), head);
 
+    // Targets that fit under the column titles. When some do not, the last line says how
+    // many and how to scroll to them, and the head above keeps the totals in view.
+    let room = list.height.saturating_sub(1) as usize;
+    let rows_shown = if n <= room { n } else { room.saturating_sub(1) };
+    let top = sheet.offset.get().min(n - rows_shown);
+    sheet.offset.set(top);
+    if rows_shown < n {
+        let below = n - top - rows_shown;
+        let mut more = Vec::new();
+        if top > 0 {
+            more.push(Span::styled(format!("↑ {top} above   "), theme.muted));
+        }
+        if below > 0 {
+            more.push(Span::styled(format!("↓ {below} more   "), theme.text));
+        }
+        more.push(Span::styled("j k", theme.key));
+        more.push(Span::styled(" scroll", theme.muted));
+        let at = Rect {
+            y: list.bottom() - 1,
+            height: 1,
+            ..list
+        };
+        f.render_widget(Paragraph::new(Line::from(more)), at);
+    }
+
     let wide = inner.width >= 90;
     let mut widths = vec![
         Constraint::Length(6),
         Constraint::Length(4),
         Constraint::Fill(2),
     ];
-    let mut titles = vec!["PID", "AGE", "COMMAND"];
+    let mut titles = vec![Line::from("PID"), Line::from("AGE"), Line::from("COMMAND")];
     if wide {
         widths.extend([Constraint::Fill(2), Constraint::Length(8)]);
-        titles.extend(["SESSION", "EVIDENCE"]);
+        titles.extend([Line::from("SESSION"), Line::from("EVIDENCE")]);
     }
     widths.push(Constraint::Length(6));
-    titles.push("FREES");
-    let rows = sheet.targets.iter().map(|t| {
+    titles.push(Line::from("FREES").right_aligned());
+    let rows = sheet.targets[top..top + rows_shown].iter().map(|t| {
         let mut cells = vec![
             Line::styled(t.pid.to_string(), theme.text),
             Line::styled(human_age(t.age_s), theme.text),
@@ -105,11 +131,15 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
         );
         Row::new(cells)
     });
+    let table = Rect {
+        height: list.height.min(1 + rows_shown as u16),
+        ..list
+    };
     f.render_widget(
         Table::new(rows, widths)
             .header(Row::new(titles).style(theme.heading))
             .column_spacing(2),
-        list,
+        table,
     );
     area
 }
@@ -120,7 +150,7 @@ fn wrapped_extra(text: &str, width: u16) -> u16 {
     let mut lines = 1;
     let mut used = 0;
     for word in text.split_whitespace() {
-        let w = word.chars().count();
+        let w = word.width();
         if used > 0 && used + 1 + w > width {
             lines += 1;
             used = w;
@@ -131,12 +161,14 @@ fn wrapped_extra(text: &str, width: u16) -> u16 {
     lines - 1
 }
 
-const KEYS: [(&str, &str, &str); 12] = [
+const KEYS: [(&str, &str, &str); 14] = [
     ("Move", "j k ↑ ↓", "up and down, ctrl-d ctrl-u by page"),
     ("", "g G", "first and last row"),
-    ("", "⏎  h l", "open or fold, go to"),
+    ("", "⏎", "fold a session, or go to the row"),
+    ("", "h l", "fold and unfold; h goes to the parent"),
     ("Views", "1-5  tab", "switch view"),
-    ("Find", "/", "filter, fuzzy; esc clears"),
+    ("Find", "/", "filter, fuzzy, within a column"),
+    ("", "esc", "clear the filter"),
     ("", "s  S", "sort by the next column, reverse"),
     ("Act", "x", "stop the selected process"),
     ("", "X", "reap leftovers"),

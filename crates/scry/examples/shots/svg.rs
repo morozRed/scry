@@ -70,6 +70,31 @@ pub const TOMORROW_NIGHT: Palette = Palette {
     ],
 };
 
+/// Solarized light, a low-contrast light palette.
+pub const SOLARIZED_LIGHT: Palette = Palette {
+    name: "solarized-light",
+    bg: hex(0xfdf6e3),
+    fg: hex(0x657b83),
+    ansi: [
+        hex(0x073642),
+        hex(0xdc322f),
+        hex(0x859900),
+        hex(0xb58900),
+        hex(0x268bd2),
+        hex(0xd33682),
+        hex(0x2aa198),
+        hex(0xeee8d5),
+        hex(0x002b36),
+        hex(0xcb4b16),
+        hex(0x586e75),
+        hex(0x657b83),
+        hex(0x839496),
+        hex(0x6c71c4),
+        hex(0x93a1a1),
+        hex(0xfdf6e3),
+    ],
+};
+
 const CELL_W: f32 = 8.4;
 const CELL_H: f32 = 18.0;
 const BASELINE: f32 = 13.5;

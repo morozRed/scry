@@ -2,15 +2,27 @@
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use scry_core::view::{Board, Load, Tab};
+use scry_core::view::agents::AgentRow;
+use scry_core::view::{Board, Detail, Evidence, Load, State, Tab};
 
 use super::app::{Action, App, Mode, SheetKind, Source};
-use super::theme::{Colors, Look, Theme};
+use super::theme::{Colors, Look, Rgb, Theme};
 use super::ui::draw;
 
 fn mono() -> Theme {
     Theme::new(Look::Tinted, Colors::Mono)
+}
+
+fn tinted() -> Theme {
+    Theme::new(
+        Look::Tinted,
+        Colors::True {
+            bg: Rgb(255, 255, 255),
+            fg: Rgb(0, 0, 0),
+        },
+    )
 }
 
 fn typical() -> App {
@@ -23,9 +35,56 @@ fn typical() -> App {
     )
 }
 
+fn design_board() -> Board {
+    Board::parse(include_str!("../../../../fixtures/design.json")).unwrap()
+}
+
 fn design() -> App {
-    let board = Board::parse(include_str!("../../../../fixtures/design.json")).unwrap();
-    App::new(board, Source::Fixture("design.json".into()), mono())
+    App::new(
+        design_board(),
+        Source::Fixture("design.json".into()),
+        mono(),
+    )
+}
+
+/// The design board with one more ended session that left `n` processes.
+fn with_leftovers(n: usize) -> Board {
+    let mut board = design_board();
+    let Load::Ready(rows) = &mut board.agents else {
+        unreachable!("the design fixture has agents");
+    };
+    let row = |id: String, depth, label: String, pid, state, evidence| AgentRow {
+        id,
+        depth,
+        label,
+        context: (depth == 0).then(|| "acme/batch".into()),
+        pid,
+        ram: Some(48 << 20),
+        ports: vec![],
+        age_s: 5 * 3600,
+        evidence,
+        state: Some(state),
+        detail: Detail::default(),
+    };
+    rows.push(row(
+        "s-batch".into(),
+        0,
+        "claude".into(),
+        None,
+        State::Ended,
+        None,
+    ));
+    for i in 0..n {
+        rows.push(row(
+            format!("w-{i}"),
+            1,
+            format!("node worker-{i:02}"),
+            Some(61000 + i as i32),
+            State::Leftover,
+            Some(Evidence::Stamp),
+        ));
+    }
+    board
 }
 
 fn render(app: &App, w: u16, h: u16) -> TestBackend {
@@ -35,6 +94,38 @@ fn render(app: &App, w: u16, h: u16) -> TestBackend {
     })
     .unwrap();
     t.backend().clone()
+}
+
+fn lines(b: &TestBackend) -> Vec<String> {
+    let buf = b.buffer();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+fn screen(b: &TestBackend) -> String {
+    lines(b).join("\n")
+}
+
+/// Where `text` first starts on screen, reading down from the top.
+fn find(buf: &Buffer, text: &str) -> Option<(u16, u16)> {
+    find_from(buf, text, 0)
+}
+
+fn find_from(buf: &Buffer, text: &str, from: u16) -> Option<(u16, u16)> {
+    for y in from..buf.area.height {
+        let line: Vec<&str> = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+        for x in 0..line.len() {
+            if line[x..].concat().starts_with(text) {
+                return Some((x as u16, y));
+            }
+        }
+    }
+    None
 }
 
 fn press(app: &mut App, keys: &str) {
@@ -50,6 +141,10 @@ fn press(app: &mut App, keys: &str) {
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn sort(a: &App) -> Option<(usize, bool)> {
+    a.state().sort.map(|s| (s.column, s.descending))
 }
 
 #[test]
@@ -101,6 +196,13 @@ fn design_agents_120x40() {
 }
 
 #[test]
+fn design_agents_150x40() {
+    let mut a = design();
+    press(&mut a, "3jj");
+    insta::assert_snapshot!(render(&a, 150, 40));
+}
+
+#[test]
 fn design_ports_100x30() {
     let mut a = design();
     press(&mut a, "2");
@@ -145,7 +247,7 @@ fn every_view_has_loading_empty_and_failed_states() {
 }
 
 #[test]
-fn keys_switch_views_and_esc_closes_help_before_quitting() {
+fn keys_switch_views_and_only_q_quits() {
     let mut a = typical();
     a.on_key(key(KeyCode::Char('3')));
     assert_eq!(a.tab, Tab::Agents);
@@ -157,9 +259,13 @@ fn keys_switch_views_and_esc_closes_help_before_quitting() {
     a.on_key(key(KeyCode::Char('?')));
     assert_eq!(a.on_key(key(KeyCode::Esc)), Action::Redraw);
     assert_eq!(a.mode, Mode::Normal);
-    assert_eq!(a.on_key(key(KeyCode::Esc)), Action::Quit);
-    let ctrl_z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
-    assert_eq!(a.on_key(ctrl_z), Action::Suspend);
+    // One esc too many does nothing.
+    assert_eq!(a.on_key(key(KeyCode::Esc)), Action::None);
+    assert_eq!(a.on_key(key(KeyCode::Esc)), Action::None);
+    assert_eq!(a.on_key(key(KeyCode::Char('q'))), Action::Quit);
+    let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+    assert_eq!(a.on_key(ctrl('c')), Action::Quit);
+    assert_eq!(a.on_key(ctrl('z')), Action::Suspend);
 }
 
 #[test]
@@ -170,6 +276,18 @@ fn enter_on_an_attention_line_opens_its_row() {
     assert_eq!(a.state().selected.as_deref(), Some("s-4f2c"));
     press(&mut a, "\n");
     assert!(a.state().folded.contains("s-4f2c"));
+}
+
+#[test]
+fn enter_on_a_process_does_nothing_and_h_goes_to_its_parent() {
+    let mut a = design();
+    press(&mut a, "3jj");
+    assert_eq!(a.state().selected.as_deref(), Some("next-48213"));
+    assert_eq!(a.on_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(a.state().selected.as_deref(), Some("next-48213"));
+    assert!(a.state().folded.is_empty());
+    press(&mut a, "h");
+    assert_eq!(a.state().selected.as_deref(), Some("npm-48201"));
 }
 
 #[test]
@@ -192,29 +310,258 @@ fn a_sheet_waits_for_enter_and_esc_sends_nothing() {
 }
 
 #[test]
-fn sort_cycles_columns_then_returns_to_the_natural_order() {
+fn sort_cycles_the_columns_on_screen_then_returns_to_the_natural_order() {
+    // At 80 columns Agents hides PID, so s goes from SESSION straight to RAM.
     let mut a = design();
-    press(&mut a, "3s");
-    assert_eq!(
-        a.state().sort.map(|s| (s.column, s.descending)),
-        Some((0, false))
-    );
+    press(&mut a, "3");
+    render(&a, 80, 24);
     press(&mut a, "s");
-    assert_eq!(
-        a.state().sort.map(|s| (s.column, s.descending)),
-        Some((1, true))
-    );
-    press(&mut a, "ssssss");
-    assert_eq!(a.state().sort, None);
+    assert_eq!(sort(&a), Some((0, false)));
+    press(&mut a, "s");
+    assert_eq!(sort(&a), Some((2, true)));
+    press(&mut a, "sssss");
+    assert_eq!(sort(&a), None);
+
+    // From 96 columns of list PID is on screen and takes its turn.
+    let mut a = design();
+    press(&mut a, "3");
+    render(&a, 150, 40);
+    press(&mut a, "ss");
+    assert_eq!(sort(&a), Some((1, true)));
+    // Narrowed so PID is hidden again, the list falls back to its natural order: no order
+    // without an arrow.
+    render(&a, 80, 24);
+    assert_eq!(a.sort(), None);
+    assert!(lines(&render(&a, 80, 24)).iter().all(|l| !l.contains('↓')));
+
+    // Ports hides ADDR below 96.
+    let mut a = design();
+    press(&mut a, "2");
+    render(&a, 80, 24);
+    press(&mut a, "ss");
+    assert_eq!(sort(&a).map(|s| s.0), Some(2));
 }
 
 #[test]
-fn a_rescan_reports_changed_rows() {
+fn the_sort_arrow_never_clips_a_title() {
+    let mut a = design();
+    press(&mut a, "3");
+    render(&a, 80, 24);
+    // AGE, then EVIDENCE.
+    press(&mut a, "ssss");
+    assert_eq!(sort(&a).map(|s| s.0), Some(4));
+    assert!(screen(&render(&a, 80, 24)).contains("AGE ↓"));
+    press(&mut a, "s");
+    assert_eq!(sort(&a).map(|s| s.0), Some(5));
+    assert!(screen(&render(&a, 80, 24)).contains("EVIDENCE ↑"));
+
+    let mut a = design();
+    render(&a, 80, 24);
+    press(&mut a, "s");
+    assert!(screen(&render(&a, 80, 24)).contains("SIZE ↓"));
+}
+
+#[test]
+fn growing_the_terminal_scrolls_rows_back_into_view() {
+    let mut a = design();
+    press(&mut a, "3");
+    render(&a, 80, 24);
+    press(&mut a, "G");
+    let small = render(&a, 80, 24);
+    assert!(
+        !screen(&small).contains("acme/wt-auth"),
+        "scrolled at 80×24"
+    );
+    let big = render(&a, 120, 40);
+    let rows = lines(&big);
+    assert!(
+        rows[4].contains("claude") && rows[4].contains("acme/wt-auth"),
+        "the first row is back at the top:\n{}",
+        screen(&big)
+    );
+}
+
+#[test]
+fn a_long_reap_sheet_scrolls_and_keeps_its_totals() {
+    let mut a = App::new(
+        with_leftovers(20),
+        Source::Fixture("design.json".into()),
+        mono(),
+    );
+    press(&mut a, "3X");
+    let Mode::Sheet(sheet) = &a.mode else {
+        panic!("X should open a sheet");
+    };
+    let n = sheet.targets.len();
+    assert_eq!(n, 24);
+    let first = render(&a, 80, 24);
+    insta::assert_snapshot!("reap_sheet_24_80x24", first);
+    let text = screen(&first);
+    assert!(text.contains("Reap 24 leftovers?"));
+    assert!(text.contains("Frees about"));
+    assert!(text.contains("more   j k scroll"));
+    assert!(!text.contains("worker-19"));
+
+    press(&mut a, "G");
+    let last = screen(&render(&a, 80, 24));
+    assert!(
+        last.contains("worker-19"),
+        "G shows the last target:\n{last}"
+    );
+    assert!(last.contains("above"));
+    assert!(last.contains("Frees about"));
+    // Every target was on screen at some point.
+    let mut seen = std::collections::HashSet::new();
+    press(&mut a, "g");
+    for _ in 0..n {
+        let s = screen(&render(&a, 80, 24));
+        for i in 0..20 {
+            if s.contains(&format!("worker-{i:02}")) {
+                seen.insert(i);
+            }
+        }
+        press(&mut a, "j");
+    }
+    assert_eq!(seen.len(), 20);
+}
+
+#[test]
+fn the_frees_title_lines_up_with_its_numbers() {
+    let mut a = design();
+    press(&mut a, "3X");
+    for w in [80, 120] {
+        let b = render(&a, w, 40);
+        let (x, y) = find(b.buffer(), "FREES").unwrap();
+        let (nx, _) = find_from(b.buffer(), "412M", y + 1).unwrap();
+        assert_eq!(x + 5, nx + 4, "at {w} columns:\n{}", screen(&b));
+    }
+}
+
+#[test]
+fn the_filter_matches_within_one_column_and_highlights_it() {
+    let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
+    press(&mut a, "3/vite");
+    let b = render(&a, 80, 24);
+    let text = screen(&b);
+    assert!(!text.contains("mcp-server-github"), "{text}");
+    let (x, y) = find(b.buffer(), "vite").unwrap();
+    let matched = a.theme.matched.fg;
+    for dx in 0..4 {
+        assert_eq!(b.buffer()[(x + dx, y)].fg, matched.unwrap());
+    }
+    // A match in another column is highlighted there.
+    press(&mut a, "\x1b/guess");
+    let b = render(&a, 80, 24);
+    let (x, y) = find(b.buffer(), "guess").unwrap();
+    assert_eq!(b.buffer()[(x, y)].fg, matched.unwrap());
+}
+
+#[test]
+fn filtering_selects_the_first_match_not_its_session() {
+    let mut a = design();
+    press(&mut a, "3/vite");
+    assert_eq!(a.state().selected.as_deref(), Some("vite-50110"));
+    let b = render(&a, 80, 24);
+    // The detail pane describes vite, not the codex session above it.
+    assert!(screen(&b).contains("vite for the live Codex session"));
+}
+
+#[test]
+fn folding_waits_until_the_filter_is_cleared() {
+    let mut a = design();
+    press(&mut a, "3/codex\n");
+    assert_eq!(a.state().selected.as_deref(), Some("s-c0de"));
+    press(&mut a, "\n");
+    assert!(a.state().folded.is_empty(), "no hidden fold");
+    assert!(a.toast.as_ref().unwrap().text.starts_with("Folding is off"));
+    press(&mut a, "\x1b\n");
+    assert!(a.state().folded.contains("s-c0de"));
+}
+
+#[test]
+fn the_footer_offers_only_keys_that_work_here() {
+    let mut a = design();
+    press(&mut a, "4");
+    let disk = lines(&render(&a, 80, 24)).pop().unwrap();
+    for absent in ["move", "filter", "sort"] {
+        assert!(!disk.contains(absent), "{disk}");
+    }
+    assert!(disk.contains("help") && disk.contains("quit"));
+    press(&mut a, "3");
+    let agents = lines(&render(&a, 80, 24)).pop().unwrap();
+    for present in ["move", "fold", "reap", "filter", "sort"] {
+        assert!(agents.contains(present), "{agents}");
+    }
+}
+
+#[test]
+fn the_selected_row_has_a_cursor_and_a_tint() {
+    let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
+    press(&mut a, "3jj");
+    let b = render(&a, 80, 24);
+    let (x, y) = find(b.buffer(), "next dev").unwrap();
+    assert_eq!(b.buffer()[(0, y)].symbol(), "▌");
+    assert_eq!(b.buffer()[(0, y)].fg, a.theme.accent.fg.unwrap());
+    assert_eq!(b.buffer()[(x, y)].bg, a.theme.selection.bg.unwrap());
+}
+
+#[test]
+fn a_fold_count_is_muted_not_faint() {
+    let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
+    press(&mut a, "3\n");
+    let b = render(&a, 80, 24);
+    let (x, y) = find(b.buffer(), "+4").unwrap();
+    assert_eq!(b.buffer()[(x, y)].fg, a.theme.muted.fg.unwrap());
+}
+
+#[test]
+fn the_pane_moves_beside_the_list_only_when_the_list_keeps_96_columns() {
+    let a = design();
+    render(&a, 120, 40);
+    assert_eq!(a.list_width.get(), 120);
+    render(&a, 149, 40);
+    assert_eq!(a.list_width.get(), 149);
+    render(&a, 150, 40);
+    assert!(a.list_width.get() >= 96);
+    render(&a, 220, 50);
+    assert!(a.list_width.get() >= 96);
+}
+
+#[test]
+fn the_ansi_rule_keeps_a_blank_column_after_the_list() {
+    let mut a = App::new(
+        design_board(),
+        Source::Fixture("d".into()),
+        Theme::new(Look::Tinted, Colors::Ansi),
+    );
+    press(&mut a, "3");
+    let b = render(&a, 150, 40);
+    let list = a.list_width.get();
+    let buf = b.buffer();
+    for y in 5..20 {
+        assert_eq!(buf[(list, y)].symbol(), " ", "row {y}:\n{}", screen(&b));
+        assert_eq!(buf[(list + 1, y)].symbol(), "│");
+    }
+}
+
+#[test]
+fn a_rescan_glows_rows_that_are_new_or_changed_state() {
     let mut a = design();
     press(&mut a, "3");
     let mut board = a.board.clone();
     if let Load::Ready(rows) = &mut board.agents {
         rows[2].ram = Some(1);
     }
-    assert_eq!(a.replace_board(board), ["next-48213"]);
+    assert!(
+        a.replace_board(board.clone()).is_empty(),
+        "RAM moves every sample"
+    );
+    if let Load::Ready(rows) = &mut board.agents {
+        rows[6].state = Some(State::Leftover);
+    }
+    let fresh = with_leftovers(1);
+    if let (Load::Ready(rows), Load::Ready(more)) = (&mut board.agents, &fresh.agents) {
+        rows.extend(more[more.len() - 2..].iter().cloned());
+    }
+    assert_eq!(a.replace_board(board), ["mem-51244", "s-batch", "w-0"]);
 }

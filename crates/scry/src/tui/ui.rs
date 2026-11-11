@@ -15,7 +15,11 @@ use super::views;
 
 pub const MIN_W: u16 = 80;
 pub const MIN_H: u16 = 24;
-const BESIDE_FROM: u16 = 120;
+/// The detail pane moves beside the list from this width, where the list still keeps
+/// `LIST_BESIDE` columns, so nothing shown in full below 150 is cut beside the pane.
+const BESIDE_FROM: u16 = 150;
+const LIST_BESIDE: u16 = 96;
+const PANE_MAX: u16 = 64;
 
 /// Where things landed, for effects that run after the frame is drawn.
 #[derive(Default)]
@@ -58,13 +62,14 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
     let view = views::view(app.tab);
     let title = app.tab.title();
     let mut count = None;
-    match app.rows() {
+    let rows = app.rows();
+    match &rows {
         Load::Ready(rows) if !rows.is_empty() => {
-            let shown = app.shown(&rows);
+            let (list, pane, beside) = split(f, body, theme);
+            app.list_width.set(list.width);
+            let shown = app.shown(rows);
             count = Some((shown.len(), rows.len()));
             let cursor = app.cursor(&shown);
-            let (list, pane, beside) = split(f, body, theme);
-            let state = app.state();
             painted.rows = table::table(
                 f,
                 list,
@@ -73,9 +78,9 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
                     columns: view.columns,
                     shown: &shown,
                     cursor,
-                    sort: state.sort,
+                    sort: app.sort(),
                 },
-                &state.offset,
+                &app.state().offset,
             );
             if shown.is_empty() {
                 states::status(
@@ -94,7 +99,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
             }
         }
         other => {
-            let status = match &other {
+            let status = match other {
                 Load::Ready(_) => Status::Empty {
                     title: view.empty.0,
                     hint: view.empty.1,
@@ -109,11 +114,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
 
     let left = footer_left(app, count);
     let hints: Vec<(&str, &str)> = match &app.mode {
-        Mode::Normal => [("j/k", "move")]
-            .into_iter()
-            .chain(view.hints.iter().copied())
-            .chain([("/", "filter"), ("s", "sort"), ("?", "help"), ("q", "quit")])
-            .collect(),
+        Mode::Normal => normal_hints(app, view, &rows),
         Mode::Filter => vec![("⏎", "keep"), ("esc", "clear"), ("↑/↓", "move")],
         Mode::Sheet(s) => vec![("⏎", overlay::confirm_label(s.kind)), ("esc", "cancel")],
         Mode::Help => vec![("esc", "close")],
@@ -128,21 +129,52 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
     painted
 }
 
-/// Splits the body into list and detail: below the list under 120 columns, beside it
-/// from 120.
+/// Keys that do something on this view as it is now: no moving, filtering or sorting
+/// without a list, and no sorting without a sortable column on screen.
+fn normal_hints(
+    app: &App,
+    view: &views::ViewDef,
+    rows: &Load<Vec<views::Row>>,
+) -> Vec<(&'static str, &'static str)> {
+    let mut hints = Vec::new();
+    match rows {
+        Load::Ready(rows) if !rows.is_empty() => {
+            hints.push(("j/k", "move"));
+            hints.extend(view.hints.iter().copied());
+            hints.push(("/", "filter"));
+            if app.columns().iter().any(|&i| view.columns[i].sortable) {
+                hints.push(("s", "sort"));
+            }
+        }
+        Load::Failed(_) => hints.push(("r", "retry")),
+        _ => {}
+    }
+    hints.extend([("?", "help"), ("q", "quit")]);
+    hints
+}
+
+/// Splits the body into list and detail: below the list under `BESIDE_FROM` columns,
+/// beside it from there.
 fn split(f: &mut Frame, body: Rect, theme: &Theme) -> (Rect, Rect, bool) {
     let rules = theme.chrome == Chrome::Rules;
     if body.width >= BESIDE_FROM {
-        let w = (body.width * 36 / 100).clamp(40, 56);
+        // A rule gets a blank column on its list side, so the last column never touches it.
+        let gap = if rules { 2 } else { 1 };
+        let w = (body.width - gap - LIST_BESIDE).min(PANE_MAX);
         let [list, gap, pane] = Layout::horizontal([
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(gap),
             Constraint::Length(w),
         ])
         .areas(body);
         if rules {
             let bar = vec![Line::raw("│"); gap.height as usize];
-            f.render_widget(Paragraph::new(bar).style(theme.border), gap);
+            let at = Rect {
+                x: gap.right() - 1,
+                width: 1,
+                ..gap
+            };
+            f.render_widget(Paragraph::new(bar).style(theme.border), at);
         }
         (list, pane, true)
     } else {

@@ -6,6 +6,7 @@ mod filter;
 mod kit;
 mod motion;
 pub mod theme;
+mod tty;
 pub mod ui;
 mod views;
 
@@ -43,13 +44,19 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     let source = fixture.map_or(Source::Live, Source::Fixture);
     let live = matches!(source, Source::Live);
     let board = source.load()?;
-    // Asks the terminal for its colours, so it runs before raw mode and the alternate screen.
-    let theme = Theme::detect();
-    let mut motion = Motion::new(theme.motion);
-    let mut app = App::new(board, source, theme);
 
+    // The colour query below changes terminal modes, so the modes are saved and the signal
+    // handler is in place before it starts.
+    tty::save();
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(Arc::clone(&stop))?;
+    // Runs before raw mode and the alternate screen.
+    let theme = Theme::detect(&stop);
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let mut motion = Motion::new(theme.motion);
+    let mut app = App::new(board, source, theme);
 
     let (tx, rx) = mpsc::channel();
     if live {
@@ -67,6 +74,7 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    tty::flush_input();
     let result = event_loop(&mut terminal, &mut app, &mut motion, &rx, &stop);
     ratatui::restore();
     result
@@ -142,9 +150,9 @@ fn event_loop(
     Ok(())
 }
 
-/// SIGTERM and SIGINT ask the loop to stop and restore the terminal. A hung-up terminal can
-/// leave crossterm spinning inside `poll`, where the loop never sees the flag, so SIGHUP
-/// exits at once and the others exit after a grace period.
+/// SIGTERM and SIGINT ask the loop to stop and restore the terminal, and restore it here
+/// after a grace period if the loop has not. A hung-up terminal can leave crossterm spinning
+/// inside `poll`, where the loop never sees the flag, so SIGHUP restores and exits at once.
 fn watch_signals(stop: Arc<AtomicBool>) -> Result<()> {
     let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])?;
     std::thread::spawn(move || {
@@ -154,8 +162,8 @@ fn watch_signals(stop: Arc<AtomicBool>) -> Result<()> {
         stop.store(true, Ordering::Relaxed);
         if sig != SIGHUP {
             std::thread::sleep(SIGNAL_GRACE);
-            ratatui::restore();
         }
+        tty::restore();
         std::process::exit(128 + sig);
     });
     Ok(())
