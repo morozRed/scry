@@ -1,0 +1,992 @@
+{
+  "pulse": {
+    "cpu": {
+      "now": 23,
+      "recent": [
+        8,
+        12,
+        9,
+        15,
+        22,
+        31,
+        27,
+        18,
+        14,
+        19,
+        25,
+        23
+      ]
+    },
+    "memory": "normal",
+    "swap_used": 1288490188,
+    "disk": {
+      "free": 90194313216,
+      "full_in_days": 19
+    }
+  },
+  "overview": {
+    "process_count": 1072,
+    "own_count": 412,
+    "own_footprint": 10522669875,
+    "attention": [
+      {
+        "id": "a-left",
+        "state": "leftover",
+        "title": "claude left 4 processes running",
+        "context": "acme/wt-auth",
+        "size": 999292928,
+        "tab": "agents",
+        "row": "s-4f2c",
+        "detail": {
+          "title": "4 leftovers in acme/wt-auth",
+          "facts": [
+            {
+              "label": "session",
+              "value": "4f2c9a1e"
+            },
+            {
+              "label": "ended",
+              "value": "14:06"
+            }
+          ],
+          "sentence": "A Claude Code session in ~/sources/acme/wt-auth ended 2 h ago and left 4 processes running. Together they hold 953M and :3000.",
+          "evidence": [
+            "3 by environment stamp, 1 by process tree (all exact)",
+            "X on the Agents view reaps them after a review"
+          ]
+        }
+      },
+      {
+        "id": "a-port",
+        "state": "leftover",
+        "title": ":3000 is held by an ended session",
+        "context": "next dev",
+        "size": 432013312,
+        "tab": "ports",
+        "row": "p-3000-tcp",
+        "detail": {
+          "title": ":3000 · next dev",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "48213"
+            }
+          ],
+          "sentence": ":3000 is held by next dev in ~/sources/acme/wt-auth. Its Claude Code session ended 2 h ago, so the port will not free itself.",
+          "evidence": [
+            "CLAUDE_CODE_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "a-disk",
+        "state": "filling",
+        "title": "84G free, full in about 19 days",
+        "context": "Macintosh HD",
+        "size": null,
+        "tab": "disk",
+        "row": null,
+        "detail": {
+          "title": "Disk is filling",
+          "facts": [
+            {
+              "label": "free",
+              "value": "84G"
+            },
+            {
+              "label": "trend",
+              "value": "-4.4G a day"
+            }
+          ],
+          "sentence": "At this week's rate the startup disk fills in about 19 days. node_modules and Xcode DerivedData grew the most.",
+          "evidence": [
+            "7 days of statfs samples, robust slope"
+          ]
+        }
+      },
+      {
+        "id": "a-wt",
+        "state": "stale",
+        "title": "2 worktrees merged 9 days ago",
+        "context": "acme",
+        "size": 3650722201,
+        "tab": "worktrees",
+        "row": null,
+        "detail": {
+          "title": "Merged worktrees in acme",
+          "facts": [
+            {
+              "label": "size",
+              "value": "3.4G with node_modules"
+            }
+          ],
+          "sentence": "wt-billing and wt-onboarding were merged into main 9 days ago and nothing has run in them since.",
+          "evidence": [
+            "git branch --merged main",
+            "No process cwd inside for 9 days"
+          ]
+        }
+      },
+      {
+        "id": "a-guess",
+        "state": "unowned",
+        "title": ":8000 python3 has no known owner",
+        "context": "~/Downloads",
+        "size": 22020096,
+        "tab": "ports",
+        "row": "p-8000-tcp",
+        "detail": {
+          "title": ":8000 · python3",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "7731"
+            }
+          ],
+          "sentence": "python3 -m http.server has run in ~/Downloads for a day. Its link to a session is a guess, so only you can stop it.",
+          "evidence": [
+            "Started inside a session's time window in its directory (guess)"
+          ]
+        }
+      }
+    ]
+  },
+  "ports": {
+    "state": "ready",
+    "value": [
+      {
+        "id": "p-631-tcp",
+        "port": 631,
+        "proto": "tcp",
+        "addr": "127.0.0.1",
+        "command": "cupsd",
+        "pid": 590,
+        "project": null,
+        "session": null,
+        "owner": "root",
+        "ram": null,
+        "age_s": 345600,
+        "evidence": null,
+        "state": "system",
+        "detail": {
+          "title": ":631 · cupsd",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "590"
+            },
+            {
+              "label": "user",
+              "value": "root"
+            }
+          ],
+          "sentence": "The print service. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
+          "evidence": []
+        }
+      },
+      {
+        "id": "p-3000-tcp",
+        "port": 3000,
+        "proto": "tcp",
+        "addr": "*",
+        "command": "next dev",
+        "pid": 48213,
+        "project": "acme/wt-auth",
+        "session": "claude acme/wt-auth",
+        "owner": null,
+        "ram": 432013312,
+        "age_s": 7200,
+        "evidence": "stamp",
+        "state": "leftover",
+        "detail": {
+          "title": ":3000 · next dev",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "48213"
+            },
+            {
+              "label": "addr",
+              "value": "*:3000"
+            },
+            {
+              "label": "started",
+              "value": "14:02"
+            }
+          ],
+          "sentence": ":3000 is held by next dev in ~/sources/acme/wt-auth. Its Claude Code session ended 2 h ago.",
+          "evidence": [
+            "CLAUDE_CODE_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "p-4321-tcp",
+        "port": 4321,
+        "proto": "tcp",
+        "addr": "127.0.0.1",
+        "command": "bun run dev",
+        "pid": 52022,
+        "project": "notes",
+        "session": "opencode notes",
+        "owner": null,
+        "ram": 146800640,
+        "age_s": 720,
+        "evidence": "stamp",
+        "state": "live",
+        "detail": {
+          "title": ":4321 · bun run dev",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "52022"
+            },
+            {
+              "label": "addr",
+              "value": "127.0.0.1:4321"
+            }
+          ],
+          "sentence": ":4321 is held by bun run dev for the live OpenCode session in ~/sources/notes.",
+          "evidence": [
+            "SCRY_SESSION in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "p-5000-tcp",
+        "port": 5000,
+        "proto": "tcp",
+        "addr": "*",
+        "command": "ControlCenter",
+        "pid": 973,
+        "project": null,
+        "session": null,
+        "owner": null,
+        "ram": null,
+        "age_s": 345600,
+        "evidence": null,
+        "state": "system",
+        "detail": {
+          "title": ":5000 · ControlCenter",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "973"
+            }
+          ],
+          "sentence": "AirPlay Receiver listens here. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
+          "evidence": [
+            "Executable inside /System/Library"
+          ]
+        }
+      },
+      {
+        "id": "p-5173-tcp",
+        "port": 5173,
+        "proto": "tcp",
+        "addr": "::1",
+        "command": "vite",
+        "pid": 50110,
+        "project": "billing-api",
+        "session": "codex billing-api",
+        "owner": null,
+        "ram": 432013312,
+        "age_s": 10800,
+        "evidence": "stamp",
+        "state": "live",
+        "detail": {
+          "title": ":5173 · vite",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "50110"
+            },
+            {
+              "label": "addr",
+              "value": "[::1]:5173"
+            }
+          ],
+          "sentence": ":5173 is held by vite for the live Codex session in ~/sources/billing-api.",
+          "evidence": [
+            "CODEX_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "p-5353-udp",
+        "port": 5353,
+        "proto": "udp",
+        "addr": "*",
+        "command": "mDNSResponder",
+        "pid": 410,
+        "project": null,
+        "session": null,
+        "owner": "_mdnsresponder",
+        "ram": null,
+        "age_s": 345600,
+        "evidence": null,
+        "state": "system",
+        "detail": {
+          "title": ":5353 · mDNSResponder",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "410"
+            },
+            {
+              "label": "user",
+              "value": "_mdnsresponder"
+            }
+          ],
+          "sentence": "Bonjour. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
+          "evidence": []
+        }
+      },
+      {
+        "id": "p-5432-tcp",
+        "port": 5432,
+        "proto": "tcp",
+        "addr": "127.0.0.1",
+        "command": "postgres",
+        "pid": 812,
+        "project": "~/Library/…/postgresql@17",
+        "session": null,
+        "owner": null,
+        "ram": 67108864,
+        "age_s": 345600,
+        "evidence": null,
+        "state": "unowned",
+        "detail": {
+          "title": ":5432 · postgres",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "812"
+            },
+            {
+              "label": "ppid",
+              "value": "1"
+            },
+            {
+              "label": "addr",
+              "value": "127.0.0.1:5432"
+            }
+          ],
+          "sentence": "postgres was started by launchd 4 days ago, so no agent session owns it.",
+          "evidence": [
+            "No session stamp, and its parent is launchd"
+          ]
+        }
+      },
+      {
+        "id": "p-7000-tcp",
+        "port": 7000,
+        "proto": "tcp",
+        "addr": "*",
+        "command": "ControlCenter",
+        "pid": 973,
+        "project": null,
+        "session": null,
+        "owner": null,
+        "ram": null,
+        "age_s": 345600,
+        "evidence": null,
+        "state": "system",
+        "detail": {
+          "title": ":7000 · ControlCenter",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "973"
+            }
+          ],
+          "sentence": "AirPlay Receiver listens here. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
+          "evidence": [
+            "Executable inside /System/Library"
+          ]
+        }
+      },
+      {
+        "id": "p-8000-tcp",
+        "port": 8000,
+        "proto": "tcp",
+        "addr": "*",
+        "command": "python3 -m http.server",
+        "pid": 7731,
+        "project": "~/Downloads",
+        "session": "claude ~/Downloads",
+        "owner": null,
+        "ram": 22020096,
+        "age_s": 93600,
+        "evidence": "guess",
+        "state": "unowned",
+        "detail": {
+          "title": ":8000 · python3",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "7731"
+            },
+            {
+              "label": "addr",
+              "value": "*:8000"
+            },
+            {
+              "label": "ppid",
+              "value": "1"
+            }
+          ],
+          "sentence": ":8000 is held by python3 in ~/Downloads. It started while a Claude Code session was open there, which is a guess, so Scry never reaps it.",
+          "evidence": [
+            "Started inside the session's time window in its directory (guess)"
+          ]
+        }
+      },
+      {
+        "id": "p-49152-tcp",
+        "port": 49152,
+        "proto": "tcp",
+        "addr": "*",
+        "command": "rapportd",
+        "pid": 886,
+        "project": null,
+        "session": null,
+        "owner": null,
+        "ram": null,
+        "age_s": 345600,
+        "evidence": null,
+        "state": "system",
+        "detail": {
+          "title": ":49152 · rapportd",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "886"
+            }
+          ],
+          "sentence": "Continuity and Handoff. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
+          "evidence": []
+        }
+      }
+    ]
+  },
+  "agents": {
+    "state": "ready",
+    "value": [
+      {
+        "id": "s-4f2c",
+        "depth": 0,
+        "label": "claude",
+        "context": "acme/wt-auth",
+        "pid": null,
+        "ram": 999292928,
+        "ports": [
+          3000
+        ],
+        "age_s": 7200,
+        "evidence": null,
+        "state": "ended",
+        "detail": {
+          "title": "claude · acme/wt-auth",
+          "facts": [
+            {
+              "label": "session",
+              "value": "4f2c9a1e"
+            },
+            {
+              "label": "ended",
+              "value": "14:06"
+            },
+            {
+              "label": "cwd",
+              "value": "~/sources/acme/wt-auth"
+            }
+          ],
+          "sentence": "This Claude Code session ended 2 h ago and left 4 processes running. Together they hold 953M and :3000.",
+          "evidence": [
+            "SessionEnd hook at 14:06 (exact)",
+            "Agent process 31877 is gone"
+          ]
+        }
+      },
+      {
+        "id": "npm-48201",
+        "depth": 1,
+        "label": "npm run dev",
+        "context": null,
+        "pid": 48201,
+        "ram": 23068672,
+        "ports": [],
+        "age_s": 7200,
+        "evidence": "stamp",
+        "state": "leftover",
+        "detail": {
+          "title": "npm run dev",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "48201"
+            },
+            {
+              "label": "started",
+              "value": "14:02"
+            },
+            {
+              "label": "cwd",
+              "value": "~/sources/acme/wt-auth"
+            }
+          ],
+          "sentence": "npm run dev is still running in ~/sources/acme/wt-auth. The Claude Code session that started it ended 2 h ago.",
+          "evidence": [
+            "CLAUDE_CODE_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "next-48213",
+        "depth": 2,
+        "label": "next dev",
+        "context": null,
+        "pid": 48213,
+        "ram": 432013312,
+        "ports": [
+          3000
+        ],
+        "age_s": 7200,
+        "evidence": "stamp",
+        "state": "leftover",
+        "detail": {
+          "title": "next dev",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "48213"
+            },
+            {
+              "label": "started",
+              "value": "14:02"
+            },
+            {
+              "label": "cwd",
+              "value": "~/sources/acme/wt-auth"
+            }
+          ],
+          "sentence": ":3000 is held by next dev in ~/sources/acme/wt-auth. Its Claude Code session ended 2 h ago.",
+          "evidence": [
+            "CLAUDE_CODE_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "mcp-48190",
+        "depth": 1,
+        "label": "node mcp-server-github",
+        "context": null,
+        "pid": 48190,
+        "ram": 228589568,
+        "ports": [],
+        "age_s": 7200,
+        "evidence": "stamp",
+        "state": "leftover",
+        "detail": {
+          "title": "node mcp-server-github",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "48190"
+            },
+            {
+              "label": "started",
+              "value": "14:01"
+            }
+          ],
+          "sentence": "An MCP server whose Claude Code session ended 2 h ago. No agent is connected to it.",
+          "evidence": [
+            "CLAUDE_CODE_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "chrome-48311",
+        "depth": 1,
+        "label": "chrome --headless",
+        "context": null,
+        "pid": 48311,
+        "ram": 315621376,
+        "ports": [],
+        "age_s": 7200,
+        "evidence": "tree",
+        "state": "leftover",
+        "detail": {
+          "title": "chrome --headless",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "48311"
+            },
+            {
+              "label": "started",
+              "value": "14:04"
+            }
+          ],
+          "sentence": "A headless Chrome started under that session's shell. It has no terminal, and its session ended 2 h ago.",
+          "evidence": [
+            "The parent chain reached claude 31877 before it exited, recorded by the daemon (exact while observed)"
+          ]
+        }
+      },
+      {
+        "id": "s-9b71",
+        "depth": 0,
+        "label": "claude",
+        "context": "scry",
+        "pid": 51200,
+        "ram": 281018368,
+        "ports": [],
+        "age_s": 2460,
+        "evidence": null,
+        "state": "live",
+        "detail": {
+          "title": "claude · scry",
+          "facts": [
+            {
+              "label": "session",
+              "value": "9b71c04d"
+            },
+            {
+              "label": "pid",
+              "value": "51200"
+            },
+            {
+              "label": "started",
+              "value": "15:25"
+            }
+          ],
+          "sentence": "This Claude Code session is live in ~/sources/scry with 2 helper processes.",
+          "evidence": [
+            "Agent process 51200 is running"
+          ]
+        }
+      },
+      {
+        "id": "mem-51244",
+        "depth": 1,
+        "label": "node mcp-server-memory",
+        "context": null,
+        "pid": 51244,
+        "ram": 100663296,
+        "ports": [],
+        "age_s": 2460,
+        "evidence": "stamp",
+        "state": null,
+        "detail": {
+          "title": "node mcp-server-memory",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "51244"
+            },
+            {
+              "label": "started",
+              "value": "15:25"
+            }
+          ],
+          "sentence": "An MCP server for the live Claude Code session in ~/sources/scry.",
+          "evidence": [
+            "CLAUDE_CODE_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "fetch-51251",
+        "depth": 1,
+        "label": "uvx mcp-server-fetch",
+        "context": null,
+        "pid": 51251,
+        "ram": 39845888,
+        "ports": [],
+        "age_s": 2460,
+        "evidence": "stamp",
+        "state": null,
+        "detail": {
+          "title": "uvx mcp-server-fetch",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "51251"
+            },
+            {
+              "label": "started",
+              "value": "15:25"
+            }
+          ],
+          "sentence": "An MCP server for the live Claude Code session in ~/sources/scry.",
+          "evidence": [
+            "CLAUDE_CODE_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "s-c0de",
+        "depth": 0,
+        "label": "codex",
+        "context": "billing-api",
+        "pid": 50101,
+        "ram": 1181116006,
+        "ports": [
+          5173
+        ],
+        "age_s": 10800,
+        "evidence": null,
+        "state": "live",
+        "detail": {
+          "title": "codex · billing-api",
+          "facts": [
+            {
+              "label": "session",
+              "value": "c0de7a22"
+            },
+            {
+              "label": "pid",
+              "value": "50101"
+            },
+            {
+              "label": "started",
+              "value": "13:06"
+            }
+          ],
+          "sentence": "This Codex session is live in ~/sources/billing-api with 4 processes and :5173.",
+          "evidence": [
+            "Agent process 50101 is running"
+          ]
+        }
+      },
+      {
+        "id": "pnpm-50108",
+        "depth": 1,
+        "label": "pnpm dev",
+        "context": null,
+        "pid": 50108,
+        "ram": 56623104,
+        "ports": [],
+        "age_s": 10800,
+        "evidence": "stamp",
+        "state": null,
+        "detail": {
+          "title": "pnpm dev",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "50108"
+            }
+          ],
+          "sentence": "Started by the live Codex session in ~/sources/billing-api.",
+          "evidence": [
+            "CODEX_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "vite-50110",
+        "depth": 2,
+        "label": "vite",
+        "context": null,
+        "pid": 50110,
+        "ram": 432013312,
+        "ports": [
+          5173
+        ],
+        "age_s": 10800,
+        "evidence": "stamp",
+        "state": null,
+        "detail": {
+          "title": "vite",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "50110"
+            }
+          ],
+          "sentence": ":5173 is held by vite for the live Codex session in ~/sources/billing-api.",
+          "evidence": [
+            "CODEX_SESSION_ID in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "esb-50131",
+        "depth": 3,
+        "label": "esbuild --service",
+        "context": null,
+        "pid": 50131,
+        "ram": 92274688,
+        "ports": [],
+        "age_s": 10800,
+        "evidence": "tree",
+        "state": null,
+        "detail": {
+          "title": "esbuild --service",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "50131"
+            }
+          ],
+          "sentence": "A child of vite, owned by the live Codex session.",
+          "evidence": [
+            "Parent chain reaches codex 50101 (exact while observed)"
+          ]
+        }
+      },
+      {
+        "id": "cmcp-50140",
+        "depth": 1,
+        "label": "codex mcp-server",
+        "context": null,
+        "pid": 50140,
+        "ram": 63963136,
+        "ports": [],
+        "age_s": 10800,
+        "evidence": "tree",
+        "state": null,
+        "detail": {
+          "title": "codex mcp-server",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "50140"
+            }
+          ],
+          "sentence": "An MCP server for the live Codex session.",
+          "evidence": [
+            "Parent chain reaches codex 50101 (exact while observed)"
+          ]
+        }
+      },
+      {
+        "id": "s-0c3n",
+        "depth": 0,
+        "label": "opencode",
+        "context": "notes",
+        "pid": 52010,
+        "ram": 220200960,
+        "ports": [
+          4321
+        ],
+        "age_s": 720,
+        "evidence": null,
+        "state": "live",
+        "detail": {
+          "title": "opencode · notes",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "52010"
+            },
+            {
+              "label": "started",
+              "value": "15:54"
+            }
+          ],
+          "sentence": "This OpenCode session is live in ~/sources/notes with 1 process and :4321.",
+          "evidence": [
+            "Agent process 52010 is running"
+          ]
+        }
+      },
+      {
+        "id": "bun-52022",
+        "depth": 1,
+        "label": "bun run dev",
+        "context": null,
+        "pid": 52022,
+        "ram": 146800640,
+        "ports": [
+          4321
+        ],
+        "age_s": 720,
+        "evidence": "stamp",
+        "state": null,
+        "detail": {
+          "title": "bun run dev",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "52022"
+            }
+          ],
+          "sentence": ":4321 is held by bun run dev for the live OpenCode session in ~/sources/notes.",
+          "evidence": [
+            "SCRY_SESSION in the process environment (exact)"
+          ]
+        }
+      },
+      {
+        "id": "s-7e11",
+        "depth": 0,
+        "label": "claude",
+        "context": "~/Downloads",
+        "pid": null,
+        "ram": 22020096,
+        "ports": [
+          8000
+        ],
+        "age_s": 93600,
+        "evidence": null,
+        "state": "ended",
+        "detail": {
+          "title": "claude · ~/Downloads",
+          "facts": [
+            {
+              "label": "session",
+              "value": "7e11d3f0"
+            },
+            {
+              "label": "ended",
+              "value": "yesterday 16:40"
+            }
+          ],
+          "sentence": "This Claude Code session ended yesterday. One process started near it is still running, but the link is a guess.",
+          "evidence": [
+            "SessionEnd hook (exact)"
+          ]
+        }
+      },
+      {
+        "id": "py-7731",
+        "depth": 1,
+        "label": "python3 -m http.server",
+        "context": null,
+        "pid": 7731,
+        "ram": 22020096,
+        "ports": [
+          8000
+        ],
+        "age_s": 93600,
+        "evidence": "guess",
+        "state": "unowned",
+        "detail": {
+          "title": "python3 -m http.server",
+          "facts": [
+            {
+              "label": "pid",
+              "value": "7731"
+            },
+            {
+              "label": "started",
+              "value": "yesterday 16:12"
+            },
+            {
+              "label": "ppid",
+              "value": "1"
+            }
+          ],
+          "sentence": ":8000 is held by python3 in ~/Downloads. It started while a Claude Code session was open there, which is a guess, so Scry never reaps it.",
+          "evidence": [
+            "Started inside the session's time window in its directory (guess)"
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -16,10 +16,14 @@ readme = "../../README.md"
 anyhow.workspace = true
 clap.workspace = true
 libc.workspace = true
+nucleo-matcher.workspace = true
 ratatui.workspace = true
 scry-core.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
+tachyonfx.workspace = true
+terminal-colorsaurus.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
