@@ -76,8 +76,15 @@ enum BenchWhat {
     },
 }
 
+/// The exit code for arguments Scry cannot parse, from sysexits(3). Clap's own code, 2, is
+/// what `scry stop` returns for a process that is still running.
+const USAGE: i32 = 64;
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|e| {
+        let _ = e.print();
+        std::process::exit(if e.use_stderr() { USAGE } else { 0 });
+    });
     match cli.command {
         None if std::io::stdout().is_terminal() => tui::run(None),
         None => print_overview(&load(None)?, false),
@@ -179,7 +186,7 @@ fn bench_scan(runs: usize, json: bool) -> Result<()> {
             "Socket table of {sockets} sockets: {s_median:.1} ms median (min {s_min:.1}, max {s_max:.1})."
         );
         println!(
-            "Snapshot with sockets, arguments and projects: {f_median:.1} ms median (min {f_min:.1}, max {f_max:.1}), arguments cached after the first run."
+            "Snapshot with sockets, labels and projects: {f_median:.1} ms median (min {f_min:.1}, max {f_max:.1}), arguments cached after the first run."
         );
         println!(
             "Full scan of {count} processes: median {median:.1} ms (min {min:.1}, max {max:.1}) over {runs} runs."

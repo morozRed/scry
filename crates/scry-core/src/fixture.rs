@@ -34,8 +34,8 @@ pub fn home_dir() -> Result<String> {
     Ok(home)
 }
 
-/// Rewrites anything that names the person: the home directory becomes `~` in paths and
-/// arguments, and connected sockets, which name their peers, are dropped.
+/// Rewrites anything that names the person: the home directory becomes `~` in paths, and
+/// connected sockets, which name their peers, are dropped. Command labels hold no paths.
 pub fn redact(mut snap: Snapshot, home: &str) -> Snapshot {
     let home = home.trim_end_matches('/');
     snap.sockets.retain(|s| s.is_listening());
@@ -45,10 +45,6 @@ pub fn redact(mut snap: Snapshot, home: &str) -> Snapshot {
         }
         if let Some(project) = &mut p.project {
             tilde(&mut project.root, home);
-        }
-        for arg in p.argv.iter_mut().flatten() {
-            *arg = arg.replace(&format!("{home}/"), "~/");
-            tilde(arg, home);
         }
     }
     snap
@@ -83,7 +79,7 @@ mod tests {
                 name: "x".into(),
                 exe: Some(exe.into()),
                 footprint: None,
-                argv: Some(vec![exe.into(), format!("--config={exe}")]),
+                command: None,
                 cwd: Some(exe.into()),
                 project: None,
                 stamps: Default::default(),
@@ -103,14 +99,9 @@ mod tests {
     }
 
     #[test]
-    fn redact_rewrites_home_in_arguments_and_the_working_directory() {
+    fn redact_rewrites_home_in_the_working_directory() {
         let s = redact(snap_with_exe("/Users/dev/bin/x"), "/Users/dev");
-        let p = &s.processes[0];
-        assert_eq!(p.cwd.as_deref(), Some("~/bin/x"));
-        assert_eq!(
-            p.argv.as_deref(),
-            Some(&["~/bin/x".to_string(), "--config=~/bin/x".to_string()][..])
-        );
+        assert_eq!(s.processes[0].cwd.as_deref(), Some("~/bin/x"));
     }
 
     #[test]

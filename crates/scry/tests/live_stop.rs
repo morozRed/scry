@@ -82,9 +82,26 @@ fn why_names_the_server_and_its_project_and_stop_ends_it() {
     let sentence = why["sentence"].as_str().unwrap();
     assert!(
         sentence.starts_with(&format!("{label} is held by `"))
-            && sentence.contains("-m http.server`")
+            && sentence.contains(&format!("`python3 -m http.server --bind … {port}`"))
             && sentence.contains(root.to_str().unwrap()),
         "{sentence}"
+    );
+    assert!(
+        !why.to_string().contains("127.0.0.1 "),
+        "the bound address is an argument"
+    );
+
+    let out = scry(&["why", &label, "--show-command"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!(" -m http.server --bind 127.0.0.1 {port}\n")),
+        "{text}"
+    );
+    let out = scry(&["why", &label, "--json", "--show-command"]);
+    assert_eq!(
+        out.status.code(),
+        Some(64),
+        "raw arguments never go into JSON"
     );
     assert!(
         holder["evidence"]
@@ -121,6 +138,22 @@ fn why_names_the_server_and_its_project_and_stop_ends_it() {
     use std::os::unix::process::ExitStatusExt;
     let status = s.child.wait().unwrap();
     assert_eq!(status.signal(), Some(libc::SIGTERM));
+}
+
+#[test]
+fn wrong_arguments_exit_64_not_the_still_running_2() {
+    for args in [
+        &["stop", "abc"][..],
+        &["stop"],
+        &["why", "port"],
+        &["ports", "--nope"],
+    ] {
+        let out = scry(args);
+        assert_eq!(out.status.code(), Some(64), "{args:?}");
+        assert!(!out.stderr.is_empty());
+    }
+    assert_eq!(scry(&["stop", "--help"]).status.code(), Some(0));
+    assert_eq!(scry(&["--version"]).status.code(), Some(0));
 }
 
 #[test]

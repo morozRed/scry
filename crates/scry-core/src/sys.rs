@@ -213,7 +213,7 @@ fn read_process(id: ProcId) -> Option<Process> {
         name: String::from_utf8_lossy(&comm).into_owned(),
         exe,
         footprint,
-        argv: None,
+        command: None,
         cwd: None,
         project: None,
         stamps: Default::default(),

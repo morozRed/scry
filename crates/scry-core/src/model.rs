@@ -5,6 +5,8 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::label::CommandLabel;
+
 pub const SNAPSHOT_SCHEMA: u32 = 2;
 
 /// A process is identified by pid plus start time, so a reused pid never matches an old record.
@@ -26,10 +28,10 @@ pub struct Process {
     /// Physical footprint in bytes, as Activity Monitor's Memory column. Readable only for
     /// the viewer's own processes without root.
     pub footprint: Option<u64>,
-    /// The command line after `redact::argv`. Raw arguments are never stored. Readable only
-    /// for the viewer's own processes.
+    /// The command line as a label of safe parts. Raw arguments are never stored here. Only
+    /// the viewer's own processes have one: other users' arguments are unreadable without root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub argv: Option<Vec<String>>,
+    pub command: Option<CommandLabel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +102,14 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "Claude Code",
             Agent::Codex => "Codex",
+        }
+    }
+
+    /// The command that starts it, as lists name it.
+    pub fn short(self) -> &'static str {
+        match self {
+            Agent::ClaudeCode => "claude",
+            Agent::Codex => "codex",
         }
     }
 }
@@ -289,6 +299,17 @@ pub struct DiskSample {
     pub free_bytes: u64,
     /// What an unprivileged process can still write.
     pub avail_bytes: u64,
+}
+
+impl Process {
+    /// What to call the process: its command label when Scry could read its arguments, its
+    /// name otherwise.
+    pub fn label(&self) -> String {
+        match &self.command {
+            Some(c) => c.to_string(),
+            None => self.name.clone(),
+        }
+    }
 }
 
 impl Snapshot {

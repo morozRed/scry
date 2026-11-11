@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::model::{ProcId, Process, Proto, Snapshot};
-use crate::ports::{port_label, short_command};
 use crate::sys::{self, Liveness};
+use crate::view::ports::port_label;
 
 /// How long SIGTERM gets before Scry reports the process as still running.
 pub const TERM_GRACE: Duration = Duration::from_secs(3);
@@ -49,8 +49,8 @@ impl FromStr for Target {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StopTarget {
     pub id: ProcId,
-    pub name: String,
-    pub command: Option<String>,
+    /// The command label, or the process name when there is none.
+    pub process: String,
     /// Set when the target was named by port. The pid must still hold it when signalled.
     pub port: Option<(Proto, u16)>,
 }
@@ -153,10 +153,14 @@ pub fn resolve(snap: &Snapshot, target: Target) -> Result<StopTarget, Refusal> {
     guard(p, snap)?;
     Ok(StopTarget {
         id: p.id,
-        name: short_command(p),
-        command: p.argv.as_deref().map(crate::redact::join),
+        process: p.label(),
         port,
     })
+}
+
+/// The macOS directory an executable runs from, if it is one of macOS's own.
+pub fn system_prefix(exe: &str) -> Option<&'static str> {
+    SYSTEM_PREFIXES.iter().copied().find(|s| exe.starts_with(s))
 }
 
 fn guard(p: &Process, snap: &Snapshot) -> Result<(), Refusal> {
@@ -173,9 +177,7 @@ fn guard(p: &Process, snap: &Snapshot) -> Result<(), Refusal> {
     if p.name == "launchd" {
         return protected("it is launchd");
     }
-    if let Some(exe) = &p.exe
-        && let Some(prefix) = SYSTEM_PREFIXES.iter().find(|s| exe.starts_with(*s))
-    {
+    if let Some(prefix) = p.exe.as_deref().and_then(system_prefix) {
         return protected(&format!("it runs from {prefix}"));
     }
     if p.uid != snap.viewer_uid {
@@ -323,7 +325,8 @@ mod tests {
     use super::*;
     use crate::fixture;
     use std::cell::{Cell, RefCell};
-    use std::process::{Child, Command};
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
 
     fn typical() -> Snapshot {
         fixture::parse(include_str!("../../../fixtures/typical.json")).unwrap()
@@ -341,7 +344,7 @@ mod tests {
     fn a_port_resolves_to_its_one_holder() {
         let t = resolve(&typical(), Target::Port(3000)).unwrap();
         assert_eq!(t.id.pid, 1320);
-        assert_eq!(t.name, "next dev");
+        assert_eq!(t.process, "next dev");
         assert_eq!(t.port, Some((Proto::Tcp, 3000)));
     }
 
@@ -468,8 +471,7 @@ mod tests {
                 pid: 500,
                 start_us: 0,
             },
-            name: "server".into(),
-            command: None,
+            process: "server".into(),
             port: port.then_some((Proto::Tcp, 3000)),
         }
     }
@@ -541,21 +543,28 @@ mod tests {
         assert_eq!(host.log.borrow().last(), Some(&"SIGKILL"));
     }
 
-    fn spawn(script: &str) -> (Child, StopTarget) {
-        let child = Command::new("/bin/sh")
-            .args(["-c", script])
+    /// `sleep 30` under `sh`, ignoring SIGTERM when asked. It returns once the shell has set
+    /// its trap, which a fixed wait cannot promise on a busy machine.
+    fn spawn(ignore_term: bool) -> (Child, StopTarget) {
+        let trap = if ignore_term { "trap '' TERM; " } else { "" };
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &format!("{trap}echo ready; exec sleep 30")])
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready, "ready\n");
         let pid = child.id() as i32;
-        std::thread::sleep(Duration::from_millis(100));
         let live = sys::liveness(pid).unwrap();
         let t = StopTarget {
             id: ProcId {
                 pid,
                 start_us: live.start_us,
             },
-            name: "sleep".into(),
-            command: None,
+            process: "sleep".into(),
             port: None,
         };
         (child, t)
@@ -563,7 +572,7 @@ mod tests {
 
     #[test]
     fn a_reused_pid_is_refused_and_not_signalled() {
-        let (mut child, mut t) = spawn("exec sleep 30");
+        let (mut child, mut t) = spawn(false);
         t.id.start_us += 1;
         assert_eq!(
             stop(&t, true, Duration::from_millis(200)),
@@ -576,7 +585,7 @@ mod tests {
 
     #[test]
     fn sigterm_stops_a_process_and_reports_it() {
-        let (mut child, t) = spawn("exec sleep 30");
+        let (mut child, t) = spawn(false);
         let out = stop(&t, false, TERM_GRACE).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGTERM"),
@@ -588,7 +597,7 @@ mod tests {
 
     #[test]
     fn sigkill_comes_only_with_kill() {
-        let (mut child, t) = spawn("trap '' TERM; exec sleep 30");
+        let (mut child, t) = spawn(true);
         let out = stop(&t, false, Duration::from_millis(300)).unwrap();
         assert!(matches!(out, Outcome::StillRunning { .. }), "{out:?}");
         assert!(child.try_wait().unwrap().is_none());
@@ -602,7 +611,7 @@ mod tests {
 
     #[test]
     fn a_port_target_must_still_hold_its_port() {
-        let (mut child, mut t) = spawn("exec sleep 30");
+        let (mut child, mut t) = spawn(false);
         t.port = Some((Proto::Tcp, 1));
         assert_eq!(
             stop(&t, false, TERM_GRACE),
