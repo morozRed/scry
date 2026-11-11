@@ -19,6 +19,7 @@ echo "local-ci at $SHA, log $LOG"
 state=success
 failed=""
 for step in \
+  "scripts/check-public.sh" \
   "cargo fmt --check" \
   "cargo clippy --all-targets -- -D warnings" \
   "cargo test" \

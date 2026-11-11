@@ -7,6 +7,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.90"
+authors = ["Grigory Moroz"]
+repository = "https://github.com/morozRed/scry"
+homepage = "https://github.com/morozRed/scry"
+keywords = ["macos", "tui", "monitor", "agents", "mcp"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 scry-core = { path = "crates/scry-core" }
