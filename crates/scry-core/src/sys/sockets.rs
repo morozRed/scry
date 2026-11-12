@@ -387,6 +387,8 @@ const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
 const SOCKET_FDINFO_LEN: usize = 792;
 const SOI_PROTOCOL: usize = 180;
 const SOI_FAMILY: usize = 184;
+/// `soi_options`, a `short` holding the `SO_*` flags, `SO_ACCEPTCONN` among them.
+const SOI_OPTIONS: usize = 188;
 const SOI_KIND: usize = 256;
 const INSI_FPORT: usize = 264;
 const INSI_LPORT: usize = 268;
@@ -407,6 +409,47 @@ pub fn pid_holds_port(pid: i32, proto: Proto, port: u16) -> Option<bool> {
 /// sockets bound to a port with no peer, as [`Socket::is_listening`] reads the table. `None`
 /// when the process cannot be inspected.
 pub fn listening_ports(pid: i32) -> Option<Vec<(Proto, u16)>> {
+    let mut held = Vec::new();
+    each_socket(pid, |info| {
+        let kind = i32_ne(info, SOI_KIND);
+        let family = i32_ne(info, SOI_FAMILY);
+        if family != libc::AF_INET && family != libc::AF_INET6 {
+            return;
+        }
+        let listening = match (i32_ne(info, SOI_PROTOCOL), kind) {
+            (libc::IPPROTO_TCP, SOCKINFO_TCP) => {
+                (i32_ne(info, TCPSI_STATE) == TSI_S_LISTEN).then_some(Proto::Tcp)
+            }
+            (libc::IPPROTO_UDP, SOCKINFO_IN) => {
+                (i32_ne(info, INSI_FPORT) == 0).then_some(Proto::Udp)
+            }
+            _ => None,
+        };
+        // `insi_lport` holds the port in network byte order in its low 16 bits.
+        let port = u16::from_be(u32_ne(info, INSI_LPORT) as u16);
+        if let Some(proto) = listening
+            && port != 0
+        {
+            held.push((proto, port));
+        }
+    })?;
+    Some(held)
+}
+
+/// Whether `pid` holds a listening Unix-domain socket, as an ssh control master holds its
+/// control socket. `None` when the process cannot be inspected.
+pub fn holds_unix_listener(pid: i32) -> Option<bool> {
+    let mut found = false;
+    each_socket(pid, |info| {
+        let options = i16::from_ne_bytes([info[SOI_OPTIONS], info[SOI_OPTIONS + 1]]);
+        found |= i32_ne(info, SOI_FAMILY) == libc::AF_UNIX
+            && options as libc::c_int & libc::SO_ACCEPTCONN != 0;
+    })?;
+    Some(found)
+}
+
+/// Calls `f` with the `socket_fdinfo` of each socket `pid` has open.
+fn each_socket(pid: i32, mut f: impl FnMut(&[u8; SOCKET_FDINFO_LEN])) -> Option<()> {
     let entry = std::mem::size_of::<libc::proc_fdinfo>();
     let need =
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
@@ -433,7 +476,6 @@ pub fn listening_ports(pid: i32) -> Option<Vec<(Proto, u16)>> {
         return None;
     }
     fds.truncate(got as usize / entry);
-    let mut held = Vec::new();
     let mut info = [0u8; SOCKET_FDINFO_LEN];
     for fd in fds
         .iter()
@@ -448,32 +490,11 @@ pub fn listening_ports(pid: i32) -> Option<Vec<(Proto, u16)>> {
                 SOCKET_FDINFO_LEN as libc::c_int,
             )
         };
-        if n as usize != SOCKET_FDINFO_LEN {
-            continue;
-        }
-        let kind = i32_ne(&info, SOI_KIND);
-        let family = i32_ne(&info, SOI_FAMILY);
-        if family != libc::AF_INET && family != libc::AF_INET6 {
-            continue;
-        }
-        let listening = match (i32_ne(&info, SOI_PROTOCOL), kind) {
-            (libc::IPPROTO_TCP, SOCKINFO_TCP) => {
-                (i32_ne(&info, TCPSI_STATE) == TSI_S_LISTEN).then_some(Proto::Tcp)
-            }
-            (libc::IPPROTO_UDP, SOCKINFO_IN) => {
-                (i32_ne(&info, INSI_FPORT) == 0).then_some(Proto::Udp)
-            }
-            _ => None,
-        };
-        // `insi_lport` holds the port in network byte order in its low 16 bits.
-        let port = u16::from_be(u32_ne(&info, INSI_LPORT) as u16);
-        if let Some(proto) = listening
-            && port != 0
-        {
-            held.push((proto, port));
+        if n as usize == SOCKET_FDINFO_LEN {
+            f(&info);
         }
     }
-    Some(held)
+    Some(())
 }
 
 #[cfg(test)]
@@ -806,5 +827,15 @@ mod tests {
         assert!(held.contains(&(Proto::Udp, bound.local_addr().unwrap().port())));
         assert!(!held.contains(&(Proto::Udp, connected.local_addr().unwrap().port())));
         drop((client, accepted));
+    }
+
+    #[test]
+    fn a_listening_unix_socket_is_found_among_a_process_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id() as i32;
+        let listener = std::os::unix::net::UnixListener::bind(dir.path().join("cm")).unwrap();
+        assert_eq!(holds_unix_listener(me), Some(true));
+        drop(listener);
+        assert_eq!(holds_unix_listener(i32::MAX), None, "no such process");
     }
 }

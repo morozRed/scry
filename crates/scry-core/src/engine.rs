@@ -127,7 +127,19 @@ impl Engine {
                     );
                 }
             }
-            if let Some(a) = self.args.get(&p.id) {
+            if let Some(a) = self.args.get_mut(&p.id) {
+                // An ssh master configured in ssh_config can look like any other ssh on its
+                // command line, but it holds its control socket. Its socket can open after
+                // the first scan saw it, so an unclassified ssh is looked at again each scan.
+                if a.role.is_none()
+                    && let Some(exe) = p.exe.as_deref().filter(|e| e.ends_with("/ssh"))
+                    && sys::sockets::holds_unix_listener(p.id.pid) == Some(true)
+                {
+                    let facts = catalog::Facts {
+                        unix_listener: true,
+                    };
+                    a.role = catalog::classify_with(exe, &a.argv, facts).map(|r| r.role);
+                }
                 p.stamps = a.stamps.clone();
                 p.worker = a.worker;
                 p.role = a.role;

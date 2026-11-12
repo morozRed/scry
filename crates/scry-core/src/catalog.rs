@@ -40,8 +40,9 @@ pub enum Infra {
     /// `gpg-agent`, `keyboxd`, `scdaemon`, `dirmngr` or `ssh-agent`. The first `git commit
     /// -S` or `ssh` of a session starts one, and every later session uses it.
     KeyAgent,
-    /// An `ssh` control master (`-M`, `ControlMaster`, or a `[mux]` title), which other `ssh`
-    /// connections share.
+    /// An `ssh` control master or background tunnel: `-M`, `ControlMaster`, `-N`, `-f`, a
+    /// `[mux]` title, or a listening Unix socket. Other `ssh` connections share a master, and
+    /// `ssh_config` can make one of a plain `ssh -fN host`.
     SshMaster,
 }
 
@@ -55,7 +56,9 @@ impl Infra {
             Infra::AppHelper => "it runs inside an application bundle, which manages it",
             Infra::Multiplexer => "it is a terminal multiplexer server",
             Infra::KeyAgent => "it is a key agent that every later session shares",
-            Infra::SshMaster => "it is an ssh control master that other connections share",
+            Infra::SshMaster => {
+                "it is an ssh control master or background tunnel that other connections share"
+            }
         }
     }
 
@@ -100,6 +103,16 @@ struct Exe<'a> {
     argv: &'a [String],
     /// For a script runtime (`node`, `bun`), the script it runs, as it was invoked.
     script: Option<&'a str>,
+    facts: Facts,
+}
+
+/// What a rule may know of a process beyond its executable and arguments. The engine reads
+/// these only for the processes a rule asks about.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Facts {
+    /// It holds a listening Unix-domain socket, as an ssh control master holds its control
+    /// socket.
+    pub unix_listener: bool,
 }
 
 impl Exe<'_> {
@@ -129,34 +142,14 @@ impl Exe<'_> {
         self.path.contains("/Python.framework/") && self.file.starts_with("Python")
     }
 
-    /// `-M`, alone or in a cluster such as `-fNM`, or `-o ControlMaster=…` other than `no`.
-    /// A master that daemonised itself retitles to `ssh: <socket> [mux]`.
+    /// An `ssh` that serves other connections or runs in the background rather than for one
+    /// command: `-M` or `-o ControlMaster=…` other than `no`; `-N` (no command, so it is there
+    /// for its forwards or its control socket) or `-f` (it backgrounds itself), which is how
+    /// a master configured through `ssh_config` is started; or a listening Unix socket. A
+    /// master that daemonised itself retitles to `ssh: <socket> [mux]`.
     fn ssh_master(&self) -> bool {
-        let mut args = self.argv.iter().skip(1).map(String::as_str);
-        let mut option = false;
-        let master = |o: &str| {
-            let o = o.to_ascii_lowercase();
-            o.strip_prefix("controlmaster")
-                .is_some_and(|v| !matches!(v.trim_start_matches([' ', '=']), "no"))
-        };
         let retitled = self.argv.first().is_some_and(|a| a.ends_with("[mux]"));
-        retitled
-            || args.any(|a| {
-                if std::mem::take(&mut option) {
-                    return master(a);
-                }
-                match a.strip_prefix('-') {
-                    Some(rest) if !rest.starts_with('-') => match rest.strip_prefix('o') {
-                        Some("") => {
-                            option = true;
-                            false
-                        }
-                        Some(o) => master(o),
-                        None => rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('M'),
-                    },
-                    _ => false,
-                }
-            })
+        retitled || self.facts.unix_listener || ssh_serves(self.argv)
     }
 
     fn codex(&self) -> bool {
@@ -292,6 +285,11 @@ const SCRIPT_RUNTIMES: [&str; 2] = ["node", "bun"];
 
 /// The first rule matching an executable path and its arguments.
 pub fn classify(exe: &str, argv: &[String]) -> Option<&'static Rule> {
+    classify_with(exe, argv, Facts::default())
+}
+
+/// [`classify`], with what Scry read of the process besides its arguments.
+pub fn classify_with(exe: &str, argv: &[String], facts: Facts) -> Option<&'static Rule> {
     let file = file_name(exe);
     let script = SCRIPT_RUNTIMES
         .contains(&file)
@@ -303,8 +301,47 @@ pub fn classify(exe: &str, argv: &[String]) -> Option<&'static Rule> {
         file,
         argv,
         script,
+        facts,
     };
     RULES.iter().find(|r| (r.test)(&x))
+}
+
+/// The `ssh` options that take a value, from ssh(1).
+const SSH_VALUED: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+
+
+/// Reads `ssh`'s options as ssh does: clusters such as `-fNL`, values glued on (`-p2222`) or
+/// in the next argument, and nothing after the destination, which starts the remote command.
+fn ssh_serves(argv: &[String]) -> bool {
+    let control_master = |o: &str| {
+        let o = o.to_ascii_lowercase();
+        o.strip_prefix("controlmaster")
+            .is_some_and(|v| !matches!(v.trim_start_matches([' ', '=']).trim(), "no"))
+    };
+    let mut master = false;
+    let mut args = argv.iter().skip(1).map(String::as_str);
+    while let Some(a) = args.next() {
+        if a == "--" {
+            break;
+        }
+        let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) else {
+            break;
+        };
+        for (i, c) in cluster.char_indices() {
+            if SSH_VALUED.contains(c) {
+                let glued = &cluster[i + c.len_utf8()..];
+                let value = if glued.is_empty() {
+                    args.next().unwrap_or("")
+                } else {
+                    glued
+                };
+                master |= c == 'o' && control_master(value);
+                break;
+            }
+            master |= matches!(c, 'M' | 'N' | 'f');
+        }
+    }
+    master
 }
 
 fn file_name(path: &str) -> &str {
@@ -322,6 +359,8 @@ mod tests {
         argv: Vec<String>,
         /// The rule name expected, or null for a process the catalog must not know.
         rule: Option<String>,
+        #[serde(default)]
+        unix_listener: bool,
     }
 
     #[test]
@@ -331,7 +370,10 @@ mod tests {
                 .unwrap();
         assert!(cases.len() >= 12);
         for c in &cases {
-            let got = classify(&c.exe, &c.argv).map(|r| r.name);
+            let facts = Facts {
+                unix_listener: c.unix_listener,
+            };
+            let got = classify_with(&c.exe, &c.argv, facts).map(|r| r.name);
             assert_eq!(
                 got,
                 c.rule.as_deref(),

@@ -246,6 +246,31 @@
     "rule": "an ssh control master"
   },
   {
+    "style": "a master from ssh_config ControlMaster auto, started with -fN",
+    "exe": "/usr/bin/ssh",
+    "argv": ["ssh", "-fN", "build.example.com"],
+    "rule": "an ssh control master"
+  },
+  {
+    "style": "a background tunnel started with -N",
+    "exe": "/usr/bin/ssh",
+    "argv": ["ssh", "-N", "-L", "5432:localhost:5432", "bastion.example.com"],
+    "rule": "an ssh control master"
+  },
+  {
+    "style": "an ssh holding a listening Unix socket, whatever its arguments",
+    "exe": "/usr/bin/ssh",
+    "argv": ["ssh", "build.example.com"],
+    "unix_listener": true,
+    "rule": "an ssh control master"
+  },
+  {
+    "style": "ssh with -N and -f only in the remote command",
+    "exe": "/usr/bin/ssh",
+    "argv": ["ssh", "-i", "-f", "build.example.com", "tail", "-f", "-N"],
+    "rule": null
+  },
+  {
     "style": "a plain ssh connection",
     "exe": "/usr/bin/ssh",
     "argv": ["ssh", "-p", "2222", "build.example.com", "make"],
