@@ -1,4 +1,4 @@
-//! Sessions and the processes that belong to them, as plain data (PLAN.md section 5).
+//! Sessions and the processes that belong to them, as plain data (docs/architecture.md, "Which session owns a process").
 //!
 //! One agent process can host many sessions over time: `/clear`, `resume` and `compact`
 //! start a new one in the same process. So a [`Session`] does not own a process; a

@@ -1,4 +1,4 @@
-//! Which session owns each process, and whether it is a leftover (PLAN.md section 5).
+//! Which session owns each process, and whether it is a leftover (docs/architecture.md).
 //!
 //! [`Lineage::build`] is the one place both questions are answered. It takes a snapshot and
 //! what Scry knows from before (sessions and recorded ancestry from the store, and hook
@@ -221,7 +221,7 @@ pub enum Verdict {
     },
 }
 
-/// Why a process is not a leftover: the first rule it fails, in the order of PLAN.md.
+/// Why a process is not a leftover: the first rule it fails, in the order of docs/architecture.md.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "spared", rename_all = "snake_case")]
 pub enum Spare {
@@ -784,7 +784,7 @@ fn guess(p: &Process, known: &Known) -> Option<SessionKey> {
         .map(|s| s.key.clone())
 }
 
-/// The leftover rule, in PLAN.md's order. The first rule a process fails is its reason.
+/// The leftover rule, in the order of docs/architecture.md. The first rule a process fails is its reason.
 fn judge(
     p: &Process,
     owner: Option<&(SessionKey, How)>,

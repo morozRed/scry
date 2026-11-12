@@ -69,6 +69,7 @@ enum Command {
     },
     /// Check that Scry can work on this Mac, with a fix for each problem.
     Doctor {
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },

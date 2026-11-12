@@ -85,7 +85,7 @@ titles repeat the tab bar. Filled pills shout, and the quiet pill (reverse video
 an error. Panels was removed from the code after the spike; its pictures come from commit
 `2d39a74`, where `scripts/shots.sh` still renders it, and show that commit's layout.
 
-This departs on purpose from one line in PLAN.md section 2 ("the palette is the terminal's
+This departs on purpose from one line in the original plan ("the palette is the terminal's
 own 16 ANSI colours"). The goal behind that line, following the user's theme in light and
 dark, holds. Without truecolor Scry falls back to exactly that principle, below.
 

@@ -1,4 +1,4 @@
-//! PLAN.md M2's exit test: a fixture agent spawns a child that ignores SIGHUP, then exits.
+//! A fixture agent spawns a child that ignores SIGHUP, then exits.
 //! The child must come out as a leftover with `stamp` evidence, from a live scan.
 //!
 //! The fixture agent is this test binary, copied to where Claude Code's native installer puts

@@ -1,5 +1,5 @@
 //! One reading of the machine: processes, sockets, command labels, stamps and projects of
-//! the viewer's own processes, and the pulse. The TUI, CLI and MCP server all take snapshots
+//! the viewer's own processes, and the pulse. The TUI and the CLI both take snapshots
 //! from here.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
