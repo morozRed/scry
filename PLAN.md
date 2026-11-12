@@ -5,7 +5,7 @@ Revision 2, 9 Nov 2026. TUI first.
 Source: the doc *Cowl, Scry & Sigil: Names, Features and Pains* (8 Nov 2026).
 Scry is a macOS system monitor whose edge is **lineage**. Every process, port,
 worktree and gigabyte is traced back to the project and agent session that made it.
-Agents get the same answers over MCP.
+Agents get the same answers from the CLI, where every command has `--json`.
 
 ## 0. Finish line for the v1 autopilot run
 
@@ -16,6 +16,9 @@ these hold on the reference Mac from a clean clone:
    Worktrees. Each view has a detail pane that explains the selected row in one
    sentence with its evidence, a filter, a sort, and the actions from section 2,
    each behind a confirmation sheet.
+   On first run each view says what it will show and how to fill it (for example,
+   which command installs the agent hooks). Live data refreshes every 2 s by
+   default, set by `[tui] refresh_secs` in the config, and `r` refreshes at once.
 2. **It looks good, by evidence.** Two or three looks are rendered and one is
    picked. Screenshots of every view in light and dark, at 80×24 and 120×40, are
    committed and shown in the README. No layout breaks from 80×24 up. Every view
@@ -26,8 +29,9 @@ these hold on the reference Mac from a clean clone:
 4. **The CLI matches the TUI.** `overview`, `ports`, `why`, `agents`,
    `leftovers`, `disk`, `worktrees`, `stop`, `reap` and `watch`, each with
    `--json`.
-5. **Agents get the same answers.** `scry mcp` serves the read tools and the
-   caller-scoped, human-confirmed write tools, with contract tests.
+5. **Agents get the same answers from the CLI.** Every command has `--json`, and
+   bare `scry` without a terminal prints a summary. There is no MCP server; the
+   operator dropped it because agents call the CLI easily.
 6. **The background parts install and report.** `scry daemon install`,
    `scry hook install claude` and `scry doctor`.
 7. **Every M0 to M6 exit criterion is a test or a recorded number.**
@@ -81,7 +85,6 @@ be verified.
 | Worktrees | Dirty, merged, branch gone, orphaned. Size including deps. Probable creator with its evidence. |
 | Pulse | A header strip: CPU, memory pressure, swap. |
 | CLI | Every view has a command with `--json`: `overview`, `ports`, `why`, `agents`, `leftovers`, `disk`, `worktrees`, `stop`, `reap`. `scry watch --json` streams them. |
-| MCP | `scry mcp` over stdio. Read tools are capped and redacted. Write tools are scoped to the caller and confirmed by the human. |
 
 ### After v1, scheduled
 | Release | Result |
@@ -182,7 +185,7 @@ critical path.
 | Filter | Substring match first. `nucleo-matcher` only if it feels weak. |
 | Sparklines, gauges | Built-in `Sparkline` and `Gauge`. |
 | Tests | `TestBackend` with `insta` snapshots, plus one PTY smoke test. |
-| Concurrency | Standard threads and channels. No async runtime in the TUI. `tokio` stays inside `scry mcp`, where `rmcp` needs it. |
+| Concurrency | Standard threads and channels. No async runtime in the TUI. |
 
 The TUI is a model, update, view loop:
 - The collector thread sends an immutable `Snapshot`.
@@ -232,13 +235,13 @@ confirm or overturn that before five views are built on it.
                       ▼
               SQLite (WAL) store ◀── audit rows, keep list
                       ▲
-     ┌────────────────┼─────────────────┐
-  scry (TUI)      scry <command>     scry mcp
+          ┌───────────┴───────────┐
+      scry (TUI)          scry <command>
   engine in-process, live scan + store reads
 ```
 
-- **One engine, three hosts.** `scry-core` exposes `Engine::snapshot()`. The TUI,
-  the CLI and the MCP server each call it in-process. They agree because they run
+- **One engine, two hosts.** `scry-core` exposes `Engine::snapshot()`. The TUI
+  and the CLI each call it in-process. They agree because they run
   the same code over the same store.
 - **The daemon records what a live scan cannot recover.** That is disk history,
   session events from hooks, and the ancestry of agent process trees observed
@@ -256,7 +259,7 @@ confirm or overturn that before five views are built on it.
 ### Why no socket yet
 The first plan had the daemon own a live index behind JSON-RPC. That design earns
 its cost when a client cannot scan for itself or needs events pushed to it. The
-TUI, CLI and MCP server can all scan. A proxy measurement on this Mac puts a full
+TUI and the CLI can both scan. A proxy measurement on this Mac puts a full
 listing of 876 processes at about 76 ms through `ps` and the socket table at about
 15 ms through `netstat`. `scry bench scan` in M0 replaces that proxy with the real
 number. If an in-process scan costs more than the TUI budget allows, the socket
@@ -273,7 +276,7 @@ behind the same interface is the only change clients see.
 scry/
   crates/
     scry-core/      # modules: sys (FFI), model, engine, attribution, store, catalog
-    scry/           # the one binary: tui, CLI commands, mcp, hook, daemon
+    scry/           # the one binary: tui, CLI commands, hook, daemon
   fixtures/         # redacted snapshots (synthetic ones in git, recorded ones ignored)
   PLAN.md
   ASSESSMENT.md
@@ -300,7 +303,6 @@ Paths:
 | Git | The `git` CLI (`worktree list --porcelain`, `status --porcelain`) |
 | File change hints | `notify` (FSEvents) |
 | Store | `rusqlite` (bundled, WAL) |
-| MCP | `rmcp`, stdio transport |
 | CLI | `clap`, `--json` on every command |
 
 ## 5. Attribution model
@@ -366,7 +368,7 @@ A process with ppid 1 and no attribution is *unattributed*. `reap` never selects
 ## 6. Milestones
 
 About 15 working days to v1, then about two weeks for the menu bar item and app. Week one ends with a TUI showing ports and agents,
-read-only MCP, and nothing yet able to kill or trash by rule.
+read-only `--json` output, and nothing yet able to kill or trash by rule.
 
 ### M0. Skeleton and first pixels (1.5 days)
 - `scry-core` and the `scry` binary. `fmt`, `clippy`, `nextest`, CI on macOS arm64.
@@ -432,22 +434,14 @@ read-only MCP, and nothing yet able to kill or trash by rule.
   - Three days of daily use before M4 starts. False leftovers are logged as
     fixtures.
 
-### M3. MCP read tools (1 day)
-- `who_owns_port`, `find_free_port`, `list_agents`, `agent_tree`,
-  `system_snapshot`.
-- `find_free_port` test-binds on `127.0.0.1`, `::1` and the wildcard address. The
-  answer is advisory, and the tool says so.
-- Each tool has a 2 s timeout and a result cap. Command lines are redacted.
-- `scry mcp` writes protocol only to stdout and exits on stdin EOF or when its
-  parent becomes pid 1.
-- **Exit:** contract tests cover the tool list, caps, redaction and exit on EOF.
+### M3. Dropped
+The MCP server is out of scope. Agents call the CLI and read its `--json`
+output.
 
-### M4. Reap and MCP write tools (2 days)
+### M4. Reap (1 day)
 - `X` and `K` in the TUI. `scry reap --dry-run` and `scry reap`.
-- MCP `stop_process` with the contract in section 7.
 - **Exit:**
   - Reaping the M2 fixture kills the child and nothing else, children first.
-  - An MCP `stop_process` for a pid outside the caller's tree is refused.
   - With `destructive = false`, every write path refuses.
 
 ### M5. Worktrees and disk (4 days)
@@ -469,7 +463,6 @@ read-only MCP, and nothing yet able to kill or trash by rule.
 - Scans stay inside the catalog and the code roots. They never walk Desktop,
   Documents or Downloads, which would raise a permission prompt in the name of the
   terminal app.
-- MCP `list_worktrees`, `disk_usage` (configured roots only) and `trash_item`.
 - **Exit:** both views finish under 2 s warm and under 30 s cold on the reference
   machine with its real `~/sources`. A pnpm fixture shows reclaimable below
   allocated.
@@ -533,16 +526,10 @@ read-only MCP, and nothing yet able to kill or trash by rule.
 
 ## 7. Safety and privacy contract
 
-**MCP write tools**
-- `stop_process` may target only processes in the caller's own tree. The caller is
-  the agent process that spawned `scry mcp`, found by parent `(pid, start_time)`.
-- `trash_item` takes an opaque `item_id` from `disk_usage` or `list_worktrees`,
-  never a free path.
-- Every write sends an MCP elicitation showing the exact target. If the client
-  lacks elicitation, the tool returns the CLI command for the human to run. There
-  is no `confirm` argument.
-- `destructive = false` in the config disables every write path.
-- Every accepted action is audited.
+**Destructive commands**
+- `scry stop`, `scry reap` and cleanup act only after a confirmation, or `--yes`
+  from a script or an agent. `destructive = false` in the config disables all of
+  them, and every accepted action is audited.
 
 **Process control**
 - Current user's processes only.
@@ -551,7 +538,8 @@ read-only MCP, and nothing yet able to kill or trash by rule.
 
 **Privacy**
 - Environment values outside the allowlist are never kept.
-- Command lines returned over MCP are redacted.
+- Command lines appear only as allowlisted labels; raw argv prints only with
+  `scry why --show-command`, never in JSON or snapshots.
 - Recorded snapshots are redacted by default and stay out of git.
 - The store and spool are mode 0600 in a 0700 directory.
 
@@ -566,7 +554,6 @@ read-only MCP, and nothing yet able to kill or trash by rule.
   one per agent version for the undocumented env keys.
 - **Live integration (macOS CI).** A fixture HTTP server for ports. A fixture agent
   tree for leftovers. The `netstat` contract test.
-- **MCP contract.** Tool list, annotations, caps, redaction, refusals.
 - **Budgets.** `bench scan` and the idle CPU measurements are recorded per
   milestone.
 
@@ -603,7 +590,7 @@ Defaults are in bold. The first is yours from this revision.
 | # | Finding | Section |
 |---|---|---|
 | 1 | Orphan rule replaced by the leftover rule | 5, M2, M4 |
-| 2 | MCP writes scoped, elicited, audited | 7, M4 |
+| 2 | Write actions confirmed and audited (MCP dropped) | 7, M4 |
 | 3 | Daemon installed from M0, one binary | 3, M0. The protocol handshake becomes a schema-version check until the socket exists. |
 | 4 | Env stamps first, allowlisted | 5, M1 |
 | 5 | Silent hooks, `SessionProcess` | 5, M2 |
@@ -615,5 +602,5 @@ Defaults are in bold. The first is yours from this revision.
 | 11 | Privacy contract | 7. Peer-uid and frame limits return with the socket. |
 | 12 | Trust wording | 3, M7 |
 | 13 | Pulse trimmed to CPU, memory pressure, swap | 1, M1 |
-| 14 | Read-tool caps, MCP exit on EOF | M3 |
+| 14 | Read-tool caps, MCP exit on EOF | Dropped with MCP |
 | 15 | Fewer crates | 4 |
