@@ -5,7 +5,7 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use scry_core::view::agents::AgentRow;
-use scry_core::view::{Board, Detail, Evidence, Load, State, Tab};
+use scry_core::view::{Board, Detail, Evidence, Load, State, Tab, Tone};
 
 use super::app::{Action, App, Mode, SheetKind, Source};
 use super::theme::{Colors, Look, Rgb, Theme};
@@ -564,4 +564,70 @@ fn a_rescan_glows_rows_that_are_new_or_changed_state() {
         rows.extend(more[more.len() - 2..].iter().cloned());
     }
     assert_eq!(a.replace_board(board), ["mem-51244", "s-batch", "w-0"]);
+}
+
+#[test]
+fn a_toast_never_hides_the_filter_being_typed() {
+    let mut a = design();
+    press(&mut a, "3");
+    a.notify("Rescan failed: boom", Tone::Danger);
+    press(&mut a, "/vi");
+    let footer = lines(&render(&a, 80, 24)).pop().unwrap();
+    assert!(
+        footer.contains("/vi") && footer.contains("of 17"),
+        "{footer}"
+    );
+    assert!(!footer.contains("Rescan failed"), "{footer}");
+    // Once the filter is kept, the toast has the line again.
+    press(&mut a, "\n");
+    let footer = lines(&render(&a, 80, 24)).pop().unwrap();
+    assert!(footer.contains("Rescan failed"), "{footer}");
+}
+
+#[test]
+fn alt_chords_are_not_typed_into_the_filter() {
+    let mut a = design();
+    press(&mut a, "3/vi");
+    a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+    a.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::ALT));
+    press(&mut a, "te");
+    assert_eq!(a.state().filter, "vite");
+}
+
+#[test]
+fn the_sheet_keeps_its_scroll_position_through_a_resize() {
+    let mut a = App::new(
+        with_leftovers(20),
+        Source::Fixture("design.json".into()),
+        mono(),
+    );
+    press(&mut a, "3X");
+    render(&a, 80, 24);
+    press(&mut a, "jjjjjjjjjj");
+    let before = screen(&render(&a, 80, 24));
+    assert!(
+        before.contains("worker-06") && !before.contains("worker-05"),
+        "{before}"
+    );
+    // Taller, every target fits and the sheet starts at the top; back at 24 rows it is
+    // where it was.
+    assert!(screen(&render(&a, 80, 50)).contains("48213"));
+    assert_eq!(screen(&render(&a, 80, 24)), before);
+    // After a shrink a key moves from what is on screen, not from an offset clamped away.
+    press(&mut a, "G");
+    render(&a, 80, 24);
+    render(&a, 80, 30);
+    press(&mut a, "k");
+    let up = screen(&render(&a, 80, 30));
+    assert!(!up.contains("worker-19"), "k moves up from the end:\n{up}");
+}
+
+#[test]
+fn reaping_where_agents_are_not_tracked_says_so_neutrally() {
+    let mut a = typical();
+    press(&mut a, "3X");
+    assert_eq!(a.mode, Mode::Normal);
+    let toast = a.toast.as_ref().unwrap();
+    assert_eq!(toast.text, "Agent sessions are not tracked yet.");
+    assert_eq!(toast.tone, Tone::Quiet);
 }

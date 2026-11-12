@@ -2,6 +2,7 @@
 //! `ui` lays out a frame from the `kit` components, and each view lives in `views`.
 
 pub mod app;
+mod appearance;
 mod filter;
 mod kit;
 mod motion;
@@ -13,16 +14,16 @@ mod views;
 #[cfg(test)]
 mod tests;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::cursor::Show;
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{self, Event, KeyEvent};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -33,28 +34,38 @@ use signal_hook::iterator::Signals;
 
 use app::{Action, App, Mode, Source};
 use motion::Motion;
-use theme::Theme;
+use theme::{Colors, Env, SHIPPED, Theme};
+use tty::LateReply;
 
 const SAMPLE_EVERY: Duration = Duration::from_secs(2);
 const INPUT_POLL: Duration = Duration::from_millis(250);
 const FRAME: Duration = Duration::from_millis(16);
 const SIGNAL_GRACE: Duration = Duration::from_secs(1);
 
+/// The signal that asked Scry to stop, or 0.
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
+
 pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     let source = fixture.map_or(Source::Live, Source::Fixture);
     let live = matches!(source, Source::Live);
     let board = source.load()?;
 
-    // The colour query below changes terminal modes, so the modes are saved and the signal
-    // handler is in place before it starts.
     tty::save();
-    let stop = Arc::new(AtomicBool::new(false));
-    watch_signals(Arc::clone(&stop))?;
-    // Runs before raw mode and the alternate screen.
-    let theme = Theme::detect(&stop);
-    if stop.load(Ordering::Relaxed) {
-        return Ok(());
-    }
+    watch_signals()?;
+    let mut terminal = tty::change(ratatui::try_init)?;
+    // Asked in raw mode and before the event loop reads a key, so the answer is read here
+    // and the question needs no terminal modes of its own.
+    let mut answer = tty::Answer::default();
+    let colors = Colors::detect(
+        &Env::read(),
+        || {
+            answer = tty::ask(&SIGNAL);
+            answer.colors
+        },
+        appearance::dark,
+    );
+    exit_on_signal();
+    let theme = Theme::new(SHIPPED, colors);
     let mut motion = Motion::new(theme.motion);
     let mut app = App::new(board, source, theme);
 
@@ -73,23 +84,41 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
         });
     }
 
-    let mut terminal = ratatui::init();
-    tty::flush_input();
-    let result = event_loop(&mut terminal, &mut app, &mut motion, &rx, &stop);
-    ratatui::restore();
+    let result = event_loop(
+        &mut terminal,
+        &mut app,
+        &mut motion,
+        &rx,
+        answer.typed,
+        answer.late,
+    );
+    exit_on_signal();
+    tty::change(ratatui::restore);
     result
 }
 
-/// Draws only when something changed, or while an effect runs.
+/// After a signal, puts the terminal back and exits with 128 plus its number, as shells
+/// report a process the signal ended.
+fn exit_on_signal() {
+    let sig = SIGNAL.load(Ordering::Relaxed);
+    if sig != 0 {
+        tty::restore_and_exit(128 + sig);
+    }
+}
+
+/// Draws only when something changed, or while an effect runs. `typed` are keys read with
+/// the colour answer; `late` picks the rest of an unfinished answer out of the keys.
 fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     motion: &mut Motion,
     rx: &mpsc::Receiver<Board>,
-    stop: &AtomicBool,
+    typed: Vec<KeyEvent>,
+    mut late: Option<LateReply>,
 ) -> Result<()> {
     let mut dirty = true;
-    while !stop.load(Ordering::Relaxed) {
+    let mut keys = VecDeque::from(typed);
+    while SIGNAL.load(Ordering::Relaxed) == 0 {
         if let Some(board) = rx.try_iter().last()
             && board != app.board
         {
@@ -100,6 +129,30 @@ fn event_loop(
         if app.toast.as_ref().is_some_and(|t| now >= t.until) {
             app.toast = None;
             dirty = true;
+        }
+        if let Some(held) = late.as_mut().and_then(|l| l.expire(now)) {
+            keys.extend(held);
+            late = None;
+        }
+        while let Some(key) = keys.pop_front() {
+            let had_sheet = matches!(app.mode, Mode::Sheet(_));
+            match app.on_key(key) {
+                Action::Quit => return Ok(()),
+                Action::Suspend => suspend(terminal)?,
+                Action::Rescan => match app.source.load() {
+                    Ok(board) if board == app.board => {
+                        app.notify("No changes since the last scan.", Tone::Ok)
+                    }
+                    Ok(board) => motion.rows_changed(app.replace_board(board)),
+                    Err(e) => app.notify(format!("Rescan failed: {e:#}"), Tone::Danger),
+                },
+                Action::Redraw => {}
+                Action::None => continue,
+            }
+            dirty = true;
+            if !had_sheet && matches!(app.mode, Mode::Sheet(_)) {
+                motion.sheet_opened();
+            }
         }
         if dirty || motion.running() {
             terminal.draw(|f| {
@@ -119,32 +172,13 @@ fn event_loop(
         if !event::poll(wait)? {
             continue;
         }
-        let had_sheet = matches!(app.mode, Mode::Sheet(_));
         match event::read()? {
-            Event::Key(key) => match app.on_key(key) {
-                Action::Quit => break,
-                Action::Suspend => {
-                    suspend(terminal)?;
-                    dirty = true;
-                }
-                Action::Rescan => {
-                    match app.source.load() {
-                        Ok(board) if board == app.board => {
-                            app.notify("No changes since the last scan.", Tone::Ok)
-                        }
-                        Ok(board) => motion.rows_changed(app.replace_board(board)),
-                        Err(e) => app.notify(format!("Rescan failed: {e:#}"), Tone::Danger),
-                    }
-                    dirty = true;
-                }
-                Action::Redraw => dirty = true,
-                Action::None => {}
+            Event::Key(key) => match late.as_mut() {
+                Some(l) => keys.extend(l.feed(key, Instant::now())),
+                None => keys.push_back(key),
             },
             Event::Resize(..) => dirty = true,
             _ => {}
-        }
-        if !had_sheet && matches!(app.mode, Mode::Sheet(_)) {
-            motion.sheet_opened();
         }
     }
     Ok(())
@@ -153,29 +187,35 @@ fn event_loop(
 /// SIGTERM and SIGINT ask the loop to stop and restore the terminal, and restore it here
 /// after a grace period if the loop has not. A hung-up terminal can leave crossterm spinning
 /// inside `poll`, where the loop never sees the flag, so SIGHUP restores and exits at once.
-fn watch_signals(stop: Arc<AtomicBool>) -> Result<()> {
+fn watch_signals() -> Result<()> {
     let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])?;
     std::thread::spawn(move || {
         let Some(sig) = signals.forever().next() else {
             return;
         };
-        stop.store(true, Ordering::Relaxed);
+        SIGNAL.store(sig, Ordering::Relaxed);
         if sig != SIGHUP {
             std::thread::sleep(SIGNAL_GRACE);
         }
-        tty::restore();
-        std::process::exit(128 + sig);
+        tty::restore_and_exit(128 + sig);
     });
     Ok(())
 }
 
 /// Ctrl-Z: give the shell its terminal back, stop, and take it again on `fg`.
 fn suspend(terminal: &mut DefaultTerminal) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(std::io::stdout(), LeaveAlternateScreen, Show)?;
+    tty::change(|| -> Result<()> {
+        disable_raw_mode()?;
+        execute!(std::io::stdout(), LeaveAlternateScreen, Show)?;
+        Ok(())
+    })?;
+    // SAFETY: raising a signal at the calling thread has no memory effects.
     unsafe { libc::raise(libc::SIGTSTP) };
-    enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    tty::change(|| -> Result<()> {
+        enable_raw_mode()?;
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        Ok(())
+    })?;
     terminal.clear()?;
     Ok(())
 }

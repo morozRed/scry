@@ -72,8 +72,11 @@ pub enum Mode {
 pub struct Sheet {
     pub kind: SheetKind,
     pub targets: Vec<Target>,
-    /// First target on screen when they do not all fit; the sheet clamps it.
+    /// First target on screen when they do not all fit. Kept as it is through a resize; the
+    /// sheet draws it clamped to the size of the moment.
     pub offset: Cell<usize>,
+    /// The highest `offset` that still fills the sheet at the size last drawn.
+    pub max_offset: Cell<usize>,
 }
 
 impl Sheet {
@@ -82,6 +85,7 @@ impl Sheet {
             kind,
             targets,
             offset: Cell::new(0),
+            max_offset: Cell::new(usize::MAX),
         }
     }
 }
@@ -129,7 +133,6 @@ pub struct App {
     /// How wide the list was last drawn, which decides the columns on screen. Keys act on
     /// what was last drawn.
     pub list_width: Cell<u16>,
-    late: LateReply,
 }
 
 impl App {
@@ -143,7 +146,6 @@ impl App {
             views: Default::default(),
             toast: None,
             list_width: Cell::new(MIN_W),
-            late: LateReply::default(),
         }
     }
 
@@ -235,7 +237,7 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        if key.kind != KeyEventKind::Press || self.late.swallow(&key) {
+        if key.kind != KeyEventKind::Press {
             return Action::None;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -257,6 +259,7 @@ impl App {
         }
         match &self.mode {
             Mode::Normal => self.on_normal(key.code),
+            Mode::Filter if key.modifiers.contains(KeyModifiers::ALT) => Action::None,
             Mode::Filter => self.on_filter(key.code),
             Mode::Sheet(_) => self.on_sheet(key.code),
             Mode::Help => match key.code {
@@ -380,11 +383,16 @@ impl App {
         let Mode::Sheet(sheet) = &self.mode else {
             return Action::None;
         };
-        let last = sheet.targets.len().saturating_sub(1) as isize;
-        let at = sheet.offset.get() as isize;
+        // From where the sheet is on screen, so a key never moves an offset that a smaller
+        // terminal clamped away.
+        let max = sheet
+            .max_offset
+            .get()
+            .min(sheet.targets.len().saturating_sub(1));
+        let at = sheet.offset.get().min(max) as isize;
         sheet
             .offset
-            .set(at.saturating_add(by).clamp(0, last) as usize);
+            .set(at.saturating_add(by).clamp(0, max as isize) as usize);
         Action::Redraw
     }
 
@@ -516,6 +524,21 @@ impl App {
         let Some(reap) = views::view(self.tab).reap else {
             return Action::None;
         };
+        // Nothing to reap is an all-clear only when the view knows what is running.
+        match self.rows() {
+            Load::Ready(_) => {}
+            Load::Unavailable(why) | Load::Failed(why) => {
+                self.notify(why, Tone::Quiet);
+                return Action::Redraw;
+            }
+            Load::Loading => {
+                self.notify(
+                    format!("Still reading {}.", self.tab.title().to_lowercase()),
+                    Tone::Quiet,
+                );
+                return Action::Redraw;
+            }
+        }
         let targets = reap(&self.board);
         if targets.is_empty() {
             self.notify("No leftovers to reap.", Tone::Ok);
@@ -527,104 +550,4 @@ impl App {
 
 fn has_children(rows: &[Row], i: usize) -> bool {
     rows.get(i + 1).is_some_and(|n| n.depth > rows[i].depth)
-}
-
-/// Swallows a terminal's colour reply that arrives after the startup query stopped
-/// waiting. Crossterm hands it over as keys: alt-] (ESC ]), then `11;rgb:1d1d/1f1f/2121`,
-/// then ctrl-g (BEL) or alt-\ (ESC \). A key that does not continue that shape ends it
-/// and is handled as usual.
-#[derive(Debug, Default)]
-struct LateReply {
-    seen: Option<String>,
-}
-
-impl LateReply {
-    const LONGEST: usize = 48;
-
-    fn swallow(&mut self, key: &KeyEvent) -> bool {
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let Some(seen) = &mut self.seen else {
-            if alt && key.code == KeyCode::Char(']') {
-                self.seen = Some(String::new());
-                return true;
-            }
-            return false;
-        };
-        // `1x;` is in, so the colour has started and may end.
-        let body = seen.len() >= 3;
-        let end = match key.code {
-            KeyCode::Char('g') => ctrl && body,
-            KeyCode::Char('\\') => (alt && body) || seen.ends_with('\x1b'),
-            _ => false,
-        };
-        if end {
-            self.seen = None;
-            return true;
-        }
-        let next = match key.code {
-            KeyCode::Esc if body => Some('\x1b'),
-            KeyCode::Char(c) if !alt && !ctrl && !seen.ends_with('\x1b') => Some(c),
-            _ => None,
-        };
-        let fits = next.is_some_and(|c| match seen.len() {
-            0 => c == '1',
-            1 => c == '0' || c == '1',
-            2 => c == ';',
-            n if n < Self::LONGEST => c == '\x1b' || c.is_ascii_hexdigit() || "rgba:/#".contains(c),
-            _ => false,
-        });
-        match (fits, next) {
-            (true, Some(c)) => {
-                seen.push(c);
-                true
-            }
-            _ => {
-                self.seen = None;
-                false
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn keys(s: &str) -> Vec<KeyEvent> {
-        let mut out = Vec::new();
-        let mut chars = s.chars();
-        while let Some(c) = chars.next() {
-            out.push(match c {
-                '\x1b' => match chars.next() {
-                    Some(n) => KeyEvent::new(KeyCode::Char(n), KeyModifiers::ALT),
-                    None => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                },
-                '\x07' => KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
-                c => KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
-            });
-        }
-        out
-    }
-
-    #[test]
-    fn a_late_colour_reply_is_swallowed_and_the_next_key_is_not() {
-        let mut late = LateReply::default();
-        for reply in [
-            "\x1b]11;rgb:1d1d/1f1f/2121\x07",
-            "\x1b]10;rgb:c5c5/c8c8/c6c6\x1b\\",
-        ] {
-            assert!(keys(reply).iter().all(|k| late.swallow(k)), "{reply:?}");
-        }
-        assert!(!late.swallow(&keys("q")[0]));
-    }
-
-    #[test]
-    fn keys_that_break_the_shape_go_through() {
-        let mut late = LateReply::default();
-        let k = keys("\x1b]j");
-        assert!(late.swallow(&k[0]));
-        assert!(!late.swallow(&k[1]), "j is not part of a reply");
-        assert!(!late.swallow(&keys("/")[0]));
-    }
 }

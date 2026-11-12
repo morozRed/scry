@@ -192,16 +192,17 @@ fn split(f: &mut Frame, body: Rect, theme: &Theme) -> (Rect, Rect, bool) {
     }
 }
 
+/// The filter while it is typed, else a toast, else the filter that is applied.
 fn footer_left<'a>(app: &App, count: Option<(usize, usize)>) -> Vec<Span<'a>> {
     let theme = &app.theme;
-    if let Some(t) = &app.toast {
+    let editing = app.mode == Mode::Filter;
+    if let Some(t) = app.toast.as_ref().filter(|_| !editing) {
         return vec![
             Span::styled(glyph(t.tone), theme.tone(t.tone)),
             Span::styled(format!(" {}", t.text), theme.text),
         ];
     }
     let filter = &app.state().filter;
-    let editing = app.mode == Mode::Filter;
     if filter.is_empty() && !editing {
         return Vec::new();
     }

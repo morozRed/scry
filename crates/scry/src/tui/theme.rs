@@ -1,13 +1,8 @@
 //! Semantic tokens. Components ask for `muted` or `warn`, never for a colour, so a look is
 //! one constructor here and the degraded variants come for free.
 
-use std::sync::atomic::AtomicBool;
-use std::time::Duration;
-
 use ratatui::style::{Color, Modifier, Style};
 use scry_core::view::Tone;
-
-use super::tty;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
@@ -59,52 +54,110 @@ pub enum Colors {
     True { bg: Rgb, fg: Rgb },
 }
 
-/// How long to wait for the terminal's answer. Local terminals answer in a few
-/// milliseconds; the wait ends early once the DA1 reply marks the answer complete.
-const QUERY_WAIT: Duration = Duration::from_secs(1);
+/// Terminals known to answer the colour query at once, by `TERM_PROGRAM` or, for those
+/// that do not set it, by `TERM`.
+const ANSWER_AT_ONCE: [(&str, &str); 5] = [
+    ("ghostty", "xterm-ghostty"),
+    ("iTerm.app", ""),
+    ("Apple_Terminal", ""),
+    ("WezTerm", ""),
+    ("kitty", "xterm-kitty"),
+];
 
-impl Colors {
-    /// Returns early, with no colours, when `stop` is set during the query.
-    pub fn detect(stop: &AtomicBool) -> Colors {
+/// What a terminal Scry did not ask is taken to show: Terminal's Basic profile when light,
+/// a neutral dark grey when dark. As `(background, foreground)`.
+const ASSUMED_LIGHT: (Rgb, Rgb) = (Rgb(0xff, 0xff, 0xff), Rgb(0x00, 0x00, 0x00));
+const ASSUMED_DARK: (Rgb, Rgb) = (Rgb(0x1c, 0x1c, 0x1c), Rgb(0xd0, 0xd0, 0xd0));
+
+/// The environment variables that decide the colours, read once at startup.
+#[derive(Clone, Debug, Default)]
+pub struct Env {
+    pub no_color: bool,
+    pub colorterm: Option<String>,
+    pub term_program: Option<String>,
+    pub term: Option<String>,
+    /// `SSH_CONNECTION` or `SSH_TTY` is set.
+    pub ssh: bool,
+    /// `SCRY_COLOR_QUERY`: `1` always asks, `0` never does.
+    pub ask: Option<String>,
+    /// `COLORFGBG`, as rxvt and others set it: `fg;bg` in ANSI colour numbers.
+    pub colorfgbg: Option<String>,
+}
+
+impl Env {
+    pub fn read() -> Env {
         let var = |k| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let ask = may_query(
-            var("SSH_CONNECTION").is_some(),
-            var("SCRY_COLOR_QUERY").as_deref(),
-        );
-        Colors::from_env(
-            var("NO_COLOR").is_some(),
-            var("COLORTERM").as_deref(),
-            || ask.then(|| tty::query_colors(QUERY_WAIT, stop)).flatten(),
-        )
+        Env {
+            no_color: var("NO_COLOR").is_some(),
+            colorterm: var("COLORTERM"),
+            term_program: var("TERM_PROGRAM"),
+            term: var("TERM"),
+            ssh: var("SSH_CONNECTION").is_some() || var("SSH_TTY").is_some(),
+            ask: var("SCRY_COLOR_QUERY"),
+            colorfgbg: var("COLORFGBG"),
+        }
     }
 
-    /// Truecolor needs both `COLORTERM` and an answer to the background query; anything
-    /// less falls back to the ANSI palette, which is right in every theme.
-    pub fn from_env(
-        no_color: bool,
-        colorterm: Option<&str>,
-        query: impl FnOnce() -> Option<(Rgb, Rgb)>,
-    ) -> Colors {
-        if no_color {
-            return Colors::Mono;
+    fn truecolor(&self) -> bool {
+        matches!(self.colorterm.as_deref(), Some("truecolor" | "24bit"))
+    }
+
+    /// Only a local terminal known to answer at once is asked, so no answer can arrive after
+    /// Scry stopped waiting. Over ssh, in tmux or in an unknown terminal an answer may be
+    /// slow or never come.
+    pub fn may_ask(&self) -> bool {
+        match self.ask.as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                let is = |v: &Option<String>, name: &str| {
+                    !name.is_empty() && v.as_deref().is_some_and(|v| v.eq_ignore_ascii_case(name))
+                };
+                !self.ssh
+                    && ANSWER_AT_ONCE.iter().any(|(program, term)| {
+                        is(&self.term_program, program) || is(&self.term, term)
+                    })
+            }
         }
-        if !matches!(colorterm, Some("truecolor" | "24bit")) {
-            return Colors::Ansi;
-        }
-        match query() {
-            Some((bg, fg)) => Colors::True { bg, fg },
-            None => Colors::Ansi,
-        }
+    }
+
+    /// Whether `COLORFGBG` names a dark background: ANSI 0 to 6 and 8 are dark.
+    fn dark_background(&self) -> Option<bool> {
+        let bg: u8 = self
+            .colorfgbg
+            .as_deref()?
+            .rsplit(';')
+            .next()?
+            .parse()
+            .ok()?;
+        Some(matches!(bg, 0..=6 | 8))
     }
 }
 
-/// Over ssh a reply can take longer than the wait, so Scry does not ask there unless
-/// `SCRY_COLOR_QUERY=1`. `SCRY_COLOR_QUERY=0` never asks.
-fn may_query(ssh: bool, force: Option<&str>) -> bool {
-    match force {
-        Some("1") => true,
-        Some("0") => false,
-        _ => !ssh,
+impl Colors {
+    /// Truecolor needs `COLORTERM`; without it the ANSI palette is right in every theme.
+    /// With it, `ask` runs only where [`Env::may_ask`] allows, and when it does not run or
+    /// gets no answer, light or dark comes from `COLORFGBG`, then from `dark`, the macOS
+    /// appearance, then dark.
+    pub fn detect(
+        env: &Env,
+        ask: impl FnOnce() -> Option<(Rgb, Rgb)>,
+        dark: impl FnOnce() -> Option<bool>,
+    ) -> Colors {
+        if env.no_color {
+            return Colors::Mono;
+        }
+        if !env.truecolor() {
+            return Colors::Ansi;
+        }
+        if env.may_ask()
+            && let Some((bg, fg)) = ask()
+        {
+            return Colors::True { bg, fg };
+        }
+        let dark = env.dark_background().or_else(dark).unwrap_or(true);
+        let (bg, fg) = if dark { ASSUMED_DARK } else { ASSUMED_LIGHT };
+        Colors::True { bg, fg }
     }
 }
 
@@ -161,10 +214,6 @@ pub struct MotionColors {
 }
 
 impl Theme {
-    pub fn detect(stop: &AtomicBool) -> Theme {
-        Theme::new(SHIPPED, Colors::detect(stop))
-    }
-
     pub fn new(look: Look, colors: Colors) -> Theme {
         match (look, colors) {
             (Look::Tinted, Colors::True { bg, fg }) => tinted(bg, fg),
@@ -325,30 +374,80 @@ mod tests {
 
     const DARK: (Rgb, Rgb) = (Rgb(0x1d, 0x1f, 0x21), Rgb(0xc5, 0xc8, 0xc6));
 
+    fn env(colorterm: &str, term_program: &str) -> Env {
+        let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
+        Env {
+            colorterm: some(colorterm),
+            term_program: some(term_program),
+            ..Env::default()
+        }
+    }
+
+    fn never<T>() -> T {
+        panic!("must not be called")
+    }
+
+    fn assumed((bg, fg): (Rgb, Rgb)) -> Colors {
+        Colors::True { bg, fg }
+    }
+
     #[test]
-    fn truecolor_needs_colorterm_and_an_answer() {
+    fn truecolor_needs_colorterm_and_only_a_known_terminal_is_asked() {
+        let ghostty = env("truecolor", "ghostty");
         assert_eq!(
-            Colors::from_env(false, Some("truecolor"), || Some(DARK)),
+            Colors::detect(&ghostty, || Some(DARK), never),
             Colors::True {
                 bg: DARK.0,
                 fg: DARK.1
             }
         );
+        // No COLORTERM: the ANSI palette, and nothing is asked or read.
         assert_eq!(
-            Colors::from_env(false, Some("24bit"), || None),
+            Colors::detect(&env("", "ghostty"), never, never),
             Colors::Ansi
         );
         assert_eq!(
-            Colors::from_env(false, None, || panic!("must not query")),
+            Colors::detect(&env("yes", "iTerm.app"), never, never),
             Colors::Ansi
         );
+        let mono = Env {
+            no_color: true,
+            ..ghostty.clone()
+        };
+        assert_eq!(Colors::detect(&mono, never, never), Colors::Mono);
+        // An unknown terminal is not asked; the macOS appearance picks light or dark.
+        for program in ["", "tmux", "vscode"] {
+            let e = env("24bit", program);
+            assert_eq!(
+                Colors::detect(&e, never, || Some(false)),
+                assumed(ASSUMED_LIGHT)
+            );
+            assert_eq!(Colors::detect(&e, never, || None), assumed(ASSUMED_DARK));
+        }
+        // A known terminal that gives no colours is treated the same.
         assert_eq!(
-            Colors::from_env(false, Some("yes"), || panic!("must not query")),
-            Colors::Ansi
+            Colors::detect(&ghostty, || None, || Some(false)),
+            assumed(ASSUMED_LIGHT)
+        );
+    }
+
+    #[test]
+    fn colorfgbg_decides_before_the_appearance() {
+        let with = |v: &str| Env {
+            colorfgbg: Some(v.into()),
+            ..env("truecolor", "")
+        };
+        assert_eq!(
+            Colors::detect(&with("15;0"), never, never),
+            assumed(ASSUMED_DARK)
         );
         assert_eq!(
-            Colors::from_env(true, Some("truecolor"), || panic!("must not query")),
-            Colors::Mono
+            Colors::detect(&with("0;default;15"), never, never),
+            assumed(ASSUMED_LIGHT)
+        );
+        assert_eq!(
+            Colors::detect(&with("default;default"), never, || Some(false)),
+            assumed(ASSUMED_LIGHT)
         );
     }
 
@@ -466,10 +565,28 @@ mod tests {
     }
 
     #[test]
-    fn the_colour_query_is_skipped_over_ssh_unless_forced() {
-        assert!(may_query(false, None));
-        assert!(!may_query(true, None));
-        assert!(may_query(true, Some("1")));
-        assert!(!may_query(false, Some("0")));
+    fn the_query_needs_a_local_known_terminal_unless_forced() {
+        for (program, term) in [("ghostty", ""), ("iTerm.app", ""), ("", "xterm-kitty")] {
+            let e = Env {
+                term: Some(term.into()).filter(|t: &String| !t.is_empty()),
+                ..env("truecolor", program)
+            };
+            assert!(e.may_ask(), "{program} {term}");
+            let ssh = Env { ssh: true, ..e };
+            assert!(!ssh.may_ask(), "{program} {term} over ssh");
+            let forced = Env {
+                ask: Some("1".into()),
+                ..ssh
+            };
+            assert!(forced.may_ask());
+        }
+        for program in ["", "tmux", "vscode", "WarpTerminal"] {
+            assert!(!env("truecolor", program).may_ask(), "{program}");
+        }
+        let off = Env {
+            ask: Some("0".into()),
+            ..env("truecolor", "ghostty")
+        };
+        assert!(!off.may_ask());
     }
 }

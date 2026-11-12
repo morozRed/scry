@@ -76,8 +76,8 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
     // many and how to scroll to them, and the head above keeps the totals in view.
     let room = list.height.saturating_sub(1) as usize;
     let rows_shown = if n <= room { n } else { room.saturating_sub(1) };
+    sheet.max_offset.set(n - rows_shown);
     let top = sheet.offset.get().min(n - rows_shown);
-    sheet.offset.set(top);
     if rows_shown < n {
         let below = n - top - rows_shown;
         let mut more = Vec::new();

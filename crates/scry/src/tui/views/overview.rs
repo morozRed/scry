@@ -23,6 +23,18 @@ pub const VIEW: ViewDef = ViewDef {
 };
 
 fn rows(board: &Board) -> Load<Vec<Row>> {
+    // An empty list is an all-clear only once every source it draws from was read.
+    let missing = match (board.ports.ready(), board.agents.ready()) {
+        (Some(_), Some(_)) => None,
+        (None, Some(_)) => Some("Ports are"),
+        (Some(_), None) => Some("Agent sessions are"),
+        (None, None) => Some("Ports and agent sessions are"),
+    };
+    if let Some(what) = missing
+        && board.overview.attention.is_empty()
+    {
+        return Load::Unavailable(format!("{what} not collected yet, so nothing is flagged."));
+    }
     let rows = board
         .overview
         .attention
