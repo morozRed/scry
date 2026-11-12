@@ -11,7 +11,7 @@ pub const HOME_ENV: &str = "SCRY_HOME";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Paths {
-    /// `config.toml`. Read only; Scry never writes it.
+    /// `config.toml`. Scry writes only its `keep` list, when asked to keep a process.
     pub config: PathBuf,
     /// Holds `scry.db`, `spool/`, `daemon.lock`, `daemon.log` and `daemon.log.1`. Mode 0700.
     pub state: PathBuf,
