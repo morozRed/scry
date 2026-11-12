@@ -18,8 +18,10 @@ pub const VIEW: ViewDef = ViewDef {
     ],
     rows,
     empty: (
-        "No agent sessions.",
-        "Claude Code, Codex, OpenCode and Gemini CLI sessions appear here while they run.",
+        "No agent sessions are running.",
+        "Scry recognises Claude Code, Codex, OpenCode and Gemini CLI.\n\
+         Their sessions appear here as they run, with what each one started.\n\
+         `scry hook install claude` makes Claude Code attribution exact.",
     ),
     badge,
     hints: &[("⏎", "fold"), ("x", "stop"), ("X", "reap")],

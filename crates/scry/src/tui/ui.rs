@@ -127,7 +127,11 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
         other => {
             let empty = views::empty(view, &app.board);
             let status = match other {
-                Load::Ready(_) => Status::Clear {
+                Load::Ready(_) if views::empty_is_clear(view) => Status::Clear {
+                    title: &empty.0,
+                    hint: &empty.1,
+                },
+                Load::Ready(_) => Status::Empty {
                     title: &empty.0,
                     hint: &empty.1,
                 },

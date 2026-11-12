@@ -5,8 +5,11 @@ pub mod agents;
 pub mod ports;
 pub mod worktrees;
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::attribution::{AgentState, Known, Lineage, Policy};
 use crate::home::Home;
 use crate::model::Snapshot;
 pub use agents::AgentRow;
@@ -64,12 +67,45 @@ pub struct Board {
 }
 
 impl Board {
+    /// The overview counts of a snapshot, with the other views not collected. A recorded
+    /// snapshot drawn as a fixture looks like this.
     pub fn from_snapshot(s: &Snapshot) -> Self {
         Board {
             pulse: None,
             overview: Overview::from_snapshot(s),
             ports: Load::Ready(PortsView::build(s, Home::from_env().as_ref()).rows),
             agents: Load::Unavailable("Agent sessions are not tracked yet.".into()),
+            worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
+        }
+    }
+
+    /// Every view from a recorded snapshot alone, with no store or spool behind it.
+    pub fn from_recorded(s: &Snapshot) -> Self {
+        let lineage = Lineage::build(s, &Known::default(), &Policy::default());
+        Board::build(s, &lineage, None)
+    }
+
+    /// Every view from one snapshot and its lineage. Paths are shown as [`Home::redact`]
+    /// writes them.
+    pub fn build(s: &Snapshot, lineage: &Lineage, home: Option<&Home>) -> Self {
+        let mut ports = PortsView::build(s, home).rows;
+        for r in ports.iter_mut().filter(|r| r.uid == s.viewer_uid) {
+            if lineage.is_leftover(r.pid) {
+                r.state = Some(State::Leftover);
+            } else if r.state.is_none()
+                && lineage.session_of(r.pid).is_some_and(|(session, _)| {
+                    !session.ended() && matches!(session.agent, AgentState::Live { .. })
+                })
+            {
+                r.state = Some(State::Live);
+            }
+        }
+        let agents = agents::rows(s, lineage, home);
+        Board {
+            pulse: None,
+            overview: Overview::build(s, lineage, &agents, &ports),
+            ports: Load::Ready(ports),
+            agents: Load::Ready(agents),
             worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
         }
     }
@@ -207,6 +243,17 @@ impl Evidence {
             Evidence::Guess => "guess",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Evidence> {
+        [Evidence::Stamp, Evidence::Tree, Evidence::Guess]
+            .into_iter()
+            .find(|e| e.word() == s)
+    }
+
+    /// Exact evidence is what a rule may act on; a guess is only shown.
+    pub fn exact(self) -> bool {
+        self != Evidence::Guess
+    }
 }
 
 /// What the detail pane says about one row: a sentence first, then the evidence for it.
@@ -294,6 +341,9 @@ pub struct Overview {
     /// Ranked things that need the user, most urgent first.
     #[serde(default)]
     pub attention: Vec<Attention>,
+    /// What was looked at, so an empty list says what it is clear of.
+    #[serde(default)]
+    pub checked: Vec<String>,
 }
 
 /// One line of the Overview: what needs the user and where to act on it.
@@ -317,6 +367,173 @@ impl Overview {
             own_count: s.own_processes().count(),
             own_footprint: s.own_processes().filter_map(|p| p.footprint).sum(),
             attention: Vec::new(),
+            checked: Vec::new(),
+        }
+    }
+
+    /// The attention list: leftovers by session first, then ports they hold.
+    pub fn build(s: &Snapshot, lineage: &Lineage, agents: &[AgentRow], ports: &[PortRow]) -> Self {
+        let mut attention = Vec::new();
+        let mut session: Option<&AgentRow> = None;
+        let mut groups: Vec<(&AgentRow, Vec<&AgentRow>)> = Vec::new();
+        for row in agents {
+            if row.depth == 0 {
+                session = Some(row);
+            } else if row.state == Some(State::Leftover)
+                && let Some(head) = session
+            {
+                match groups.last_mut() {
+                    Some((h, v)) if h.id == head.id => v.push(row),
+                    _ => groups.push((head, vec![row])),
+                }
+            }
+        }
+        for (head, left) in groups {
+            let n = left.len();
+            attention.push(Attention {
+                id: format!("a-left-{}", head.id),
+                state: State::Leftover,
+                title: format!(
+                    "{} left {n} {} running",
+                    head.label,
+                    if n == 1 { "process" } else { "processes" }
+                ),
+                context: head.context.clone(),
+                size: Some(left.iter().filter_map(|r| r.ram).sum()),
+                tab: Tab::Agents,
+                row: Some(head.id.clone()),
+                detail: Detail {
+                    title: match &head.context {
+                        Some(c) => format!("{n} left over in {c}"),
+                        None => format!("{n} left over"),
+                    },
+                    facts: head.detail.facts.clone(),
+                    sentence: head.detail.sentence.clone(),
+                    evidence: left
+                        .iter()
+                        .map(|r| format!("{}: {}", r.label, r.detail.evidence.join("; ")))
+                        .collect(),
+                },
+            });
+        }
+        // Ports held by leftovers, one line per session, since an ended test run can leave
+        // dozens of servers behind.
+        let mut owner: HashMap<i32, &AgentRow> = HashMap::new();
+        let mut head: Option<&AgentRow> = None;
+        for row in agents {
+            if row.depth == 0 {
+                head = Some(row);
+            } else if let (Some(h), Some(pid)) = (head, row.pid) {
+                owner.insert(pid, h);
+            }
+        }
+        let mut held: Vec<(Option<&AgentRow>, Vec<&PortRow>)> = Vec::new();
+        for p in ports.iter().filter(|p| p.state == Some(State::Leftover)) {
+            let h = owner.get(&p.pid).copied();
+            match held
+                .iter_mut()
+                .find(|(o, _)| o.map(|o| &o.id) == h.map(|h| &h.id))
+            {
+                Some((_, v)) => v.push(p),
+                None => held.push((h, vec![p])),
+            }
+        }
+        for (h, list) in held {
+            let p = list[0];
+            let more = list.len() - 1;
+            let title = match more {
+                0 => format!("{} is held by an ended session", p.label()),
+                n => format!(
+                    "{} and {n} more {} are held by an ended session",
+                    p.label(),
+                    if n == 1 { "port" } else { "ports" }
+                ),
+            };
+            let mut detail = p.detail();
+            if more > 0 {
+                detail.evidence.push(format!(
+                    "Also held: {}",
+                    list[1..]
+                        .iter()
+                        .map(|p| p.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            attention.push(Attention {
+                id: format!("a-port-{}-{}-{}", p.proto.name(), p.port, p.pid),
+                state: State::Leftover,
+                title,
+                context: h
+                    .and_then(|h| h.context.clone())
+                    .or_else(|| Some(p.holder())),
+                size: Some({
+                    let mut seen = Vec::new();
+                    list.iter()
+                        .filter(|p| {
+                            let new = !seen.contains(&p.pid);
+                            seen.push(p.pid);
+                            new
+                        })
+                        .filter_map(|p| p.ram)
+                        .sum()
+                }),
+                tab: Tab::Ports,
+                row: Some(format!("{}-{}-{}", p.proto.name(), p.port, p.pid)),
+                detail,
+            });
+        }
+        let sessions = lineage.sessions.len();
+        let listening = ports.len();
+        let own = s.own_processes().count();
+        Overview {
+            attention,
+            checked: vec![
+                format!("{own} of your processes against the leftover rule"),
+                format!(
+                    "{sessions} agent {}",
+                    if sessions == 1 { "session" } else { "sessions" }
+                ),
+                format!(
+                    "{listening} listening {} for one held by an ended session",
+                    if listening == 1 { "port" } else { "ports" }
+                ),
+            ],
+            ..Overview::from_snapshot(s)
+        }
+    }
+
+    /// Puts a broken config first: until it is fixed, no process is a leftover, so an empty
+    /// list would be a false all-clear.
+    pub fn config_unread(&mut self, error: &str) {
+        self.attention.insert(
+            0,
+            Attention {
+                id: "a-config".into(),
+                state: State::NotRead,
+                title: "Your config could not be read, so no leftovers are selected".into(),
+                context: None,
+                size: None,
+                tab: Tab::Agents,
+                row: None,
+                detail: Detail {
+                    title: "Config unreadable".into(),
+                    facts: Vec::new(),
+                    sentence: format!(
+                        "Scry selects no leftovers until the config is fixed, since the keep list in it is unknown: {error}"
+                    ),
+                    evidence: vec!["Run `scry doctor` for the line to fix.".into()],
+                },
+            },
+        );
+    }
+
+    /// "Checked 412 of your processes …, 6 agent sessions and 14 listening ports …."
+    pub fn checked_line(&self) -> Option<String> {
+        match self.checked.as_slice() {
+            [] => None,
+            [one] => Some(format!("Checked {one}.")),
+            [rest @ .., last] => Some(format!("Checked {} and {last}.", rest.join(", "))),
         }
     }
 

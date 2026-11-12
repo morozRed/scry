@@ -74,6 +74,8 @@ mod tests {
                 project: None,
                 stamps: Default::default(),
                 worker: false,
+                tty: None,
+                role: None,
             }],
             ..Snapshot::default()
         }

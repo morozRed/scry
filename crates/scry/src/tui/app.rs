@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use scry_core::engine::{Engine, Labels};
+use scry_core::engine::Labels;
 use scry_core::view::{Board, Load, Tab, Target, Tone, human_age};
 
 use super::theme::Theme;
@@ -30,10 +30,7 @@ impl Source {
     /// One reading. The live TUI reads in the background instead; see `tui::run`.
     pub fn load(&self) -> Result<Board> {
         match self {
-            Source::Live => {
-                let mut engine = Engine::labelling(Labels::Listeners);
-                Ok(Board::from_snapshot(&engine.snapshot()?))
-            }
+            Source::Live => scry_core::live::Collector::new(Labels::All).board(),
             Source::Fixture(path) => load_fixture(path),
         }
     }

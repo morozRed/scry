@@ -115,6 +115,14 @@ dark, holds. Without truecolor Scry falls back to exactly that principle, below.
 Disk is not built yet, so it shows what it will hold and what its history needs. The
 Worktrees fixture rows are synthetic.
 
+On a first run with nothing to report, a view says what it checked and how to fill it:
+the Overview names the checks behind its all-clear, and an empty Agents view names the
+agents Scry recognises and the hook that makes attribution exact.
+
+| Overview | Agents |
+|---|---|
+| ![](screens/first-run-overview-light.svg) | ![](screens/first-run-agents-dark.svg) |
+
 From 150 columns the detail pane moves beside the list, which keeps 96 columns:
 [agents light](screens/agents-light-150x40.svg),
 [agents dark](screens/agents-dark-150x40.svg),

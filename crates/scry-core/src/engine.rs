@@ -9,6 +9,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::catalog::{self, Role};
 use crate::home::Home;
 use crate::label::{self, CommandLabel, Facts, LiveFiles};
 use crate::model::{ProcId, Project, Proto, Snapshot, Stamps};
@@ -27,6 +28,8 @@ pub enum Labels {
     Listeners,
     /// One pid, for `stop <pid>`.
     Pid(i32),
+    /// None, for the daemon, which needs stamps and roles but no labels.
+    None,
 }
 
 /// What Scry read from one process's arguments.
@@ -37,6 +40,7 @@ struct Args {
     argv: Vec<String>,
     stamps: Stamps,
     worker: bool,
+    role: Option<Role>,
     /// The label and the listening ports it was built with. It is built again when they change.
     label: Option<(Vec<u16>, CommandLabel)>,
 }
@@ -105,9 +109,15 @@ impl Engine {
                     while read.argv.last().is_some_and(|a| a.is_empty()) {
                         read.argv.pop();
                     }
+                    let role = p
+                        .exe
+                        .as_deref()
+                        .and_then(|exe| catalog::classify(exe, &read.argv))
+                        .map(|r| r.role);
                     self.args.insert(
                         p.id,
                         Args {
+                            role,
                             exe: p.exe.clone(),
                             worker: label::multiprocessing_worker(&read.argv),
                             argv: read.argv,
@@ -120,6 +130,7 @@ impl Engine {
             if let Some(a) = self.args.get(&p.id) {
                 p.stamps = a.stamps.clone();
                 p.worker = a.worker;
+                p.role = a.role;
             }
             if let Some(cwd) = &p.cwd {
                 p.project = roots
@@ -173,6 +184,7 @@ impl Engine {
             Labels::All => return snap.own_processes().map(|p| p.id.pid).collect(),
             Labels::Listeners => listening.keys().copied().collect(),
             Labels::Pid(pid) => HashSet::from([pid]),
+            Labels::None => return HashSet::new(),
         };
         let parents: Vec<i32> = wanted
             .iter()

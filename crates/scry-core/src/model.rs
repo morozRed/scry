@@ -5,6 +5,7 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::Role;
 use crate::label::CommandLabel;
 
 pub const SNAPSHOT_SCHEMA: u32 = 2;
@@ -42,6 +43,15 @@ pub struct Process {
     /// starts. Its arguments say only that, so views name it by [`Snapshot::worker_parent`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker: bool,
+    /// The controlling terminal, as `ttys004`, while the process has a live one. The kernel
+    /// drops it when the terminal closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty: Option<String>,
+    /// What the agent catalog recognised from the executable path and arguments: an agent,
+    /// or something on the never-reap list. Only the viewer's own processes are classified,
+    /// because only their arguments are readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
 }
 
 /// The allowlisted agent keys from a process's environment. Every other variable is dropped
@@ -95,31 +105,51 @@ impl Stamps {
 
     /// The agent and session id a stamp names, strongest first.
     pub fn session(&self) -> Option<(Agent, &str, &'static str)> {
-        if let Some(id) = &self.scry_session {
-            return Some((Agent::ClaudeCode, id, "SCRY_SESSION"));
-        }
-        if let Some(id) = &self.claude_code_session_id {
-            return Some((Agent::ClaudeCode, id, "CLAUDE_CODE_SESSION_ID"));
-        }
-        if let Some(id) = &self.codex_session_id {
-            return Some((Agent::Codex, id, "CODEX_SESSION_ID"));
-        }
-        None
+        self.sessions().into_iter().next()
+    }
+
+    /// Every agent and session id the stamps name, strongest first. A process started by
+    /// one agent inside another's session carries both.
+    pub fn sessions(&self) -> Vec<(Agent, &str, &'static str)> {
+        [
+            (Agent::ClaudeCode, &self.scry_session, "SCRY_SESSION"),
+            (
+                Agent::ClaudeCode,
+                &self.claude_code_session_id,
+                "CLAUDE_CODE_SESSION_ID",
+            ),
+            (Agent::Codex, &self.codex_session_id, "CODEX_SESSION_ID"),
+        ]
+        .into_iter()
+        .filter_map(|(agent, id, key)| Some((agent, id.as_deref()?, key)))
+        .collect()
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Agent {
     ClaudeCode,
     Codex,
+    #[serde(rename = "opencode")]
+    OpenCode,
+    Gemini,
 }
 
 impl Agent {
+    pub const ALL: [Agent; 4] = [
+        Agent::ClaudeCode,
+        Agent::Codex,
+        Agent::OpenCode,
+        Agent::Gemini,
+    ];
+
     pub fn title(self) -> &'static str {
         match self {
             Agent::ClaudeCode => "Claude Code",
             Agent::Codex => "Codex",
+            Agent::OpenCode => "OpenCode",
+            Agent::Gemini => "Gemini CLI",
         }
     }
 
@@ -128,7 +158,14 @@ impl Agent {
         match self {
             Agent::ClaudeCode => "claude",
             Agent::Codex => "codex",
+            Agent::OpenCode => "opencode",
+            Agent::Gemini => "gemini",
         }
+    }
+
+    /// The inverse of [`Agent::short`], for the store and the spool.
+    pub fn from_short(s: &str) -> Option<Agent> {
+        Agent::ALL.into_iter().find(|a| a.short() == s)
     }
 }
 
