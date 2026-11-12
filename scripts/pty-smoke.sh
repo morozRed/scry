@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs the TUI in a real pty (tmux) and checks the terminal comes back cooked after
-# quit, SIGTERM, SIGHUP and Ctrl-Z, then runs scripts/pty-late-reply.py for a terminal
-# that answers the colour query late. Usage: scripts/pty-smoke.sh [path/to/scry]
+# quit, SIGTERM, SIGHUP and Ctrl-Z, then runs scripts/pty-late-reply.py, which plays the
+# terminal on a bare pty: late colour answers, keys typed during the query, a setup that
+# fails and a terminal that stops reading. Usage: scripts/pty-smoke.sh [path/to/scry]
 set -eu
 
 BIN=$(cd "$(dirname "${1:-target/debug/scry}")" && pwd)/$(basename "${1:-target/debug/scry}")

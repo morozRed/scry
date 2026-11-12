@@ -15,19 +15,21 @@ mod views;
 mod tests;
 
 use std::collections::VecDeque;
+use std::io::{self, stdout};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ratatui::DefaultTerminal;
+use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{self, Event, KeyEvent};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::{DefaultTerminal, Terminal};
 use scry_core::view::{Board, Tone};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
@@ -44,6 +46,9 @@ const SIGNAL_GRACE: Duration = Duration::from_secs(1);
 
 /// The signal that asked Scry to stop, or 0.
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
+/// What `enter` changed and `leave` has not put back yet.
+static RAW: AtomicBool = AtomicBool::new(false);
+static ALTERNATE: AtomicBool = AtomicBool::new(false);
 
 pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     let source = fixture.map_or(Source::Live, Source::Fixture);
@@ -52,7 +57,11 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
 
     tty::save();
     watch_signals()?;
-    let mut terminal = tty::change(ratatui::try_init)?;
+    leave_on_panic();
+    // Declared before the terminal, so it is dropped after it.
+    let _restore = Restore;
+    enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     // Asked in raw mode and before the event loop reads a key, so the answer is read here
     // and the question needs no terminal modes of its own.
     let mut answer = tty::Answer::default();
@@ -93,8 +102,51 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
         answer.late,
     );
     exit_on_signal();
-    tty::change(ratatui::restore);
     result
+}
+
+/// Raw mode, then the alternate screen. Each step is recorded once it worked, so when a
+/// later one fails `leave` still undoes the earlier.
+fn enter() -> io::Result<()> {
+    tty::change(enable_raw_mode)?;
+    RAW.store(true, Ordering::Relaxed);
+    execute!(stdout(), EnterAlternateScreen)?;
+    ALTERNATE.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Undoes what `enter` did, each step once, and shows the cursor. Both steps are tried
+/// whatever the other did; the first error is returned.
+fn leave() -> io::Result<()> {
+    let mut result = Ok(());
+    if RAW.swap(false, Ordering::Relaxed) {
+        result = disable_raw_mode();
+    }
+    if ALTERNATE.swap(false, Ordering::Relaxed) {
+        result = result.and(execute!(stdout(), LeaveAlternateScreen, Show));
+    }
+    result
+}
+
+/// Puts the terminal back on every way out of `run`, setup errors included.
+struct Restore;
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        if let Err(e) = leave() {
+            eprintln!("Failed to restore the terminal: {e}");
+        }
+    }
+}
+
+/// Puts the terminal back before a panic message is printed, so it lands on the normal
+/// screen in cooked mode.
+fn leave_on_panic() {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = leave();
+        hook(info);
+    }));
 }
 
 /// After a signal, puts the terminal back and exits with 128 plus its number, as shells
@@ -204,18 +256,10 @@ fn watch_signals() -> Result<()> {
 
 /// Ctrl-Z: give the shell its terminal back, stop, and take it again on `fg`.
 fn suspend(terminal: &mut DefaultTerminal) -> Result<()> {
-    tty::change(|| -> Result<()> {
-        disable_raw_mode()?;
-        execute!(std::io::stdout(), LeaveAlternateScreen, Show)?;
-        Ok(())
-    })?;
+    leave()?;
     // SAFETY: raising a signal at the calling thread has no memory effects.
     unsafe { libc::raise(libc::SIGTSTP) };
-    tty::change(|| -> Result<()> {
-        enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
-        Ok(())
-    })?;
+    enter()?;
     terminal.clear()?;
     Ok(())
 }
