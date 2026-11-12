@@ -13,6 +13,37 @@ that gives agents the same answers is planned.
 > `ports`, `why` and `stop` commands work. Agents, disk and worktrees are being
 > built. See the [roadmap](PLAN.md).
 
+## Screenshots
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/agents-dark-120x40.svg">
+  <img alt="The Agents view: agent sessions as a tree, with leftover processes flagged and the selected one explained" src="docs/screens/agents-light-120x40.svg">
+</picture>
+
+The Agents view groups processes under the agent session that started them and
+flags what a finished session left behind. The pane below the list explains the
+selected row in one sentence, with its evidence.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/ports-dark-120x40.svg">
+  <img alt="The Ports view: every listening port with its process, project, session, age and state" src="docs/screens/ports-light-120x40.svg">
+</picture>
+
+The Ports view lists every listening port on the Mac, yours and the system's.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/sheet-long-dark.svg">
+  <img alt="The reap confirmation sheet listing each process it would stop and the memory it frees" src="docs/screens/sheet-long-light.svg">
+</picture>
+
+Nothing is stopped on one key. Every action opens a sheet that lists each target
+and what it frees.
+
+Scry follows your terminal's light or dark theme. These screens are drawn from a
+synthetic fixture with `cargo run -p scry --example shots`; the Agents, Disk and
+Worktrees views show sample data until those parts are built. The design notes are
+in [docs/design.md](docs/design.md).
+
 ## Requirements
 
 - macOS 14 or later on Apple Silicon
