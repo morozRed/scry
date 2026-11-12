@@ -5,6 +5,7 @@ mod doctor_cmd;
 mod hook;
 mod ports;
 mod reap;
+mod setup;
 mod stop;
 mod worktrees;
 
@@ -37,6 +38,7 @@ enum Command {
     Agents(agents::AgentsArgs),
     Leftovers(agents::LeftoversArgs),
     Watch(agents::WatchArgs),
+    Setup(setup::SetupArgs),
     /// Install or remove the agent hooks that tell Scry when sessions start and end.
     Hook {
         #[command(subcommand)]
@@ -113,6 +115,7 @@ fn main() -> Result<()> {
         Some(Command::Agents(a)) => agents::agents(a),
         Some(Command::Leftovers(a)) => agents::leftovers(a),
         Some(Command::Watch(a)) => agents::watch(a),
+        Some(Command::Setup(a)) => setup::run(a),
         Some(Command::Hook { action }) => hook::run(action),
         Some(Command::Snapshot { out }) => snapshot(out),
         Some(Command::Ports(a)) => ports::ports(a),

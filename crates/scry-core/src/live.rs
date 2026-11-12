@@ -2,6 +2,9 @@
 //! and the lineage built from both. Clients only read: the daemon alone writes sessions and
 //! ancestry, and without it the spool is applied in memory.
 
+use std::collections::VecDeque;
+use std::path::Path;
+
 use anyhow::Result;
 use serde::Serialize;
 
@@ -13,7 +16,10 @@ use crate::model::Snapshot;
 use crate::paths::Paths;
 use crate::spool;
 use crate::store::{SCHEMA_VERSION, Store};
-use crate::view::Board;
+use crate::view::{Board, Pulse};
+
+/// CPU readings the pulse keeps, oldest first: enough for the Overview's graph.
+const CPU_RECENT: usize = 30;
 
 /// Where the lineage's history came from, so a view can say what it is missing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -39,6 +45,8 @@ pub struct Collector {
     paths: Option<Paths>,
     policy: Policy,
     home: Option<Home>,
+    /// The last CPU readings, for the pulse's graph.
+    cpu: VecDeque<u8>,
 }
 
 impl Collector {
@@ -55,6 +63,7 @@ impl Collector {
             policy: policy(paths.as_ref()),
             paths,
             home: Home::from_env(),
+            cpu: VecDeque::with_capacity(CPU_RECENT),
         }
     }
 
@@ -91,6 +100,15 @@ impl Collector {
         if let Some(e) = self.config_error() {
             board.overview.config_unread(e);
         }
+        if let crate::model::Reading::Ready(v) = r.snap.pulse.cpu_percent {
+            if self.cpu.len() == CPU_RECENT {
+                self.cpu.pop_front();
+            }
+            self.cpu.push_back(v.round().clamp(0.0, 100.0) as u8);
+        }
+        let free = crate::disk::space::important(Path::new(crate::daemon::SAMPLED_VOLUME));
+        let recent: Vec<u8> = self.cpu.iter().copied().collect();
+        board.pulse = Some(Pulse::read(&r.snap.pulse, &recent, free));
         Ok(board)
     }
 
@@ -148,5 +166,32 @@ fn policy(paths: Option<&Paths>) -> Policy {
             ..Policy::default()
         },
         None => Policy::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_live_board_carries_the_pulse_and_cpu_once_two_readings_exist() {
+        let mut c = Collector::with_paths(crate::engine::Labels::All, None);
+        let first = c.board().unwrap();
+        let pulse = first.pulse.expect("a live board has a pulse");
+        assert!(pulse.memory.is_some(), "memory pressure reads at once");
+        assert!(pulse.swap_used.is_some());
+        assert!(pulse.disk.is_some_and(|d| d.free > 0));
+        // The tick counters can stand still for a moment under a parallel test run.
+        let mut cpu = None;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cpu = c.board().unwrap().pulse.and_then(|p| p.cpu);
+            if cpu.is_some() {
+                break;
+            }
+        }
+        let cpu = cpu.expect("a second reading has the CPU load");
+        assert!(cpu.now <= 100);
+        assert_eq!(cpu.recent.last(), Some(&cpu.now));
     }
 }

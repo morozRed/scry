@@ -9,7 +9,8 @@ agent sessions, decides which ones are leftovers, and turns all of it into plain
 models. It holds no terminal or UI types. The `scry` crate is the command-line tool and
 terminal UI built on it.
 
-It runs on macOS only. Its API follows the needs of the `scry` binary and is not yet
+It runs on macOS today; Linux support is on the
+[roadmap](https://github.com/morozRed/scry/blob/main/docs/roadmap.md#linux). Its API follows the needs of the `scry` binary and is not yet
 stable. See [docs/architecture.md](https://github.com/morozRed/scry/blob/main/docs/architecture.md)
 for how it works.
 

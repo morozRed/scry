@@ -1792,3 +1792,17 @@ fn an_open_sigkill_sheet_keeps_its_targets_and_origin_whatever_finishes_meanwhil
     let pids: Vec<i32> = kill.targets.iter().map(|t| t.pid).collect();
     assert_eq!(pids, [48213]);
 }
+
+#[test]
+fn the_pulse_takes_the_disk_forecast_from_the_disk_reading() {
+    let mut board = design_board();
+    if let Some(d) = board.pulse.as_mut().and_then(|p| p.disk.as_mut()) {
+        d.full_in_days = None;
+    }
+    board.forecast_pulse();
+    let days = board
+        .pulse
+        .and_then(|p| p.disk)
+        .and_then(|d| d.full_in_days);
+    assert_eq!(days, Some(19), "19.3 days, as Disk says ~19");
+}

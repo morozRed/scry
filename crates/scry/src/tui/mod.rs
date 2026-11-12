@@ -218,10 +218,16 @@ impl Workers {
     }
 }
 
-/// Reads at once, then after each interval or when asked. Asks that arrive during a
-/// reading are answered by the next one.
+/// How soon after the first process reading the second comes. CPU load is the difference
+/// between two readings, so until then the pulse has none.
+const CPU_SETTLE: Duration = Duration::from_secs(1);
+
+/// Reads at once, again after `CPU_SETTLE` so the CPU load has two readings to tell apart,
+/// then after each interval or when asked. Asks that arrive during a reading are answered
+/// by the next one.
 fn read_processes(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, every: Option<Duration>) {
     let mut collector = Collector::new(Labels::All);
+    let mut first = true;
     loop {
         if tx.send(Update::Started).is_err() {
             return;
@@ -233,7 +239,11 @@ fn read_processes(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, every: O
         if tx.send(update).is_err() {
             return;
         }
-        let asked = match every {
+        let wait = match (std::mem::take(&mut first), every) {
+            (true, every) => Some(every.map_or(CPU_SETTLE, |d| d.min(CPU_SETTLE))),
+            (false, every) => every,
+        };
+        let asked = match wait {
             Some(d) => asks
                 .recv_timeout(d)
                 .map_err(|e| e == RecvTimeoutError::Disconnected),
@@ -325,6 +335,8 @@ fn act(req: &Request) -> std::result::Result<Report, String> {
 /// Worktrees and the disk, from the size cache first: the catalog's items at once, the
 /// worktrees once git has read them, then the sizes that changed, walked again.
 fn read_storage(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, s: &Storage) {
+    // Walking folders for their sizes is the heaviest thing Scry does; it gives way.
+    scry_core::sys::yield_to_the_user();
     let cache = SizeCache::open(&s.paths);
     let home = &s.worktrees.home;
     while asks.recv().is_ok() {
@@ -392,6 +404,7 @@ fn run_cleanups(
     home: &Path,
     paths: &Paths,
 ) {
+    scry_core::sys::yield_to_the_user();
     let store = paths
         .ensure_state()
         .and_then(|()| Store::open(&paths.db()))
@@ -646,6 +659,7 @@ fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
         Update::Board(mut board) => {
             board.worktrees = app.board.worktrees.clone();
             board.disk = app.board.disk.clone();
+            board.forecast_pulse();
             let changed = !app.looks_the_same(&board);
             let glow = app.replace_board(*board);
             if changed {
@@ -677,6 +691,7 @@ fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
         Update::Disk(list) => {
             let mut board = app.board.clone();
             board.disk = *list;
+            board.forecast_pulse();
             motion.rows_changed(app.replace_board(board));
             true
         }

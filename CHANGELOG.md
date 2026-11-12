@@ -6,7 +6,24 @@ All notable changes to Scry are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`scry setup`** installs a skill that teaches Claude Code, Codex, OpenCode or Gemini CLI
+  to use Scry's CLI: when to reach for it, which command answers what, and to act only after
+  you agree. Pick agents from a list, name them, or pass `--all`; `--remove` takes it out.
+
+### Fixed
+
+- The pulse never reached a live board, so the Overview's CPU and memory gauges stayed on
+  "warming up" and the header showed process counts. CPU, memory pressure, swap and free
+  disk now show, CPU from the second reading a second after start.
+
 ### Changed
+
+- Folder walks on Disk and Worktrees, cleanups and the background recorder run at macOS's
+  utility priority, so they give way to your own work.
+- Linux support moved from "not planned" to the roadmap, with a plan for each part that
+  reads the machine.
 
 - **A new look for the terminal UI**, after ghui and disktree. One header line with the
   views and the pulse; lists without column titles, the state as a glyph in a gutter; the

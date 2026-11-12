@@ -56,7 +56,7 @@ impl Tab {
 /// and a recorded one is a design fixture (`scry tui --fixture fixtures/design.json`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Board {
-    /// `None` until the pulse collector exists.
+    /// The machine's load, from a live reading; `None` for one built from a snapshot alone.
     #[serde(default)]
     pub pulse: Option<Pulse>,
     pub overview: Overview,
@@ -114,6 +114,19 @@ impl Board {
             agents: Load::Ready(agents),
             worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
             disk: Load::Unavailable("A process snapshot holds no disk reading.".into()),
+        }
+    }
+
+    /// Copies the disk reading's forecast into the pulse, which a process reading cannot
+    /// know: the disk is read on its own. Days round as the Disk view writes them ("~19").
+    pub fn forecast_pulse(&mut self) {
+        use crate::disk::forecast::Forecast;
+        let days = match self.disk.ready().and_then(|d| d.forecast.as_ref()) {
+            Some(Forecast::FullIn { days, .. }) => Some(days.round().max(1.0) as u32),
+            _ => None,
+        };
+        if let Some(disk) = self.pulse.as_mut().and_then(|p| p.disk.as_mut()) {
+            disk.full_in_days = days;
         }
     }
 
@@ -308,6 +321,38 @@ pub struct Pulse {
     pub memory: Option<Pressure>,
     pub swap_used: Option<u64>,
     pub disk: Option<DiskFree>,
+}
+
+impl Pulse {
+    /// The header's pulse from the sampler's reading: CPU now and the `recent` readings
+    /// before it (oldest first, this one last), memory pressure, swap in use and the free
+    /// space Finder shows. Each is `None` while it has no value yet.
+    pub fn read(p: &crate::model::Pulse, recent: &[u8], disk_free: Option<u64>) -> Pulse {
+        use crate::model::{MemoryPressure, Reading};
+        Pulse {
+            cpu: match &p.cpu_percent {
+                Reading::Ready(v) => Some(Cpu {
+                    now: v.round().clamp(0.0, 100.0) as u8,
+                    recent: recent.to_vec(),
+                }),
+                _ => None,
+            },
+            memory: match &p.memory {
+                Reading::Ready(MemoryPressure::Normal) => Some(Pressure::Normal),
+                Reading::Ready(MemoryPressure::Warn) => Some(Pressure::Warn),
+                Reading::Ready(MemoryPressure::Critical) => Some(Pressure::Critical),
+                _ => None,
+            },
+            swap_used: match &p.swap {
+                Reading::Ready(s) => Some(s.used),
+                _ => None,
+            },
+            disk: disk_free.map(|free| DiskFree {
+                free,
+                full_in_days: None,
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
