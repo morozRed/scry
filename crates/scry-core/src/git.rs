@@ -396,6 +396,31 @@ pub fn parse_stashes(z: &str) -> Vec<Stash> {
         .collect()
 }
 
+/// The arguments that list every entry of one config file for `parse_config`, one per NUL.
+/// `include.path` and `includeIf` are listed as keys, not followed.
+pub fn config_list_args(file: &Path) -> [&OsStr; 6] {
+    [
+        "config".as_ref(),
+        "--file".as_ref(),
+        file.as_os_str(),
+        "--no-includes".as_ref(),
+        "--list".as_ref(),
+        "-z".as_ref(),
+    ]
+}
+
+/// Parses the output of `config_list_args`: `<key>\n<value>` per entry, or `<key>` alone for
+/// a key written without `=`. git prints section and variable names in lowercase.
+pub fn parse_config(z: &str) -> Vec<(String, Option<String>)> {
+    z.split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| match entry.split_once('\n') {
+            Some((key, value)) => (key.to_string(), Some(value.to_string())),
+            None => (entry.to_string(), None),
+        })
+        .collect()
+}
+
 /// The target of a `.git` file, `gitdir: <path>`, relative to the file's folder unless
 /// absolute. Like git, only line endings are trimmed, so a path may hold any other byte. A
 /// symlink in place of the file is not followed.
@@ -519,6 +544,33 @@ mod tests {
         );
         assert!(parse_index("H 100644\tx\0").is_err());
         assert_eq!(parse_index("").unwrap(), IndexFlags::default());
+    }
+
+    #[test]
+    fn lists_a_config_file_with_bare_keys_and_values_holding_newlines() {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("config.worktree");
+        std::fs::write(
+            &file,
+            "[core]\n\tuntrackedCache = true\n\tbare\n[Codex \"Sub\"]\n\tNote = \"a\\nb\"\n\
+             [include]\n\tpath = /elsewhere\n",
+        )
+        .unwrap();
+        let out = stdout(
+            Path::new("/"),
+            &config_list_args(&file),
+            Duration::from_secs(5),
+        );
+        assert_eq!(
+            parse_config(&out.unwrap()),
+            [
+                ("core.untrackedcache".into(), Some("true".into())),
+                ("core.bare".into(), None),
+                ("codex.Sub.note".into(), Some("a\nb".into())),
+                ("include.path".into(), Some("/elsewhere".into())),
+            ]
+        );
+        assert_eq!(parse_config(""), []);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use super::{Changes, Concern, GitFacts, Lock, Merge, ReposInside, Upstream, Work
 /// - no index entry is flagged assume-unchanged or skip-worktree;
 /// - no submodule is checked out in it, and no other worktree or repository sits inside it,
 ///   by a walk that read every entry;
-/// - its record holds only git's standard files;
+/// - its record holds only git's standard files and known agent bookkeeping;
 /// - a detached HEAD is held by a local branch or tag.
 ///
 /// Ignored files are not checked.
@@ -79,8 +79,9 @@ impl Safe {
 }
 
 /// Proof that pruning a worktree's record loses nothing: its folder is gone and no folder
-/// links back to the record, it is not locked, the record holds only git's standard files,
-/// and its HEAD is a branch, which pruning keeps, or a commit some other ref holds.
+/// links back to the record, it is not locked, the record holds only git's standard files and
+/// known agent bookkeeping, and its HEAD is a branch, which pruning keeps, or a commit some
+/// other ref holds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Prunable {
     branch_only: Option<u32>,

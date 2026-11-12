@@ -429,7 +429,8 @@ fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
             out.push(
                 "nothing to lose: a valid, unlocked worktree; git status lists nothing and \
                  nothing is hidden from it; no submodule, worktree or repository sits inside \
-                 it; its record holds only git's standard files. Ignored files are not checked"
+                 it; its record holds only git's standard files and known agent bookkeeping. \
+                 Ignored files are not checked"
                     .into(),
             );
             let finished = safe.finished();
@@ -500,7 +501,9 @@ fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
             let why: Vec<String> = w.creator.evidence.iter().map(|e| e.describe()).collect();
             format!("probably made by {}: {}", agent.label(), why.join("; "))
         }
-        None => "made by an unknown tool: no agent's path or lock reason matched".into(),
+        None => {
+            "made by an unknown tool: no agent's record file, path or lock reason matched".into()
+        }
     });
     if let Some(s) = &w.size {
         match &s.error {

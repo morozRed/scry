@@ -258,7 +258,7 @@ fn what_removing_a_folder_would_destroy_keeps_it_from_can_go() {
             (
                 "record-config",
                 "needs a look",
-                "also holds config.worktree and hooks",
+                "also holds config.worktree (scry.onlycopy) and hooks",
             ),
             ("worktree-ref", "needs a look", "also holds refs"),
             ("rebasing", "needs a look", "rebase-merge"),
@@ -298,6 +298,170 @@ fn what_removing_a_folder_would_destroy_keeps_it_from_can_go() {
             ),
         ],
     );
+}
+
+/// What Claude Code, the Claude desktop app and Codex write into the records of worktrees
+/// they make, as found on a real machine.
+const AGENT_FILES: [(&str, &str); 5] = [
+    ("CLAUDE_BASE", "0123456789abcdef0123456789abcdef01234567\n"),
+    ("claude-desktop-worktree", ""),
+    (
+        "codex-thread.json",
+        "{\"version\":1,\"ownerThreadId\":\"00000000-0000-0000-0000-000000000000\"}",
+    ),
+    (
+        "codex-synced-branch.json",
+        "{\"branch\":\"refs/heads/task\",\"lastSyncedTreeRef\":\"0123abcd\"}\n",
+    ),
+    ("preview-slot", "1\n"),
+];
+
+#[test]
+fn known_agent_files_in_a_record_keep_neither_can_go_nor_can_prune_away() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let code = home.join("code");
+    let repo = code.join("app");
+    app(&base, &repo);
+    let admin = |name: &str| repo.join(".git/worktrees").join(name);
+
+    // Each file alone, in a merged, clean worktree outside any agent's path layout.
+    let mut cases = Vec::new();
+    for (i, (file, text)) in AGENT_FILES.iter().enumerate() {
+        let name = format!("agent-file-{i}");
+        add(&repo, &name, &name);
+        write(&admin(&name).join(file), text);
+        cases.push((name, *file));
+    }
+    // Registered, folder gone, with two of them beside git's own files.
+    let gone = add(&repo, "agent-files-gone", "agent-files-gone");
+    write(
+        &admin("agent-files-gone").join("claude-desktop-worktree"),
+        "",
+    );
+    write(&admin("agent-files-gone").join("preview-slot"), "2\n");
+    fs::remove_dir_all(&gone).unwrap();
+    // A file no reviewed agent writes still needs a look, beside a known one or alone, and so
+    // does a folder that takes a known file's name.
+    add(&repo, "unknown-beside", "unknown-beside");
+    write(&admin("unknown-beside").join("CLAUDE_BASE"), "0123abcd\n");
+    write(&admin("unknown-beside").join("tool-state.json"), "{}\n");
+    let unknown_gone = add(&repo, "unknown-gone", "unknown-gone");
+    write(&admin("unknown-gone").join("tool-state.json"), "{}\n");
+    fs::remove_dir_all(&unknown_gone).unwrap();
+    add(&repo, "folder-named-like-one", "folder-named-like-one");
+    write(
+        &admin("folder-named-like-one").join("CLAUDE_BASE/notes.txt"),
+        "work\n",
+    );
+
+    let v = view(&home);
+    let mut want: Vec<(&str, &str, &str)> = cases
+        .iter()
+        .map(|(name, _)| (name.as_str(), "can go", "as of the last fetch"))
+        .collect();
+    want.extend([
+        ("agent-files-gone", "can prune", "the folder does not exist"),
+        (
+            "unknown-beside",
+            "needs a look",
+            "its record in the repo's git folder also holds tool-state.json.",
+        ),
+        ("unknown-gone", "needs a look", "also holds tool-state.json"),
+        (
+            "folder-named-like-one",
+            "needs a look",
+            "its record in the repo's git folder also holds CLAUDE_BASE.",
+        ),
+    ]);
+    expect(&v, &want);
+
+    // A file only one agent writes names it, though the path follows no agent's layout.
+    for (name, file) in &cases {
+        let r = row(&v, name);
+        let creator = match *file {
+            "CLAUDE_BASE" | "claude-desktop-worktree" => "Claude Code",
+            "codex-thread.json" | "codex-synced-branch.json" => "Codex",
+            _ => "unknown",
+        };
+        assert_eq!(r.creator, creator, "{file}: {:?}", r.evidence);
+        if creator != "unknown" {
+            let line = format!("probably made by {creator}: record file {file}");
+            assert!(says(r, &line), "{file}: {:?}", r.evidence);
+        }
+    }
+}
+
+#[test]
+fn config_worktree_passes_only_with_keys_agents_are_known_to_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let code = home.join("code");
+    let repo = code.join("app");
+    app(&base, &repo);
+    let set = |wt: &Path, key: &str, value: &str| {
+        git(wt, &["config", "--worktree", key, value]);
+    };
+
+    // What the Claude desktop app and Codex set, with `core.worktree` naming the folder.
+    let allowed = add(&repo, "config-allowed", "config-allowed");
+    set(&allowed, "core.untrackedCache", "true");
+    set(&allowed, "core.fsmonitor", "false");
+    set(
+        &allowed,
+        "codex.localEnvironmentConfigPath",
+        "/opt/env.toml",
+    );
+    set(&allowed, "core.worktree", s(&allowed));
+    // git reads a relative `core.worktree` from the record's folder.
+    let relative = add(&repo, "config-relative", "config-relative");
+    set(&relative, "core.worktree", "../../../../config-relative");
+
+    // A hook path beside an allowed key, an identity, and a work tree aimed elsewhere.
+    let hooks = add(&repo, "config-hooks", "config-hooks");
+    set(&hooks, "core.untrackedCache", "true");
+    set(&hooks, "core.hooksPath", "/opt/private-hooks");
+    let email = add(&repo, "config-email", "config-email");
+    set(&email, "user.email", "someone@example.com");
+    let elsewhere = add(&repo, "config-elsewhere", "config-elsewhere");
+    let other = base.join("other-folder");
+    fs::create_dir_all(&other).unwrap();
+    set(&elsewhere, "core.worktree", s(&other));
+
+    let v = view(&home);
+    expect(
+        &v,
+        &[
+            ("config-allowed", "can go", "as of the last fetch"),
+            ("config-relative", "can go", "as of the last fetch"),
+            (
+                "config-hooks",
+                "needs a look",
+                "also holds config.worktree (core.hookspath).",
+            ),
+            (
+                "config-email",
+                "needs a look",
+                "also holds config.worktree (user.email).",
+            ),
+            (
+                "config-elsewhere",
+                "needs a look",
+                "also holds config.worktree (core.worktree).",
+            ),
+        ],
+    );
+    // Key names are evidence; values stay out of it.
+    for (name, value) in [
+        ("config-hooks", "private-hooks"),
+        ("config-email", "example.com"),
+        ("config-elsewhere", "other-folder"),
+    ] {
+        let r = row(&v, name);
+        assert!(!says(r, value), "{name} shows {value:?}: {r:?}");
+    }
 }
 
 #[test]

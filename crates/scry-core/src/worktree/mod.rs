@@ -6,8 +6,9 @@
 //! - **Loss: what does removing the folder destroy?** Working files and the worktree's own git
 //!   state. Scry checks that `git status` lists nothing, that no file is hidden from it, that
 //!   no submodule, other worktree or repository sits inside, that the worktree's record holds
-//!   only git's standard files, that a detached HEAD is held by a local branch or tag, and
-//!   that it is not locked. Ignored files are not checked: a local `.env` goes with the folder.
+//!   only git's standard files and the bookkeeping files agents are known to write there,
+//!   that a detached HEAD is held by a local branch or tag, and that it is not locked. Ignored
+//!   files are not checked: a local `.env` goes with the folder.
 //! - **Finished: is its work done?** Asked only when nothing is lost: HEAD is in the default
 //!   branch or on its upstream, as of the repo's last fetch. Scry never fetches.
 //!
@@ -28,7 +29,7 @@ use serde::Serialize;
 
 use crate::size::SubtreeSize;
 
-pub use creator::{Agent, CreatorEvidence, CreatorSource, ProbableCreator};
+pub use creator::{Agent, Clues, CreatorEvidence, CreatorSource, ProbableCreator};
 pub use discover::{ScanOptions, measure, scan};
 pub use verdict::{Finished, KeptBy, NothingLost, Prunable, Safe};
 
@@ -167,8 +168,10 @@ pub struct PerWorktree {
     pub worktrees_inside: Vec<PathBuf>,
     /// Folders inside it with a `.git` of their own, from the size walk.
     pub repos_inside: ReposInside,
-    /// Entries in its record under `.git/worktrees` beyond git's standard files, such as
-    /// `config.worktree`, `hooks`, `refs` or `rebase-merge`.
+    /// Entries in its record under `.git/worktrees` beyond git's standard files and known
+    /// agent bookkeeping, such as `hooks`, `refs` or `rebase-merge`. A `config.worktree`
+    /// counts when it sets a key agents are not known to set, and is named with those keys:
+    /// `config.worktree (core.hookspath)`.
     pub record_extras: Vec<String>,
     /// Commits at a detached HEAD that no local branch or tag holds. HEAD goes with the
     /// worktree, and with it the only ref to them.
@@ -272,7 +275,7 @@ pub enum Concern {
     Unread {
         entries: u64,
     },
-    /// Files in its record beyond git's standard ones.
+    /// Files in its record beyond git's standard ones and known agent bookkeeping.
     RecordExtras {
         names: Vec<String>,
     },

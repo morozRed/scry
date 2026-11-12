@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use super::creator::{self, CreatorSource};
+use super::creator::{self, Agent, Clues, CreatorSource};
 use super::verdict::{Reading, judge};
 use super::{
     Changes, GitFacts, Head, Lock, Merge, NotRead, PerWorktree, ReposInside, Timings, Upstream,
@@ -192,8 +192,13 @@ pub fn scan(opts: &ScanOptions) -> WorktreeScan {
             ),
             Link::Worktree { .. } | Link::Repo { .. } => continue,
         };
+        let clues = Clues {
+            path: &dir,
+            lock_reason: None,
+            record_files: &[],
+        };
         worktrees.push(Worktree {
-            creator: creator::attribute(&opts.creators, &dir, None),
+            creator: creator::attribute(&opts.creators, &clues),
             path: dir,
             repo,
             head: Head::Unknown,
@@ -392,8 +397,12 @@ struct Record {
     head: RecordHead,
     lock: Option<Lock>,
     created_at: Option<i64>,
-    /// Entries beyond git's standard files, which pruning or removal would destroy.
+    /// Entries beyond git's standard files and known agent bookkeeping, which pruning or
+    /// removal would destroy. A `config.worktree` with keys beyond `CONFIG_KEYS` is named with
+    /// those keys.
     extras: Vec<String>,
+    /// Files from `AGENT_FILES` that it holds.
+    agent_files: Vec<&'static AgentFile>,
     /// Entries that are symlinks. git would follow one wherever it leads, so it is not run.
     symlinks: Vec<String>,
 }
@@ -426,7 +435,7 @@ fn read_repo(common: &Path, guard: &Protected, timeout: Duration) -> Repo {
         error: None,
         warnings: Vec::new(),
     };
-    read_records(&mut repo, guard);
+    read_records(&mut repo, guard, timeout);
     // Without a record there is nothing to ask git about.
     if repo.records.is_empty() {
         return repo;
@@ -452,7 +461,8 @@ fn read_repo(common: &Path, guard: &Protected, timeout: Duration) -> Repo {
 
 /// Files git keeps in a worktree's record as a matter of course, `AUTO_MERGE` and `ORIG_HEAD`
 /// being what its last merge or reset left. Anything else is the worktree's own state, such
-/// as its config, hooks or refs, an operation in progress, or a file another tool put there.
+/// as its config, hooks or refs, an operation in progress, or a file another tool put there,
+/// unless `AGENT_FILES` or `CONFIG_KEYS` clears it.
 const RECORD_FILES: [&str; 10] = [
     "AUTO_MERGE",
     "COMMIT_EDITMSG",
@@ -466,7 +476,56 @@ const RECORD_FILES: [&str; 10] = [
     "logs",
 ];
 
-fn read_records(repo: &mut Repo, guard: &Protected) {
+/// A file an agent writes into a worktree's record for its own bookkeeping.
+struct AgentFile {
+    name: &'static str,
+    /// The agent that writes it, when no other agent does.
+    agent: Option<Agent>,
+}
+
+/// Files that agents write into a worktree's record, each reviewed for what it holds: how
+/// the agent made or tracks the worktree, never the user's work. They are not git's, so they
+/// are kept apart from `RECORD_FILES`, but removing or pruning a worktree loses nothing Scry
+/// checks by destroying them. One that only one agent writes names the worktree's probable
+/// creator. Only a regular file counts. Add a name here only after reading what agents put
+/// in it; an unknown file keeps a worktree at "needs a look".
+static AGENT_FILES: [AgentFile; 5] = [
+    // The commit a Claude Code agent's worktree started from.
+    AgentFile {
+        name: "CLAUDE_BASE",
+        agent: Some(Agent::ClaudeCode),
+    },
+    // An empty marker on the worktrees the Claude desktop app makes for Claude Code.
+    AgentFile {
+        name: "claude-desktop-worktree",
+        agent: Some(Agent::ClaudeCode),
+    },
+    // The Codex thread that owns the worktree.
+    AgentFile {
+        name: "codex-thread.json",
+        agent: Some(Agent::Codex),
+    },
+    // The branch Codex last synced the worktree with, and the tree it synced.
+    AgentFile {
+        name: "codex-synced-branch.json",
+        agent: Some(Agent::Codex),
+    },
+    // A preview slot number. It sits beside both agents' files, so it names neither.
+    AgentFile {
+        name: "preview-slot",
+        agent: None,
+    },
+];
+
+/// Keys an agent sets in a worktree's `config.worktree` that hold no work: git's untracked
+/// cache and file system monitor switches, and Codex's own settings. Any other key, such as a
+/// hook path or an identity, is the worktree's own config, which removing it destroys.
+/// `core.worktree` passes when it names the worktree's own folder, as agents set it; aimed
+/// anywhere else it sends git to another folder.
+const CONFIG_KEYS: [&str; 2] = ["core.untrackedcache", "core.fsmonitor"];
+const CONFIG_SECTIONS: [&str; 1] = ["codex."];
+
+fn read_records(repo: &mut Repo, guard: &Protected, timeout: Duration) {
     let fetched = |dir: &Path| mtime(&dir.join("FETCH_HEAD"));
     repo.fetched_at = fetched(&repo.common);
     let dir = match guard.resolve(&repo.common.join("worktrees")) {
@@ -533,6 +592,7 @@ fn read_records(repo: &mut Repo, guard: &Protected) {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
         let mut extras = Vec::new();
+        let mut agent_files = Vec::new();
         let mut symlinks = Vec::new();
         for e in fs::read_dir(&admin).into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -540,17 +600,33 @@ fn read_records(repo: &mut Repo, guard: &Protected) {
             if kind.as_ref().is_ok_and(|t| t.is_symlink()) {
                 symlinks.push(name.clone());
             }
-            let standard =
-                RECORD_FILES.contains(&name.as_str()) || name.starts_with("sharedindex.");
+            if RECORD_FILES.contains(&name.as_str()) || name.starts_with("sharedindex.") {
+                continue;
+            }
+            // The entry's own type: a symlink is not a file here.
+            let file = kind.as_ref().is_ok_and(|t| t.is_file());
+            if let Some(known) = AGENT_FILES.iter().find(|f| f.name == name).filter(|_| file) {
+                agent_files.push(known);
+                continue;
+            }
+            if file && name == "config.worktree" {
+                match config_extras(&e.path(), &admin, &path, guard, timeout) {
+                    Ok(keys) if keys.is_empty() => {}
+                    Ok(keys) => extras.push(format!("{name} ({})", keys.join(", "))),
+                    Err(_) => extras.push(name),
+                }
+                continue;
+            }
             let holds = match kind {
                 Ok(t) if t.is_dir() => holds_files(&e.path(), guard, 0),
                 _ => true,
             };
-            if !standard && holds {
+            if holds {
                 extras.push(name);
             }
         }
         extras.sort();
+        agent_files.sort_by_key(|f| f.name);
         symlinks.sort();
         repo.records.push(Record {
             head: read_head(&admin.join("HEAD")),
@@ -559,6 +635,7 @@ fn read_records(repo: &mut Repo, guard: &Protected) {
             lock,
             created_at,
             extras,
+            agent_files,
             symlinks,
         });
     }
@@ -581,6 +658,43 @@ fn holds_files(dir: &Path, guard: &Protected, depth: usize) -> bool {
         }
         _ => true,
     })
+}
+
+/// The keys in a record's `config.worktree` that `CONFIG_KEYS` does not clear, as git names
+/// them, without their values. git parses the file from `/`, so no repository's config is
+/// read with it. The caller has checked that the entry is a regular file, not a symlink that
+/// git would follow.
+fn config_extras(
+    file: &Path,
+    admin: &Path,
+    path: &RecordPath,
+    guard: &Protected,
+    timeout: Duration,
+) -> anyhow::Result<Vec<String>> {
+    let out = git::stdout(Path::new("/"), &git::config_list_args(file), timeout)?;
+    // git reads a relative `core.worktree` from the record's folder.
+    let own_folder = |value: &str| match path {
+        RecordPath::Folder(folder) => {
+            match (guard.resolve(&admin.join(value)), guard.resolve(folder)) {
+                (Resolved::Outside(a), Resolved::Outside(b)) => a == b,
+                _ => false,
+            }
+        }
+        RecordPath::Absent | RecordPath::Unreadable(_) => false,
+    };
+    let cleared = |key: &str, value: Option<&str>| {
+        CONFIG_KEYS.contains(&key)
+            || CONFIG_SECTIONS.iter().any(|s| key.starts_with(s))
+            || (key == "core.worktree" && value.is_some_and(own_folder))
+    };
+    let mut keys: Vec<String> = git::parse_config(&out)
+        .into_iter()
+        .filter(|(key, value)| !cleared(key, value.as_deref()))
+        .map(|(key, _)| key)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 
 fn mtime(file: &Path) -> Option<i64> {
@@ -1085,8 +1199,18 @@ fn worktree(
             (path, head, state)
         }
     };
+    let signed: Vec<(&str, Agent)> = rec
+        .agent_files
+        .iter()
+        .filter_map(|f| Some((f.name, f.agent?)))
+        .collect();
+    let clues = Clues {
+        path: &path,
+        lock_reason: lock.and_then(|l| l.reason.as_deref()),
+        record_files: &signed,
+    };
     Worktree {
-        creator: creator::attribute(ctx.creators, &path, lock.and_then(|l| l.reason.as_deref())),
+        creator: creator::attribute(ctx.creators, &clues),
         path,
         repo: repo.shown_as.clone(),
         head,
