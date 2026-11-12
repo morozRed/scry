@@ -165,7 +165,7 @@ impl Workers {
     /// `opened` says the view was just switched to.
     fn worktrees_due(&self, app: &App, opened: bool, now: Instant) -> bool {
         app.tab == Tab::Worktrees
-            && !app.fresh.worktrees
+            && app.fresh.worktrees.is_none()
             && match app.fresh.worktrees_at {
                 None => true,
                 Some(t) => {
@@ -329,8 +329,8 @@ fn event_loop(
                     Some(w) => {
                         app.fresh.asked = true;
                         let _ = w.now.send(());
-                        if app.tab == Tab::Worktrees && !app.fresh.worktrees {
-                            app.fresh.worktrees = true;
+                        if app.tab == Tab::Worktrees && app.fresh.worktrees.is_none() {
+                            app.fresh.worktrees = Some(now);
                             let _ = w.worktrees.send(());
                         }
                     }
@@ -353,15 +353,15 @@ fn event_loop(
         if let Some(w) = workers
             && w.worktrees_due(app, app.tab != tab, now)
         {
-            app.fresh.worktrees = true;
+            app.fresh.worktrees = Some(now);
             let _ = w.worktrees.send(());
         }
-        let says = app.freshness(now);
-        if says != said {
+        let says = app.activity(now);
+        if Some(&says) != said.as_ref() {
             dirty = true;
         }
         if dirty || motion.running() {
-            said = says;
+            said = Some(says);
             terminal.draw(|f| {
                 let painted = ui::draw(f, app);
                 motion.apply(f.buffer_mut(), &painted);
@@ -372,7 +372,7 @@ fn event_loop(
             FRAME
         } else {
             let toast = app.toast.as_ref().map(|t| t.until);
-            [toast, app.freshness_due()]
+            [toast, app.activity_due(now)]
                 .into_iter()
                 .flatten()
                 .map(|at| at.saturating_duration_since(now))
@@ -394,8 +394,9 @@ fn event_loop(
 }
 
 /// Takes in what a reader sent, and says whether the screen changed beyond the header's
-/// word on freshness, which the loop compares on its own. A process board keeps the
-/// worktrees the app already has, since those come from their own reader.
+/// spinner, which the loop compares on its own. A board that changes nothing on screen,
+/// such as ages that still round to the same text, draws nothing. A process board keeps
+/// the worktrees the app already has, since those come from their own reader.
 fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
     let now = Instant::now();
     match update {
@@ -405,21 +406,22 @@ fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
         }
         Update::Board(mut board) => {
             board.worktrees = app.board.worktrees.clone();
-            let changed = *board != app.board;
+            let changed = !app.looks_the_same(&board);
+            let glow = app.replace_board(*board);
             if changed {
-                motion.rows_changed(app.replace_board(*board));
+                motion.rows_changed(glow);
             }
-            finish_scan(app, now, None) || changed
+            finish_scan(app, None) || changed
         }
         Update::Failed(why) => {
             if app.board.ports == Load::Loading {
                 app.board.ports = Load::Failed(why.clone());
             }
-            finish_scan(app, now, Some(why))
+            finish_scan(app, Some(why))
         }
         Update::Worktrees(list) => {
             if list.ready().is_none_or(|l| !l.sizing) {
-                app.fresh.worktrees = false;
+                app.fresh.worktrees = None;
                 app.fresh.worktrees_at = Some(now);
             }
             let mut board = app.board.clone();
@@ -431,13 +433,12 @@ fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
 }
 
 /// Ends a process scan; a toast follows one that `r` asked for, or one that failed.
-fn finish_scan(app: &mut App, now: Instant, failed: Option<String>) -> bool {
+fn finish_scan(app: &mut App, failed: Option<String>) -> bool {
     let f = &mut app.fresh;
     f.scanning = None;
     let asked = std::mem::take(&mut f.asked);
     match failed {
         None => {
-            f.updated = Some(now);
             if asked {
                 app.notify_for("Refreshed.", Tone::Ok, REFRESHED_FOR);
             }

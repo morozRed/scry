@@ -161,7 +161,7 @@ Components ask the theme for a role, never for a colour. A look is one construct
 | Token | Used for |
 |---|---|
 | `text`, `strong` | Body text; titles, session names and command names |
-| `muted` | Labels, context, evidence words, fold counts, the data source, the sparkline |
+| `muted` | Labels, context, evidence words, fold counts, the fixture name or refresh spinner, the sparkline |
 | `faint` | Tree guides, separators and whatever an overlay covers: nothing you need to read |
 | `accent` | The name, the sort arrow |
 | `heading` | Column titles |
@@ -268,18 +268,27 @@ an effect runs, every 16 ms; then it goes back to waiting for input.
 ### Refresh
 
 Live data comes from two readers off the UI thread. Process snapshots, which carry the
-ports, are read at start and then every `[tui] refresh_secs` (2 s by default, 1 to 60, 0
+ports, are read at start and then every `[tui] refresh_secs` (5 s by default, 1 to 60, 0
 for only on `r`). Worktrees are read when their view opens: git state first, then the
 sizes, which take seconds, so the list shows at once with `…` in SIZE and the header says
 "measuring sizes…". Sizing is costly (15 s and 38 s of CPU across cores for 1.6 million
 entries on the reference Mac), so worktrees are never read on a timer: coming back to the
-view reads them again when the last reading is over 10 minutes old, and the header gives
-the age of that reading. `r`
-asks for a process reading at once, and on the Worktrees view for a worktree reading too;
-the footer says "Refreshed." when it lands. The header's right end says how fresh the data
-is, such as "updated 3s ago", or "refreshing…" for a reading `r` asked for or one that has
-taken over 300 ms, so a quick automatic one never flickers. The loop draws when that word
-changes, not on a clock.
+view reads them again when the last reading is over 10 minutes old. `r` asks for a process
+reading at once, and on the Worktrees view for a worktree reading too; the footer says
+"Refreshed." when it lands.
+
+The header shows no clock. Its right end is empty while nothing is read, and holds a muted
+braille spinner (`⠋⠙⠹…`, 10 frames a second) while a reading the view waits on is in
+flight: one that `r` asked for at once, an automatic one only after 300 ms, so a quick
+refresh (about 70 ms on the reference Mac) never blinks. A reading past one second says
+what it is doing beside the spinner: "refreshing…", or on the Worktrees view
+"reading worktrees…" and "measuring sizes…". A fixture shows its name there instead.
+
+A reading that changes nothing on screen draws nothing. A new board is compared with the
+old by what the view shows, the header pulse, the tab counts and each row's text and
+detail, not by the numbers under them, so ages advance when their text does ("41m" to
+"42m") rather than on every refresh, and nothing glows. The loop draws when something
+shown changed, when the spinner turns, or while an effect runs, not on a clock.
 
 ## Data shapes
 

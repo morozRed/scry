@@ -189,7 +189,7 @@ keep = ["postgres"]                   # processes no cleanup rule ever selects
 sample_interval_secs = 600            # how often the daemon samples disk space
 
 [tui]
-refresh_secs = 2                      # 1 to 60 seconds between live refreshes; 0 only on r
+refresh_secs = 5                      # 1 to 60 seconds between live refreshes; 0 only on r
 ```
 
 Without the file, `code_roots` is whichever of `~/sources`, `~/code`, `~/src` and
