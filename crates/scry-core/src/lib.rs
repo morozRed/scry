@@ -7,14 +7,18 @@ pub mod daemon_log;
 pub mod doctor;
 pub mod engine;
 pub mod fixture;
+pub mod git;
 pub mod home;
 pub mod label;
 pub mod launch_agent;
 pub mod model;
 pub mod paths;
 pub mod project;
+pub mod protected;
+pub mod size;
 pub mod store;
 pub mod sys;
 pub mod view;
+pub mod worktree;
 
 pub use model::{ProcId, Process, Snapshot};

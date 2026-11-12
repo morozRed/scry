@@ -1460,6 +1460,7 @@ dependencies = [
  "ratatui",
  "rusqlite",
  "scry-core",
+ "serde",
  "serde_json",
  "signal-hook",
  "tachyonfx",
