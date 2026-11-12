@@ -1,5 +1,7 @@
+mod agents;
 mod daemon_cmd;
 mod doctor_cmd;
+mod hook;
 mod ports;
 mod stop;
 mod worktrees;
@@ -12,8 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use scry_core::view::Overview;
-use scry_core::{Snapshot, fixture, sys};
+use scry_core::{fixture, sys};
 
 #[derive(Parser)]
 #[command(name = "scry", version, about = "See what your agents left running")]
@@ -30,14 +31,14 @@ enum Command {
         #[arg(long)]
         fixture: Option<PathBuf>,
     },
-    /// Print what needs attention and exit.
-    Overview {
-        /// Print JSON instead of text.
-        #[arg(long)]
-        json: bool,
-        /// Read a recorded snapshot instead of this machine.
-        #[arg(long)]
-        fixture: Option<PathBuf>,
+    Overview(agents::OverviewArgs),
+    Agents(agents::AgentsArgs),
+    Leftovers(agents::LeftoversArgs),
+    Watch(agents::WatchArgs),
+    /// Install or remove the agent hooks that tell Scry when sessions start and end.
+    Hook {
+        #[command(subcommand)]
+        action: hook::Action,
     },
     /// Write a redacted snapshot of this machine as JSON.
     Snapshot {
@@ -94,14 +95,18 @@ fn main() -> Result<()> {
     raise_fd_limit();
     match cli.command {
         None if std::io::stdout().is_terminal() => tui::run(None),
-        None => print_overview(&load(None)?, false),
+        None => agents::overview(Default::default()),
         Some(Command::Tui { fixture }) => {
             if !std::io::stdout().is_terminal() {
                 bail!("scry tui needs a terminal. Use `scry overview` for plain output.");
             }
             tui::run(fixture)
         }
-        Some(Command::Overview { json, fixture }) => print_overview(&load(fixture)?, json),
+        Some(Command::Overview(a)) => agents::overview(a),
+        Some(Command::Agents(a)) => agents::agents(a),
+        Some(Command::Leftovers(a)) => agents::leftovers(a),
+        Some(Command::Watch(a)) => agents::watch(a),
+        Some(Command::Hook { action }) => hook::run(action),
         Some(Command::Snapshot { out }) => snapshot(out),
         Some(Command::Ports(a)) => ports::ports(a),
         Some(Command::Why(a)) => ports::why(a),
@@ -135,24 +140,6 @@ fn raise_fd_limit() {
         r.rlim_cur = want;
         unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
     }
-}
-
-pub(crate) fn load(fixture: Option<PathBuf>) -> Result<Snapshot> {
-    match fixture {
-        Some(path) => fixture::load(&path),
-        None => sys::scan(),
-    }
-}
-
-fn print_overview(snap: &Snapshot, json: bool) -> Result<()> {
-    let o = Overview::from_snapshot(snap);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&o)?);
-    } else {
-        println!("{}", o.headline());
-        println!("{}.", o.counts_line());
-    }
-    Ok(())
 }
 
 fn snapshot(out: Option<PathBuf>) -> Result<()> {

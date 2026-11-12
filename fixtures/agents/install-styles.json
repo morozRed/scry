@@ -1,0 +1,200 @@
+[
+  {
+    "style": "Claude Code native installer, interactive in a terminal",
+    "exe": "/Users/dev/.local/share/claude/versions/2.1.318",
+    "argv": ["claude"],
+    "rule": "Claude Code, native installer"
+  },
+  {
+    "style": "Claude Code native installer, a background session under a pty host",
+    "exe": "/Users/dev/.local/share/claude/versions/2.1.318",
+    "argv": ["/Users/dev/.local/share/claude/versions/2.1.318", "--session-id", "8f1eaa57-0000-4000-8000-000000000001", "--resume", "x"],
+    "rule": "Claude Code, native installer"
+  },
+  {
+    "style": "Claude Code background daemon, started through the ~/.local/bin/claude link",
+    "exe": "/Users/dev/.local/share/claude/versions/2.1.322",
+    "argv": ["/Users/dev/.local/bin/claude", "daemon", "run", "--origin", "transient"],
+    "rule": "claude daemon"
+  },
+  {
+    "style": "Claude Code pty host, from the ClaudeCode.app bundle",
+    "exe": "/Users/dev/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude",
+    "argv": ["/Users/dev/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude", "--bg-pty-host", "/tmp/cc-daemon-501/0a1b2c3d/pty/8f1eaa57.sock", "103", "61", "--", "/Users/dev/.local/share/claude/versions/2.1.318"],
+    "rule": "claude --bg-pty-host"
+  },
+  {
+    "style": "Claude Code pty host, from the versions directory with a rewritten title",
+    "exe": "/Users/dev/.local/share/claude/versions/2.1.322",
+    "argv": ["claude bg-pty-host", "--bg-pty-host", "/tmp/cc-daemon-501/0a1b2c3d/spare/1174469c.pty.sock", "200", "50"],
+    "rule": "claude --bg-pty-host"
+  },
+  {
+    "style": "Claude Code pre-started spare session",
+    "exe": "/Users/dev/.local/share/claude/versions/2.1.322",
+    "argv": ["claude bg-spare", "--bg-spare", "/tmp/cc-daemon-501/0a1b2c3d/spare/1174469c.claim.sock"],
+    "rule": "claude --bg-pty-host"
+  },
+  {
+    "style": "Claude Code inside the Claude desktop app",
+    "exe": "/Users/dev/Library/Application Support/Claude/claude-code/2.1.321/ddbdf2b334e1/claude.app/Contents/MacOS/claude",
+    "argv": ["/Users/dev/Library/Application Support/Claude/claude-code/2.1.321/ddbdf2b334e1/claude.app/Contents/MacOS/claude", "--output-format", "stream-json", "--verbose"],
+    "rule": "Claude Code, inside the Claude desktop app"
+  },
+  {
+    "style": "Claude Code from npm, through the bin link node runs",
+    "exe": "/Users/dev/.nvm/versions/node/v22.13.0/bin/node",
+    "argv": ["node", "/Users/dev/.nvm/versions/node/v22.13.0/bin/claude"],
+    "rule": "Claude Code, npm"
+  },
+  {
+    "style": "Claude Code from npm, cli.js named directly",
+    "exe": "/Users/dev/.nvm/versions/node/v22.13.0/bin/node",
+    "argv": ["node", "--no-warnings", "/Users/dev/.nvm/versions/node/v22.13.0/lib/node_modules/@anthropic-ai/claude-code/cli.js"],
+    "rule": "Claude Code, npm"
+  },
+  {
+    "style": "Claude Code from a Homebrew cask (not on the reference Mac)",
+    "exe": "/opt/homebrew/Caskroom/claude-code/2.1.300/claude",
+    "argv": ["claude"],
+    "rule": "Claude Code, other"
+  },
+  {
+    "style": "Codex standalone installer, interactive",
+    "exe": "/Users/dev/.codex/packages/standalone/releases/0.167.2-aarch64-apple-darwin/bin/codex",
+    "argv": ["codex"],
+    "rule": "Codex, standalone installer"
+  },
+  {
+    "style": "Codex standalone app-server",
+    "exe": "/Users/dev/.codex/packages/standalone/releases/0.167.2-aarch64-apple-darwin/bin/codex",
+    "argv": ["/Users/dev/.codex/packages/standalone/releases/0.167.2-aarch64-apple-darwin/bin/codex", "app-server", "--listen", "unix://", "--managed-daemon"],
+    "rule": "codex app-server"
+  },
+  {
+    "style": "Codex standalone app-server's supervisor loop",
+    "exe": "/Users/dev/.codex/packages/standalone/releases/0.167.2-aarch64-apple-darwin/bin/codex",
+    "argv": ["codex", "app-server", "daemon", "pid-update-loop"],
+    "rule": "codex app-server"
+  },
+  {
+    "style": "Codex app-server inside the ChatGPT app",
+    "exe": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "argv": ["/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex", "-c", "features.code_mode_host=true", "app-server", "--analytics-default-enabled"],
+    "rule": "codex app-server"
+  },
+  {
+    "style": "Codex exec-server inside the ChatGPT app",
+    "exe": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+    "argv": ["/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex", "exec-server", "--concurrent-requests", "32"],
+    "rule": "a helper inside *.app/Contents/"
+  },
+  {
+    "style": "Codex code-mode host inside the ChatGPT app",
+    "exe": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex-code-mode-host",
+    "argv": ["/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex-code-mode-host"],
+    "rule": "a helper inside *.app/Contents/"
+  },
+  {
+    "style": "Codex from npm, through the bin link node runs",
+    "exe": "/Users/dev/.nvm/versions/node/v24.4.1/bin/node",
+    "argv": ["node", "/Users/dev/.nvm/versions/node/v24.4.1/bin/codex"],
+    "rule": "Codex, npm"
+  },
+  {
+    "style": "Codex from npm, the native binary it starts",
+    "exe": "/Users/dev/.nvm/versions/node/v24.4.1/lib/node_modules/@openai/codex/vendor/aarch64-apple-darwin/codex/codex",
+    "argv": ["codex"],
+    "rule": "Codex, npm"
+  },
+  {
+    "style": "Codex from a Homebrew cask (not on the reference Mac)",
+    "exe": "/opt/homebrew/Caskroom/codex/0.160.0/codex-aarch64-apple-darwin",
+    "argv": ["codex"],
+    "rule": "Codex, other"
+  },
+  {
+    "style": "OpenCode install script, interactive",
+    "exe": "/Users/dev/.opencode/bin/opencode",
+    "argv": ["opencode"],
+    "rule": "OpenCode"
+  },
+  {
+    "style": "OpenCode install script, background service",
+    "exe": "/Users/dev/.opencode/bin/opencode",
+    "argv": ["/Users/dev/.opencode/bin/opencode", "serve", "--service"],
+    "rule": "OpenCode"
+  },
+  {
+    "style": "OpenCode desktop app",
+    "exe": "/Applications/OpenCode.app/Contents/MacOS/OpenCode",
+    "argv": ["/Applications/OpenCode.app/Contents/MacOS/OpenCode"],
+    "rule": "a helper inside *.app/Contents/"
+  },
+  {
+    "style": "Gemini CLI from npm, through the bin link node runs",
+    "exe": "/Users/dev/.nvm/versions/node/v24.4.1/bin/node",
+    "argv": ["node", "/Users/dev/.nvm/versions/node/v24.4.1/bin/gemini"],
+    "rule": "Gemini CLI, npm"
+  },
+  {
+    "style": "Gemini CLI from Homebrew, which runs the npm bundle",
+    "exe": "/opt/homebrew/Cellar/node/24.4.1/bin/node",
+    "argv": ["node", "/opt/homebrew/Cellar/gemini-cli/0.20.0/libexec/lib/node_modules/@google/gemini-cli/dist/index.js"],
+    "rule": "Gemini CLI, npm"
+  },
+  {
+    "style": "Gemini CLI as a single binary (not on the reference Mac)",
+    "exe": "/usr/local/bin/gemini",
+    "argv": ["gemini"],
+    "rule": "Gemini CLI, other"
+  },
+  {
+    "style": "tmux server",
+    "exe": "/opt/homebrew/bin/tmux",
+    "argv": ["tmux", "new", "-s", "work"],
+    "rule": "tmux, screen or zellij"
+  },
+  {
+    "style": "screen",
+    "exe": "/usr/bin/screen",
+    "argv": ["screen", "-S", "work"],
+    "rule": "tmux, screen or zellij"
+  },
+  {
+    "style": "zellij",
+    "exe": "/opt/homebrew/bin/zellij",
+    "argv": ["zellij", "--server", "/tmp/zellij-501/0.43.0/work"],
+    "rule": "tmux, screen or zellij"
+  },
+  {
+    "style": "the Claude desktop app's Electron helper",
+    "exe": "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",
+    "argv": ["/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper", "--type=utility"],
+    "rule": "a helper inside *.app/Contents/"
+  },
+  {
+    "style": "an MCP server shipped inside an app bundle, which the bundle rule spares too",
+    "exe": "/Applications/Example.app/Contents/Resources/mcp-server-darwin-arm64",
+    "argv": ["/Applications/Example.app/Contents/Resources/mcp-server-darwin-arm64", "--agent", "claudeCodeCLI"],
+    "rule": "a helper inside *.app/Contents/"
+  },
+  {
+    "style": "a script run by a framework build of Python, which is not an app helper",
+    "exe": "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python",
+    "argv": ["python3", "-m", "http.server", "8000"],
+    "rule": null
+  },
+  {
+    "style": "a dev server run by node",
+    "exe": "/Users/dev/.nvm/versions/node/v24.4.1/bin/node",
+    "argv": ["node", "/Users/dev/sources/acme/node_modules/.bin/next", "dev"],
+    "rule": null
+  },
+  {
+    "style": "a system agent whose name contains screen",
+    "exe": "/System/Library/PrivateFrameworks/ScreenTimeCore.framework/Versions/A/ScreenTimeAgent",
+    "argv": ["/System/Library/PrivateFrameworks/ScreenTimeCore.framework/Versions/A/ScreenTimeAgent"],
+    "rule": null
+  }
+]

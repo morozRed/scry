@@ -113,6 +113,27 @@ fn main() -> anyhow::Result<()> {
             let name = format!("worktrees-{state}-{p}");
             n += shots.take(&name, &board, theme(), "5", pal, (80, 24))?;
         }
+        // A first run with nothing to report: what each view checked and how to fill it.
+        let mut first = design.clone();
+        first.overview.attention.clear();
+        first.agents = Load::Ready(Vec::new());
+        first.ports = Load::Ready(Vec::new());
+        n += shots.take(
+            &format!("first-run-overview-{p}"),
+            &first,
+            theme(),
+            "",
+            pal,
+            (80, 24),
+        )?;
+        n += shots.take(
+            &format!("first-run-agents-{p}"),
+            &first,
+            theme(),
+            "3",
+            pal,
+            (80, 24),
+        )?;
     }
     let sol = &SOLARIZED_LIGHT;
     n += shots.take(

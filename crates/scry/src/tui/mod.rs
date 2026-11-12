@@ -31,7 +31,8 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::{DefaultTerminal, Terminal};
 use scry_core::config::Config;
-use scry_core::engine::{Engine, Labels};
+use scry_core::engine::Labels;
+use scry_core::live::Collector;
 use scry_core::paths::Paths;
 use scry_core::view::{Board, Load, Tab, Tone, WorktreeList};
 use scry_core::worktree::{self, ScanOptions};
@@ -177,13 +178,13 @@ impl Workers {
 /// Reads at once, then after each interval or when asked. Asks that arrive during a
 /// reading are answered by the next one.
 fn read_processes(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, every: Option<Duration>) {
-    let mut engine = Engine::labelling(Labels::Listeners);
+    let mut collector = Collector::new(Labels::All);
     loop {
         if tx.send(Update::Started).is_err() {
             return;
         }
-        let update = match engine.snapshot() {
-            Ok(snap) => Update::Board(Box::new(Board::from_snapshot(&snap))),
+        let update = match collector.board() {
+            Ok(board) => Update::Board(Box::new(board)),
             Err(e) => Update::Failed(format!("{e:#}")),
         };
         if tx.send(update).is_err() {

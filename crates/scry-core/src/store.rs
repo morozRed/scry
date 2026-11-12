@@ -9,12 +9,15 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
-use crate::model::DiskSample;
+use crate::model::{Agent, DiskSample, ProcId};
 use crate::paths::private_file;
+use crate::session::{Part, Session, SessionId, SessionKey, SessionProcess, Source};
+use crate::view::Evidence;
 
 /// Append only. Each entry moves the schema up by one version, so version N means the
-/// first N entries ran. Sessions and ancestry arrive as later entries in M2.
-const MIGRATIONS: &[&str] = &["CREATE TABLE disk_sample (
+/// first N entries ran.
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE disk_sample (
         id          INTEGER PRIMARY KEY,
         at_ms       INTEGER NOT NULL,
         volume      TEXT    NOT NULL,
@@ -30,7 +33,36 @@ const MIGRATIONS: &[&str] = &["CREATE TABLE disk_sample (
         action TEXT    NOT NULL,
         target TEXT    NOT NULL,
         result TEXT    NOT NULL
-    );"];
+    );",
+    // Sessions; the processes in them, which records an agent tree's ancestry while the
+    // agent lives; and the spool events already taken.
+    "CREATE TABLE session (
+        agent         TEXT    NOT NULL,
+        session_id    TEXT    NOT NULL,
+        cwd           TEXT,
+        started_at_ms INTEGER,
+        ended_at_ms   INTEGER,
+        end_reason    TEXT,
+        source        TEXT    NOT NULL,
+        PRIMARY KEY (agent, session_id)
+    );
+    CREATE TABLE session_process (
+        agent         TEXT    NOT NULL,
+        session_id    TEXT    NOT NULL,
+        pid           INTEGER NOT NULL,
+        start_us      INTEGER NOT NULL,
+        role          TEXT    NOT NULL,
+        first_seen_ms INTEGER NOT NULL,
+        last_seen_ms  INTEGER NOT NULL,
+        evidence      TEXT    NOT NULL,
+        PRIMARY KEY (agent, session_id, pid, start_us)
+    );
+    CREATE INDEX session_process_proc ON session_process (pid, start_us);
+    CREATE TABLE spool_event (
+        id       TEXT    PRIMARY KEY,
+        taken_ms INTEGER NOT NULL
+    );",
+];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
 
@@ -184,6 +216,177 @@ impl Store {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+
+    /// Adds a session or fills in what it learned. A field already known is kept, so a
+    /// SessionEnd arriving after a scan fills the end without losing the start; a hook's
+    /// start and directory replace a scan's guess at them.
+    pub fn upsert_session(&self, s: &Session) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO session (agent, session_id, cwd, started_at_ms, ended_at_ms, end_reason, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (agent, session_id) DO UPDATE SET
+               cwd = CASE WHEN excluded.source = 'hook'
+                     THEN coalesce(excluded.cwd, cwd) ELSE coalesce(cwd, excluded.cwd) END,
+               started_at_ms = CASE WHEN excluded.source = 'hook'
+                     THEN coalesce(excluded.started_at_ms, started_at_ms)
+                     ELSE coalesce(started_at_ms, excluded.started_at_ms) END,
+               ended_at_ms = coalesce(ended_at_ms, excluded.ended_at_ms),
+               end_reason = coalesce(end_reason, excluded.end_reason),
+               source = CASE WHEN excluded.source = 'hook' THEN 'hook' ELSE source END",
+            params![
+                s.key.agent.short(),
+                s.key.id.encode(),
+                s.cwd,
+                s.started_at_ms,
+                s.ended_at_ms,
+                s.end_reason,
+                s.source.word()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Sessions that are open, or ended at or after `since_ms`.
+    pub fn sessions(&self, since_ms: i64) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent, session_id, cwd, started_at_ms, ended_at_ms, end_reason, source
+             FROM session WHERE ended_at_ms IS NULL OR ended_at_ms >= ?1",
+        )?;
+        let rows = stmt.query_map([since_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (agent, id, cwd, started_at_ms, ended_at_ms, end_reason, source) = row?;
+            let (Some(key), Some(source)) = (key(&agent, &id), Source::parse(&source)) else {
+                continue;
+            };
+            out.push(Session {
+                key,
+                cwd,
+                started_at_ms,
+                ended_at_ms,
+                end_reason,
+                source,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Records that a process was seen in a session, keeping when it was first seen.
+    pub fn record_process(&self, m: &SessionProcess) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO session_process
+               (agent, session_id, pid, start_us, role, first_seen_ms, last_seen_ms, evidence)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (agent, session_id, pid, start_us) DO UPDATE SET
+               last_seen_ms = max(last_seen_ms, excluded.last_seen_ms),
+               evidence = excluded.evidence",
+            params![
+                m.session.agent.short(),
+                m.session.id.encode(),
+                m.proc.pid,
+                m.proc.start_us,
+                m.part.word(),
+                m.first_seen_ms,
+                m.last_seen_ms,
+                m.evidence.word()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Session processes last seen at or after `since_ms`.
+    pub fn session_processes(&self, since_ms: i64) -> Result<Vec<SessionProcess>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent, session_id, pid, start_us, role, first_seen_ms, last_seen_ms, evidence
+             FROM session_process WHERE last_seen_ms >= ?1",
+        )?;
+        let rows = stmt.query_map([since_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get::<_, String>(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (agent, id, pid, start_us, part, first_seen_ms, last_seen_ms, evidence) = row?;
+            let (Some(session), Some(part), Some(evidence)) = (
+                key(&agent, &id),
+                Part::parse(&part),
+                Evidence::parse(&evidence),
+            ) else {
+                continue;
+            };
+            out.push(SessionProcess {
+                session,
+                proc: ProcId { pid, start_us },
+                part,
+                first_seen_ms,
+                last_seen_ms,
+                evidence,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Marks a spool event as taken. False when it was taken before, which makes ingest
+    /// idempotent.
+    pub fn take_event(&self, id: &str, now_ms: i64) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO spool_event (id, taken_ms) VALUES (?1, ?2)",
+            params![id, now_ms],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Forgets session processes, ended sessions and taken event ids older than `before_ms`.
+    pub fn prune(&self, before_ms: i64) -> Result<()> {
+        for sql in [
+            "DELETE FROM session_process WHERE last_seen_ms < ?1",
+            "DELETE FROM session WHERE ended_at_ms < ?1",
+            "DELETE FROM spool_event WHERE taken_ms < ?1",
+        ] {
+            self.conn.execute(sql, [before_ms])?;
+        }
+        Ok(())
+    }
+
+    /// Runs `f` in one transaction, so the rows of one scan land together.
+    pub fn batch<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f(self) {
+            Ok(v) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+}
+
+fn key(agent: &str, id: &str) -> Option<SessionKey> {
+    Some(SessionKey {
+        agent: Agent::from_short(agent)?,
+        id: SessionId::decode(id)?,
+    })
 }
 
 fn migrate(conn: &mut Connection) -> Result<()> {

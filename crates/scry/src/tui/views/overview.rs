@@ -15,7 +15,9 @@ pub const VIEW: ViewDef = ViewDef {
     rows,
     empty: (
         "Nothing needs attention.",
-        "Leftovers, held ports, a filling disk and stale worktrees show up here.",
+        "Checked your processes for leftovers of ended agent sessions,\n\
+         and every listening port for one held by a leftover.\n\
+         A filling disk and stale worktrees will show up here too.",
     ),
     badge,
     hints: &[("⏎", "go to")],

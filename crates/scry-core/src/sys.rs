@@ -1,5 +1,6 @@
 //! Reads the live process table. Every call here works without root.
 
+pub mod kqueue;
 pub mod procinfo;
 pub mod pulse;
 pub mod sockets;
@@ -9,6 +10,7 @@ use std::ffi::{CStr, CString};
 use std::mem::{MaybeUninit, size_of};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -23,6 +25,8 @@ const KINFO_PROC_SIZE: usize = 648;
 const KINFO_STARTTIME_OFFSET: usize = 0;
 const KINFO_PID_OFFSET: usize = 40;
 const KINFO_STAT_OFFSET: usize = 36;
+/// `kp_eproc.e_tdev`, the controlling terminal's device, or `NODEV` (-1) when there is none.
+const KINFO_TDEV_OFFSET: usize = 572;
 const SZOMB: u8 = 5;
 
 unsafe extern "C" {
@@ -30,11 +34,25 @@ unsafe extern "C" {
 }
 
 pub fn scan() -> Result<Snapshot> {
-    let starts = all_pids_with_start()?;
+    let records = all_records()?;
     let viewer_uid = unsafe { libc::getuid() };
-    let read: Vec<Process> = starts
+    // `devname` searches /dev and costs about as much as the rest of the scan, so names are
+    // kept for the life of the process. A device number names one terminal while it exists.
+    static TTYS: Mutex<Option<HashMap<i32, String>>> = Mutex::new(None);
+    let mut ttys = TTYS.lock().unwrap_or_else(|e| e.into_inner());
+    let ttys = ttys.get_or_insert_with(HashMap::new);
+    let read: Vec<Process> = records
         .into_iter()
-        .filter_map(|(pid, start_us)| read_process(ProcId { pid, start_us }))
+        .filter_map(|r| {
+            let mut p = read_process(ProcId {
+                pid: r.pid,
+                start_us: r.start_us,
+            })?;
+            p.tty = r
+                .tty
+                .map(|dev| ttys.entry(dev).or_insert_with(|| tty_name(dev)).clone());
+            Some(p)
+        })
         .collect();
     // A pid can exit and be reused while its details are read. Reading the table again
     // brackets those reads: a record whose pid is gone or restarted could mix two processes.
@@ -53,6 +71,21 @@ pub fn scan() -> Result<Snapshot> {
 }
 
 fn all_pids_with_start() -> Result<Vec<(i32, i64)>> {
+    Ok(all_records()?
+        .into_iter()
+        .map(|r| (r.pid, r.start_us))
+        .collect())
+}
+
+/// What Scry reads from one `kinfo_proc` in the full table.
+struct Record {
+    pid: i32,
+    start_us: i64,
+    /// The controlling terminal's device number, when the process has a live one.
+    tty: Option<i32>,
+}
+
+fn all_records() -> Result<Vec<Record>> {
     let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
     let mut buf: Vec<u8> = Vec::new();
     // The table can grow between the size probe and the read, so retry with headroom.
@@ -94,7 +127,7 @@ fn all_pids_with_start() -> Result<Vec<(i32, i64)>> {
     bail!("sysctl kern.proc.all kept growing")
 }
 
-fn parse_kinfo(buf: &[u8]) -> Result<Vec<(i32, i64)>> {
+fn parse_kinfo(buf: &[u8]) -> Result<Vec<Record>> {
     if !buf.len().is_multiple_of(KINFO_PROC_SIZE) {
         bail!(
             "kern.proc.all returned {} bytes, not a multiple of the {KINFO_PROC_SIZE}-byte kinfo_proc this build expects",
@@ -102,7 +135,34 @@ fn parse_kinfo(buf: &[u8]) -> Result<Vec<(i32, i64)>> {
         );
     }
     let (records, _) = buf.as_chunks::<KINFO_PROC_SIZE>();
-    Ok(records.iter().map(parse_record).collect())
+    Ok(records
+        .iter()
+        .map(|rec| {
+            let (pid, start_us) = parse_record(rec);
+            let tdev = i32::from_ne_bytes(
+                rec[KINFO_TDEV_OFFSET..KINFO_TDEV_OFFSET + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            Record {
+                pid,
+                start_us,
+                tty: (tdev != -1).then_some(tdev),
+            }
+        })
+        .collect())
+}
+
+/// `ttys004` for a terminal device number, as `ps` prints it; `tty?` when the device has no
+/// node, which still means the process has a terminal.
+fn tty_name(dev: i32) -> String {
+    let name = unsafe { libc::devname(dev, libc::S_IFCHR) };
+    if name.is_null() {
+        return "tty?".into();
+    }
+    unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// A live process's start time, and whether it has exited and waits to be reaped.
@@ -218,7 +278,14 @@ fn read_process(id: ProcId) -> Option<Process> {
         project: None,
         stamps: Default::default(),
         worker: false,
+        tty: None,
+        role: None,
     })
+}
+
+/// The parent of one live process.
+pub fn ppid(pid: i32) -> Option<i32> {
+    short_bsd_info(pid).map(|i| i.pbsi_ppid as i32)
 }
 
 fn short_bsd_info(pid: i32) -> Option<libc::proc_bsdshortinfo> {

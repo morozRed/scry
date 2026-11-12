@@ -24,7 +24,7 @@ use crate::launch_agent::{
 use crate::model::{DiskSample, ProcId};
 use crate::paths::{Paths, private_file};
 use crate::store::{AuditRow, SCHEMA_VERSION, SchemaTooNew, Store};
-use crate::sys;
+use crate::{recorder, sys};
 
 pub const SAMPLED_VOLUME: &str = "/";
 
@@ -376,15 +376,18 @@ pub fn run(paths: &Paths) -> Result<()> {
     });
 
     daemon_log::line(&format!(
-        "started as pid {} (scry {}), sampling {SAMPLED_VOLUME} every {} s into {}",
+        "started as pid {} (scry {}), sampling {SAMPLED_VOLUME} every {} s and recording agent sessions into {}",
         me.pid,
         me.version,
         interval.as_secs(),
         paths.db().display()
     ));
+    let (recorder, recording) = recorder::spawn(paths.clone())?;
     let sig = sample_until_stopped(&store, interval, &rx, || {
         sys::volume_space(Path::new(SAMPLED_VOLUME))
     });
+    recorder.stop();
+    let _ = recording.join();
     handle.close();
     let _ = waiter.join();
     drop(store);

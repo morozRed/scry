@@ -923,3 +923,26 @@ fn r_refreshes_and_every_footer_lists_it() {
     press(&mut a, "?");
     assert!(screen(&render(&a, 80, 24)).contains("refresh now"));
 }
+
+#[test]
+fn a_first_run_explains_what_agents_and_overview_will_show() {
+    let mut board = design_board();
+    board.overview.attention.clear();
+    board.agents = Load::Ready(Vec::new());
+    board.ports = Load::Ready(Vec::new());
+    let mut a = App::new(board, Source::Fixture("d".into()), mono());
+    let text = screen(&render(&a, 80, 24));
+    assert!(text.contains("✓  Nothing needs attention."), "{text}");
+    assert!(
+        text.contains("Checked your processes for leftovers"),
+        "{text}"
+    );
+    press(&mut a, "3");
+    let text = screen(&render(&a, 80, 24));
+    assert!(text.contains("No agent sessions are running."), "{text}");
+    assert!(
+        text.contains("Claude Code, Codex, OpenCode and Gemini CLI"),
+        "{text}"
+    );
+    assert!(text.contains("scry hook install claude"), "{text}");
+}

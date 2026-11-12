@@ -40,8 +40,8 @@ Nothing is stopped on one key. Every action opens a sheet that lists each target
 and what it frees.
 
 Scry follows your terminal's light or dark theme. These screens are drawn from a
-synthetic fixture with `cargo run -p scry --example shots`; the Agents, Disk and
-Worktrees views show sample data until those parts are built. The design notes are
+synthetic fixture with `cargo run -p scry --example shots`; the Disk and Worktrees
+views show sample data until those parts are built. The design notes are
 in [docs/design.md](docs/design.md).
 
 ## Requirements
@@ -103,10 +103,47 @@ each signal it checks that the pid still belongs to the process it chose. It exi
 0 when the process stopped, 1 when nothing was signalled and 2 when the process is
 still running. Every command exits 64 when its arguments are wrong.
 
+## Agents
+
+```sh
+scry agents                    # agent sessions running now, with project, RAM and ports
+scry agents --tree --json      # each session with the processes it started
+scry leftovers                 # what ended sessions left running, with the evidence
+scry leftovers --json
+scry watch --json              # one JSON line now and on every change, for programs
+scry hook install claude       # exact Claude Code sessions; shows the diff, backs up
+scry hook uninstall claude
+```
+
+Scry recognises Claude Code, Codex, OpenCode and Gemini CLI by their executable
+path, in every install style it has seen (native installer, npm, the desktop apps,
+Homebrew). A process belongs to a session by its environment stamp
+(`CLAUDE_CODE_SESSION_ID`, `CODEX_SESSION_ID`, or `SCRY_SESSION` from Scry's own
+hook), by a parent chain up to the agent, or, shown but never acted on, by having
+started in the session's directory while it ran.
+
+A process is a **leftover** only if all of these hold: a stamp or the process tree
+ties it to a session; that session's agent process is gone; it is not on the
+never-reap list (`claude daemon`, Claude Code's background pty hosts, `codex
+app-server`, anything inside an `*.app/Contents/` bundle, and `tmux`, `screen` and
+`zellij`); neither it nor anything below it has a terminal; it is older than five
+minutes; and it is not on your keep list. A process re-parented to launchd that
+nothing ties to a session is never a leftover. Nothing is stopped by this release;
+the list is for reading.
+
+`scry hook install claude` adds exec-form SessionStart and SessionEnd hooks to
+`~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`). It prints the diff, backs the
+file up beside it, keeps every other hook, and refuses when Claude Code's managed
+settings would stop user hooks from running. The hook prints nothing, always exits
+0 and appends one line to Scry's spool. It never installs a `WorktreeCreate` hook.
+
 ## Background recorder
 
-Disk history needs something running while Scry is closed. A small daemon records
-free space on `/` every 10 minutes.
+Disk history and agent ancestry need something running while Scry is closed. A
+small daemon records free space on `/` every 10 minutes, takes hook events from the
+spool, and records which session each process belongs to while its agent lives, so a
+child re-parented to launchd after its agent exits keeps its owner. It rescans when
+a watched agent forks or exits.
 
 ```sh
 scry daemon install     # install the LaunchAgent and start the daemon
