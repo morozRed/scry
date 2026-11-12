@@ -17,9 +17,20 @@
 //! for repositories, worktrees and mounted volumes inside it; reads a worktree's label again,
 //! `git status` included, after that walk; opens the folder from `/` without following a
 //! symlink and checks its identity and its parents' against the plan; and writes an intent
-//! row to the audit log, refusing when it cannot. The home folder, Desktop, Documents,
-//! Downloads and every folder above one of them are out of reach whatever the plan says.
-//! What lands in the Trash must be the planned folder, or it is moved back.
+//! row to the audit log, refusing when it cannot; then holds the folder once more. The home
+//! folder, Desktop, Documents, Downloads, Scry's own config and state folders and every
+//! folder above one of them are out of reach whatever the plan says, and a delete stops at
+//! any of them moved inside while it runs. A prune checks everything its verdict rests on
+//! again after the intent row, with the record held.
+//!
+//! The Trash is the one step that acts by pathname: `trashItemAtURL:` takes a path, and
+//! Foundation resolves it again when it renames. Between the last hold and that rename,
+//! something else can take the path, or a folder above it can become a symlink, and then
+//! Foundation moves whatever the path names then. Nothing is deleted by it: what lands in
+//! the Trash is compared with the held folder by device and inode, and if it is another, it
+//! is renamed back to the path with `RENAME_EXCL`, never over what stands there now. If that
+//! rename fails, it stays in the Trash and the result names where it is and where it
+//! belongs, so Put Back restores it.
 
 use std::fmt;
 use std::io;
@@ -129,7 +140,9 @@ pub fn allows(item: &Item, destructive: bool) -> Allows {
 fn kept(item: &Item) -> Option<String> {
     if item.fenced {
         return Some(
-            "It is your home folder, or Desktop, Documents or Downloads lies inside it.".into(),
+            "It is your home folder, or Desktop, Documents, Downloads or Scry's own config or \
+             state lies inside it."
+                .into(),
         );
     }
     let rel = |p: &Path| {
@@ -238,7 +251,8 @@ pub enum Refusal {
     Changed {
         path: PathBuf,
     },
-    /// It is the home folder, a protected folder or above one, or leads through one.
+    /// It is the home folder, a protected folder or Scry's own, or above one, or leads
+    /// through one.
     Protected {
         path: PathBuf,
     },
@@ -306,8 +320,8 @@ impl fmt::Display for Refusal {
             ),
             Refusal::Protected { path } => write!(
                 f,
-                "{} is your home folder, holds Desktop, Documents or Downloads, or leads into \
-                 one. Nothing was done.",
+                "{} is your home folder, holds Desktop, Documents, Downloads or Scry's own \
+                 config or state, or leads into one. Nothing was done.",
                 path.display()
             ),
             Refusal::Relabelled { now } => write!(
@@ -497,6 +511,8 @@ impl Done {
 /// Points in a cleanup where a test changes the disk under it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Moment {
+    /// The intent row is written; next the target is held and checked once more.
+    Intent,
     /// Every check passed and the folder is held; next it moves or goes.
     Act,
     /// A delete has removed this many entries so far.
@@ -630,6 +646,7 @@ fn run(plan: &Plan, typed: Option<&str>, ctx: &Context, audit: &Audit) -> Result
                 return Err(Refusal::Off);
             }
             audit.intent()?;
+            ctx.at(Moment::Intent);
             let h = held(plan, &fence)?;
             ctx.at(Moment::Act);
             if plan.action == Action::Trash {
@@ -637,7 +654,7 @@ fn run(plan: &Plan, typed: Option<&str>, ctx: &Context, audit: &Audit) -> Result
                 done.worktree = plan.repo.is_some();
                 done.trash = Some(trash::size(ctx.home, ctx.store));
             } else {
-                delete(plan, h, ctx)?;
+                delete(plan, h, &fence, ctx)?;
             }
         }
     }
@@ -762,10 +779,9 @@ fn to_trash(plan: &Plan, h: Held, store: Option<&Store>) -> Result<PathBuf, Refu
             },
             Err(e) => Refusal::Incomplete {
                 did: format!(
-                    "what stood at {} was moved to {} in the Trash; it is not the folder that \
-                     was listed, and it could not be moved back",
-                    plan.path.display(),
-                    landed.display()
+                    "what stood at {} went to the Trash, and it is not the folder that was \
+                     listed",
+                    plan.path.display()
                 ),
                 error: e.to_string(),
             },
@@ -785,38 +801,55 @@ fn to_trash(plan: &Plan, h: Held, store: Option<&Store>) -> Result<PathBuf, Refu
     Ok(landed)
 }
 
-/// Puts a folder back where it came from, never over something that stands there now.
+/// Puts a folder back where it came from, never over something that stands there now. When
+/// it cannot, the error names where the folder is and where it belongs.
 fn move_back(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes());
-    let (from, to) = (c(from)?, c(to)?);
-    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } != 0 {
-        return Err(io::Error::last_os_error());
+    let (f, t) = (c(from)?, c(to)?);
+    if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        return Ok(());
     }
-    Ok(())
+    let e = io::Error::last_os_error();
+    let why = match e.raw_os_error() {
+        Some(libc::EEXIST) => format!("something else now stands at {}", to.display()),
+        _ => e.to_string(),
+    };
+    Err(io::Error::new(
+        e.kind(),
+        format!(
+            "it could not be moved back from {} to {} ({why}); it is still at {}, and Finder's \
+             Put Back or a move by hand restores it",
+            from.display(),
+            to.display(),
+            from.display()
+        ),
+    ))
 }
 
-fn delete(plan: &Plan, h: Held, ctx: &Context) -> Result<(), Refusal> {
+fn delete(plan: &Plan, h: Held, fence: &Fence, ctx: &Context) -> Result<(), Refusal> {
     let mut progress = |r: &Removed| ctx.at(Moment::Removed(r.files + r.folders));
-    hold::remove(h, &mut progress).map(|_| ()).map_err(|s| {
-        let error = if s.at.as_os_str().is_empty() {
-            s.error
-        } else {
-            format!("{} (at {})", s.error, s.at.display())
-        };
-        if s.removed == Removed::default() {
-            Refusal::Failed { error }
-        } else {
-            Refusal::Incomplete {
-                did: format!(
-                    "{} inside {} were deleted",
-                    s.removed.sentence(),
-                    plan.path.display()
-                ),
-                error,
+    hold::remove(h, fence, &mut progress)
+        .map(|_| ())
+        .map_err(|s| {
+            let error = if s.at.as_os_str().is_empty() {
+                s.error
+            } else {
+                format!("{} (at {})", s.error, s.at.display())
+            };
+            if s.removed == Removed::default() {
+                Refusal::Failed { error }
+            } else {
+                Refusal::Incomplete {
+                    did: format!(
+                        "{} inside {} were deleted",
+                        s.removed.sentence(),
+                        plan.path.display()
+                    ),
+                    error,
+                }
             }
-        }
-    })
+        })
 }
 
 /// Removes the worktree's own record, once it is sure the record is that worktree's, its
@@ -825,29 +858,29 @@ fn prune(plan: &Plan, ctx: &Context, fence: &Fence, audit: &Audit) -> Result<(),
     let record = plan.record.as_ref().ok_or(Refusal::Failed {
         error: "git's record of it is not known".into(),
     })?;
-    match std::fs::symlink_metadata(&plan.path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Ok(_) => {
-            return Err(Refusal::Changed {
-                path: plan.path.clone(),
-            });
-        }
-        Err(e) => {
-            return Err(Refusal::Failed {
-                error: e.to_string(),
-            });
-        }
-    }
+    still_gone(plan)?;
     expect_label(plan, ctx, None, Status::CanPrune)?;
     check_record(plan, record, ctx.home)?;
+    let before = fingerprint(record)?;
     if !(ctx.destructive)() {
         return Err(Refusal::Off);
     }
     audit.intent()?;
+    ctx.at(Moment::Intent);
     let h = hold::hold(record, fence).map_err(|e| held_refusal(e, record))?;
     if Some(h.id) != plan.record_id {
         return Err(Refusal::Changed {
             path: record.clone(),
+        });
+    }
+    // Everything the verdict rests on, again, now the record is held: the checkout is still
+    // gone, and the record still names it, is not locked, stages nothing, keeps its HEAD
+    // held by a branch or tag, and has not changed since it was checked.
+    still_gone(plan)?;
+    check_record(plan, record, ctx.home)?;
+    if fingerprint(record)? != before {
+        return Err(Refusal::Record {
+            why: "Its record changed while it was checked.".into(),
         });
     }
     // Read once more through the held folder, so the checks bind to what is removed.
@@ -868,20 +901,59 @@ fn prune(plan: &Plan, ctx: &Context, fence: &Fence, audit: &Audit) -> Result<(),
         });
     }
     ctx.at(Moment::Act);
-    hold::remove(h, &mut |_| {}).map(|_| ()).map_err(|s| {
-        if s.removed == Removed::default() {
-            Refusal::Failed { error: s.error }
-        } else {
-            Refusal::Incomplete {
-                did: format!(
-                    "{} of the record {} were removed",
-                    s.removed.sentence(),
-                    record.display()
-                ),
-                error: s.error,
+    hold::remove(h, fence, &mut |_| {})
+        .map(|_| ())
+        .map_err(|s| {
+            if s.removed == Removed::default() {
+                Refusal::Failed { error: s.error }
+            } else {
+                Refusal::Incomplete {
+                    did: format!(
+                        "{} of the record {} were removed",
+                        s.removed.sentence(),
+                        record.display()
+                    ),
+                    error: s.error,
+                }
             }
-        }
-    })
+        })
+}
+
+/// The worktree's folder is still gone.
+fn still_gone(plan: &Plan) -> Result<(), Refusal> {
+    match std::fs::symlink_metadata(&plan.path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(Refusal::Changed {
+            path: plan.path.clone(),
+        }),
+        Err(e) => Err(Refusal::Failed {
+            error: e.to_string(),
+        }),
+    }
+}
+
+/// Each entry of a record, with its identity, size and change time, so any write to it shows.
+type Fingerprint = Vec<(std::ffi::OsString, FileId, u64, i64, i64)>;
+
+fn fingerprint(record: &Path) -> Result<Fingerprint, Refusal> {
+    use std::os::unix::fs::MetadataExt;
+    let failed = |e: io::Error| Refusal::Record {
+        why: format!("Its record could not be read: {e}."),
+    };
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(record).map_err(failed)? {
+        let e = e.map_err(failed)?;
+        let m = std::fs::symlink_metadata(e.path()).map_err(failed)?;
+        out.push((
+            e.file_name(),
+            file_id(&m),
+            m.size(),
+            m.ctime(),
+            m.ctime_nsec(),
+        ));
+    }
+    out.sort();
+    Ok(out)
 }
 
 /// The record names the planned folder, is not locked, stages nothing its HEAD lacks, and a

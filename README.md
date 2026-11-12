@@ -181,7 +181,8 @@ Each item allows one cleanup: **trash** (Put Back in Finder restores it; space
 returns when the Trash is emptied), **delete** for caches a tool fills again, after
 you type the item's name, **command**, which shows the tool's own cleanup for you to
 run, or **never**. Scry never removes the home folder, a folder that Desktop,
-Documents or Downloads lies inside, or a cache that holds a git repository, a
+Documents, Downloads or Scry's own config or state lies inside, or a cache that
+holds a git repository (a bare one or a separate git directory included), a
 worktree or a mounted volume.
 
 A worktree labelled "can go" goes to the Trash as a folder only: git keeps its record
@@ -196,9 +197,16 @@ link to git.
 Right before acting, Scry reads `destructive` from the config again, walks the folder
 for repositories, worktrees and mounted volumes, reads a worktree's label again with
 `git status`, and checks that the folder and every folder above it are the ones it
-listed, opening each without following a symlink. What lands in the Trash must be
-that folder, or it is moved back; a delete goes through the folder Scry opened and
-never into another volume. Cleanup is off until you set `destructive = true`. Every
+listed, opening each without following a symlink. A delete goes through the folder
+Scry opened, never into another volume, and stops untouched at a protected folder
+moved inside while it runs. A prune checks the record again after the audit row
+is written. The move to the Trash is the one step macOS takes by path: if something
+else takes that path, or a folder above it becomes a symlink, in the moment between
+Scry's last check and the move, macOS moves that instead. Nothing is deleted that
+way: Scry compares what landed in the Trash with the folder it checked and moves
+anything else back, never over what stands there now; when it cannot, it says
+where the item is in the Trash and where it belongs. Cleanup is off until you set
+`destructive = true`. Every
 attempt writes two rows to the audit log in Scry's store: what it is about to do,
 then what happened, including exactly what changed if it stopped partway. When the
 log cannot be written, nothing is done.

@@ -38,11 +38,12 @@ pub struct SubtreeSize {
     pub dirs: u64,
     /// Entries that could not be read and are missing from `size`.
     pub skipped: u64,
-    /// Folders below the root that hold a `.git` of their own, relative to the root and
-    /// sorted. A `.git` directly in the root, such as a worktree's own link, is not listed.
+    /// Folders below the root that hold a `.git` of their own or are a git directory
+    /// themselves (see [`git_dir_shape`]), relative to the root and sorted. A `.git` directly
+    /// in the root, such as a worktree's own link, is not listed.
     pub repos: Vec<PathBuf>,
-    /// The root itself holds a `.git`. Which `repos` leaves out, but a caller that measures a
-    /// tree in parts needs it for a part below the tree's root.
+    /// The root itself holds a `.git` or is a git directory. Which `repos` leaves out, but a
+    /// caller that measures a tree in parts needs it for a part below the tree's root.
     #[serde(default)]
     pub git_at_root: bool,
     /// Folders inside it on another volume, such as a mounted disk image. They are not
@@ -363,6 +364,9 @@ struct Tally {
     repos: Vec<PathBuf>,
     /// For a tree, a `.git` in its root; while one folder is counted, a `.git` in it.
     git_at_root: bool,
+    /// While one folder is counted: which of a git directory's entries it holds. Never added
+    /// up across folders.
+    git_marks: u8,
     mounts: u64,
     shared_links: bool,
 }
@@ -483,6 +487,11 @@ impl Ctx<'_> {
             self.list(&at_dir, fd, buf, &mut here, &mut found, &mut roots);
         }
         let t = &mut w.trees[tree];
+        // A git directory found by its shape; inside a `.git` the folder above already counts.
+        let marks = std::mem::take(&mut here.git_marks);
+        if git_dir_shape(marks) && !inside_dot_git(&job.rel) {
+            here.git_at_root = true;
+        }
         let git_here = std::mem::take(&mut here.git_at_root);
         if git_here {
             if job.rel.as_os_str().is_empty() {
@@ -567,6 +576,7 @@ impl Ctx<'_> {
         if e.name.eq_ignore_ascii_case(b".git") {
             t.git_at_root = true;
         }
+        t.git_marks |= git_mark(e.name, e.objtype == VDIR);
         let id = (e.dev, e.ino);
         // Only a volume mounted here has another device; the kernel may not say it is a
         // folder.
@@ -631,6 +641,37 @@ impl Ctx<'_> {
             }
         }
     }
+}
+
+const MARK_HEAD: u8 = 1;
+const MARK_OBJECTS: u8 = 2;
+const MARK_REFS: u8 = 4;
+const MARK_LINK: u8 = 8;
+
+/// Which entry of a git directory `name` is, by name and kind, ignoring case as APFS does.
+fn git_mark(name: &[u8], dir: bool) -> u8 {
+    let is = |n: &[u8]| name.eq_ignore_ascii_case(n);
+    match dir {
+        false if is(b"HEAD") => MARK_HEAD,
+        false if is(b"gitdir") || is(b"commondir") => MARK_LINK,
+        true if is(b"objects") => MARK_OBJECTS,
+        true if is(b"refs") => MARK_REFS,
+        _ => 0,
+    }
+}
+
+/// A folder that is a git directory whatever its name: a bare repository or a separate git
+/// directory (`HEAD`, `objects/` and `refs/`), or a linked worktree's or a submodule's own
+/// git directory (`HEAD` with a `gitdir` or `commondir` file).
+fn git_dir_shape(marks: u8) -> bool {
+    marks & MARK_HEAD != 0
+        && (marks & (MARK_OBJECTS | MARK_REFS) == MARK_OBJECTS | MARK_REFS
+            || marks & MARK_LINK != 0)
+}
+
+fn inside_dot_git(rel: &Path) -> bool {
+    rel.components()
+        .any(|c| c.as_os_str().as_bytes().eq_ignore_ascii_case(b".git"))
 }
 
 // <sys/attr.h> and <sys/vnode.h> values that libc does not export.
@@ -938,6 +979,57 @@ mod tests {
             r.repos,
             [PathBuf::from("deep/a/b"), PathBuf::from("src/inner")]
         );
+    }
+
+    /// A git directory with its own `HEAD`, `objects/` and `refs/` under any name.
+    fn git_dir(at: &Path) {
+        fs::create_dir_all(at.join("objects/pack")).unwrap();
+        fs::create_dir_all(at.join("refs/heads")).unwrap();
+        fs::write(at.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn finds_bare_repositories_and_separate_git_directories_by_their_shape() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("cache");
+        git_dir(&root.join("pkg/bare.git"));
+        git_dir(&root.join("vendor/sep"));
+        // A linked worktree's own git directory: HEAD and a gitdir file.
+        fs::create_dir_all(root.join("rec/wt")).unwrap();
+        fs::write(root.join("rec/wt/HEAD"), "0123\n").unwrap();
+        fs::write(root.join("rec/wt/gitdir"), "/x/.git\n").unwrap();
+        // Lookalikes that are not.
+        fs::create_dir_all(root.join("half/objects")).unwrap();
+        fs::write(root.join("half/HEAD"), "x\n").unwrap();
+        fs::create_dir_all(root.join("dirs/HEAD")).unwrap();
+        fs::create_dir_all(root.join("dirs/objects")).unwrap();
+        fs::create_dir_all(root.join("dirs/refs")).unwrap();
+        // Inside a `.git`, the folder that holds it is the repository.
+        git_dir(&root.join("normal/.git"));
+        git_dir(&root.join("normal/.git/modules/sub"));
+        let [r] = walker(t.path())
+            .measure(std::slice::from_ref(&root))
+            .try_into()
+            .unwrap();
+        assert!(!r.git_at_root);
+        assert_eq!(
+            r.repos,
+            [
+                PathBuf::from("normal"),
+                "pkg/bare.git".into(),
+                "rec/wt".into(),
+                "vendor/sep".into()
+            ]
+        );
+
+        let bare = t.path().join("bare");
+        git_dir(&bare);
+        let [b] = walker(t.path())
+            .measure(std::slice::from_ref(&bare))
+            .try_into()
+            .unwrap();
+        assert!(b.git_at_root, "a bare repository as the root itself");
+        assert!(b.repos.is_empty(), "{:?}", b.repos);
     }
 
     #[test]

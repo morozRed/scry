@@ -728,8 +728,9 @@ fn a_mounted_volume_inside_a_cache_is_never_entered() {
     let offered = allows(&it, true);
     let r = execute(&forced(&modules, Action::Delete), Some("forced"), &ctx(&h));
     // The descriptor removal itself never crosses into it either.
-    let held = hold::hold(&modules, &Fence::new(&h.home)).unwrap();
-    let removal = hold::remove(held, &mut |_| {});
+    let fence = Fence::new(&h.home);
+    let held = hold::hold(&modules, &fence).unwrap();
+    let removal = hold::remove(held, &fence, &mut |_| {});
     let data = fs::read(mounted.join("data"));
     detach(&mounted);
     assert!(
@@ -1058,4 +1059,117 @@ fn app_caches_say_which_items_inside_them_are_counted_on_their_own() {
     );
     // 2 MB of its own; the 4 MB inside Yarn's and pip's folders are theirs.
     assert!(caches.size.unwrap() < 3_000_000, "{:?}", caches.size);
+}
+
+#[test]
+fn a_cache_holding_a_bare_repository_or_a_separate_git_directory_is_never_removed() {
+    for kind in ["bare", "separate"] {
+        let h = home();
+        let modules = h.home.join("code/web/node_modules");
+        fs::create_dir_all(&modules).unwrap();
+        fs::write(modules.join("own.js"), b"x").unwrap();
+        let gitdir = modules.join("pkg/store.git");
+        fs::create_dir_all(gitdir.parent().unwrap()).unwrap();
+        if kind == "bare" {
+            git(&h.home, &["init", "-q", "--bare", gitdir.to_str().unwrap()]);
+        } else {
+            // The checkout lives elsewhere; its history lives in the cache.
+            let work = h.home.join("work");
+            let sep = format!("--separate-git-dir={}", gitdir.display());
+            git(&h.home, &["init", "-q", &sep, work.to_str().unwrap()]);
+        }
+        let it = items(&h.home)
+            .into_iter()
+            .find(|i| i.path == modules)
+            .unwrap();
+        assert!(
+            matches!(&allows(&it, true), Allows::Never { why } if why.contains("store.git")),
+            "{kind}: {:?}",
+            allows(&it, true)
+        );
+        let r = execute(&forced(&modules, Action::Delete), Some("forced"), &ctx(&h));
+        assert!(
+            matches!(&r, Err(Refusal::Holds { what, .. }) if what.contains("store.git")),
+            "{kind}: {r:?}"
+        );
+        assert!(gitdir.join("HEAD").exists(), "{kind}");
+    }
+}
+
+#[test]
+fn a_prune_checks_everything_again_after_the_intent_row() {
+    type Change = fn(&Path, &Path, &Path);
+    let changes: [(&str, Change); 3] = [
+        ("staged", |app, record, _| {
+            let blob = git(app, &["rev-parse", "HEAD:README"]);
+            let entry = format!("100644,{},late.txt", blob.trim());
+            let dir = format!("--git-dir={}", record.display());
+            git(app, &[&dir, "update-index", "--add", "--cacheinfo", &entry]);
+        }),
+        ("back", |_, _, folder| fs::create_dir_all(folder).unwrap()),
+        ("changed", |_, record, _| {
+            fs::write(record.join("notes"), "added late\n").unwrap()
+        }),
+    ];
+    for (name, change) in changes {
+        let (h, app, prunable) = missing_worktrees();
+        let record = app.join(".git/worktrees/wt-prunable");
+        let p = plan(&worktree_item(&h, &prunable), true).unwrap();
+        let late = |m: Moment| {
+            if m == Moment::Intent {
+                change(&app, &record, &prunable);
+            }
+        };
+        let c = Context {
+            moment: Some(&late),
+            ..ctx(&h)
+        };
+        let r = execute(&p, None, &c);
+        let refused = match name {
+            "staged" => matches!(&r, Err(Refusal::Record { why }) if why.contains("staged")),
+            "back" => matches!(&r, Err(Refusal::Changed { .. })),
+            _ => matches!(&r, Err(Refusal::Record { why }) if why.contains("changed")),
+        };
+        assert!(refused, "{name}: {r:?}");
+        assert!(record.exists(), "{name}: the record stays");
+        let rows = results(&h);
+        assert!(rows[0].starts_with("intent: "), "{name}: {rows:?}");
+        assert!(rows[1].starts_with("refused: "), "{name}: {rows:?}");
+    }
+}
+
+#[test]
+fn a_cache_holding_scrys_own_config_is_never_removed() {
+    let h = home();
+    // ~/.config really lives inside the npm cache, and Scry's config is in it.
+    let real = h.home.join(".npm/config-dir");
+    fs::create_dir_all(real.join("scry")).unwrap();
+    fs::write(real.join("scry/config.toml"), b"destructive = true\n").unwrap();
+    fs::write(h.home.join(".npm/blob"), vec![1u8; 4096]).unwrap();
+    symlink(&real, h.home.join(".config")).unwrap();
+    let it = item(&h.home, "npm-cache");
+    assert!(it.fenced);
+    assert!(
+        matches!(&allows(&it, true), Allows::Never { why } if why.contains("Scry")),
+        "{:?}",
+        allows(&it, true)
+    );
+    let npm = h.home.join(".npm");
+    let r = execute(&forced(&npm, Action::Delete), Some("forced"), &ctx(&h));
+    assert_eq!(r, Err(Refusal::Protected { path: npm.clone() }));
+    assert!(real.join("scry/config.toml").exists());
+}
+
+#[test]
+fn moving_back_names_both_paths_when_it_cannot() {
+    let h = home();
+    let from = h.home.join("in-trash");
+    let to = h.home.join("taken");
+    fs::create_dir_all(&from).unwrap();
+    fs::create_dir_all(&to).unwrap();
+    let e = move_back(&from, &to).unwrap_err().to_string();
+    assert!(e.contains(&*from.to_string_lossy()), "{e}");
+    assert!(e.contains(&*to.to_string_lossy()), "{e}");
+    assert!(e.contains("something else now stands"), "{e}");
+    assert!(from.exists() && to.exists());
 }

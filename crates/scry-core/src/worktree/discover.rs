@@ -1234,7 +1234,8 @@ struct Context<'a> {
 }
 
 /// Whether the record's index stages anything its HEAD lacks, from `git diff --cached`
-/// aimed at the record alone. A record without an index stages nothing.
+/// aimed at the record alone. A record without an index stages nothing. No config can hide
+/// a staged change from it: submodule ignores, external diff drivers and textconv are off.
 pub fn record_staged(record: &Path, timeout: Duration) -> anyhow::Result<bool> {
     match fs::symlink_metadata(record.join("index")) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -1244,9 +1245,15 @@ pub fn record_staged(record: &Path, timeout: Duration) -> anyhow::Result<bool> {
     }
     let args = [
         git_dir(record),
+        "-c".into(),
+        "diff.ignoreSubmodules=none".into(),
         "diff".into(),
         "--cached".into(),
         "--quiet".into(),
+        // Over `submodule.<name>.ignore` too, which the config key above does not reach.
+        "--ignore-submodules=none".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
         "HEAD".into(),
         "--".into(),
     ];

@@ -1080,3 +1080,23 @@ fn scan_inside_a_hook() {
     assert_eq!(row(&v, "app-dirty").status.word(), "dirty");
     println!("scanned inside a hook");
 }
+
+#[test]
+fn config_cannot_hide_a_staged_submodule_change_from_the_prune_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let app = base.join("code/app");
+    new_repo(&base, &app);
+    let wt = add(&app, "feat", "wt");
+    let head = git(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+    // A submodule pointer staged in the worktree's index and never committed.
+    let entry = format!("160000,{head},sub");
+    git(&wt, &["update-index", "--add", "--cacheinfo", &entry]);
+    // The repository's config asks git diff to ignore submodules.
+    git(&app, &["config", "diff.ignoreSubmodules", "all"]);
+    let record = app.join(".git/worktrees/wt");
+    assert!(
+        record_staged(&record, std::time::Duration::from_secs(20)).unwrap(),
+        "the staged pointer is seen whatever the config says"
+    );
+}

@@ -114,8 +114,9 @@ fn remove_deletes_the_held_folder_and_counts_what_went() {
     fs::create_dir_all(home.join("outside")).unwrap();
     fs::write(home.join("outside/keep"), b"x").unwrap();
     symlink(home.join("outside"), root.join("a/link")).unwrap();
-    let held = hold(&root, &Fence::new(&home)).unwrap();
-    let removed = remove(held, &mut |_| {}).unwrap();
+    let fence = Fence::new(&home);
+    let held = hold(&root, &fence).unwrap();
+    let removed = remove(held, &fence, &mut |_| {}).unwrap();
     assert!(!root.exists());
     assert!(
         home.join("outside/keep").exists(),
@@ -131,11 +132,12 @@ fn a_folder_swapped_in_during_a_remove_is_never_touched() {
     let (_t, home) = home();
     let root = home.join("cache");
     tree(&root);
-    let held = hold(&root, &Fence::new(&home)).unwrap();
+    let fence = Fence::new(&home);
+    let held = hold(&root, &fence).unwrap();
     let mut swapped = false;
     // After the first entry goes, the folder is moved away and a lookalike with something
     // precious takes its name.
-    let result = remove(held, &mut |_| {
+    let result = remove(held, &fence, &mut |_| {
         if !swapped {
             swapped = true;
             fs::rename(&root, home.join("moved")).unwrap();
@@ -161,9 +163,10 @@ fn a_subfolder_swapped_for_a_symlink_mid_remove_goes_as_a_link() {
     fs::write(root.join("z/f"), b"x").unwrap();
     fs::create_dir_all(home.join("precious")).unwrap();
     fs::write(home.join("precious/f"), b"keep").unwrap();
-    let held = hold(&root, &Fence::new(&home)).unwrap();
+    let fence = Fence::new(&home);
+    let held = hold(&root, &fence).unwrap();
     let mut once = false;
-    let result = remove(held, &mut |_| {
+    let result = remove(held, &fence, &mut |_| {
         if !once {
             once = true;
             // Whichever of a and z is still there becomes a symlink to the precious folder.
@@ -179,4 +182,57 @@ fn a_subfolder_swapped_for_a_symlink_mid_remove_goes_as_a_link() {
     // Either it stopped because the folder changed, or it removed the link as a link.
     let _ = result;
     assert_eq!(fs::read(home.join("precious/f")).unwrap(), b"keep");
+}
+
+#[test]
+fn documents_moved_into_the_folder_mid_remove_stops_it_untouched() {
+    let (_t, home) = home();
+    let docs = home.join("Documents");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("thesis.txt"), b"years of work").unwrap();
+    let root = home.join("cache");
+    let sub = |i: usize| root.join(format!("d{i}"));
+    for i in 0..10 {
+        fs::create_dir_all(sub(i)).unwrap();
+        fs::write(sub(i).join("f"), b"cache").unwrap();
+    }
+    let fence = Fence::new(&home);
+    let held = hold(&root, &fence).unwrap();
+    let mut moved = false;
+    // After the first file goes, Documents is renamed into a folder not yet emptied.
+    let result = remove(held, &fence, &mut |_| {
+        if !moved {
+            let next = (0..10).map(sub).find(|d| d.join("f").exists()).unwrap();
+            fs::rename(&docs, next.join("docs")).unwrap();
+            moved = true;
+        }
+    });
+    let stopped = result.unwrap_err();
+    assert!(stopped.error.contains("protected"), "{stopped:?}");
+    assert!(stopped.at.ends_with("docs"), "{stopped:?}");
+    let now = (0..10).map(|i| sub(i).join("docs")).find(|d| d.exists());
+    assert_eq!(
+        fs::read(now.unwrap().join("thesis.txt")).unwrap(),
+        b"years of work"
+    );
+}
+
+#[test]
+fn the_fence_keeps_scrys_own_folders_and_every_folder_above_them() {
+    let (_t, home) = home();
+    let state = home.join(".npm/scry-home/state");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(home.join(".cargo/registry")).unwrap();
+    let fence = Fence::keeping(&home, std::slice::from_ref(&state));
+    let id = |p: &Path| file_id(&fs::symlink_metadata(p).unwrap());
+    assert!(!fence.allows(id(&state)));
+    assert!(!fence.allows(id(&home.join(".npm"))));
+    assert!(fence.allows(id(&home.join(".cargo/registry"))));
+    assert_eq!(
+        hold(&home.join(".npm"), &fence).err(),
+        Some(HoldError::Fenced)
+    );
+    // The default folders are kept without being named.
+    fs::create_dir_all(home.join(".config/scry")).unwrap();
+    assert!(!Fence::new(&home).allows(id(&home.join(".config"))));
 }

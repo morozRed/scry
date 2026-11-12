@@ -2,12 +2,15 @@
 //!
 //! - [`Fence`] names, by device and inode, the folders no cleanup may act on: the home folder
 //!   and every folder above it, Desktop, Documents and Downloads wherever they really are,
-//!   and every folder above one of those. Names are never compared.
+//!   and every folder above one of those, and Scry's own config and state folders and
+//!   every folder above them. Names are never compared.
 //! - [`hold`] opens a path from `/` one component at a time with `O_NOFOLLOW`, checking each
 //!   folder's identity before it is opened, so a symlink anywhere on the way fails it and a
 //!   protected folder is never opened.
 //! - [`remove`] deletes the held folder through its descriptor with `openat` and `unlinkat`,
-//!   never following a symlink and never entering a folder on another device.
+//!   never following a symlink, never entering a folder on another device, and checking
+//!   every folder it opens against the fence, so a protected folder moved inside while it
+//!   runs stops it untouched.
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
@@ -17,6 +20,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
+use crate::paths::{HOME_ENV, Paths, normalize_home};
 use crate::protected::{FOLDERS, FileId, Protected, file_id};
 
 const DIR_FLAGS: libc::c_int =
@@ -31,7 +35,14 @@ pub struct Fence {
 }
 
 impl Fence {
+    /// The fence for `home`, keeping Scry's own folders where they are by default and where
+    /// `SCRY_HOME` puts them.
     pub fn new(home: &Path) -> Fence {
+        Fence::keeping(home, &own_folders(home))
+    }
+
+    /// The fence for `home` that also keeps each of `own` and every folder above it.
+    pub fn keeping(home: &Path, own: &[PathBuf]) -> Fence {
         let mut above = HashSet::new();
         let mut climb = |p: &Path, with_self: bool| {
             // Where the folder really is, so a protected folder that is a symlink to a folder
@@ -49,6 +60,9 @@ impl Fence {
         for name in FOLDERS {
             climb(&home.join(name), false);
         }
+        for dir in own {
+            climb(dir, true);
+        }
         Fence {
             protected: Protected::new(home),
             above,
@@ -63,6 +77,24 @@ impl Fence {
     pub fn allows(&self, id: FileId) -> bool {
         !self.protected(id) && !self.above.contains(&id)
     }
+}
+
+/// Where Scry keeps its config and state: the default folders under `home`, and those under
+/// `SCRY_HOME` when it is set.
+pub fn own_folders(home: &Path) -> Vec<PathBuf> {
+    let mut all = vec![Paths::new(home.to_path_buf(), None)];
+    if let Some(h) = std::env::var_os(HOME_ENV).filter(|h| !h.is_empty())
+        && let Ok(h) = normalize_home(Path::new(&h))
+    {
+        all.push(Paths::new(home.to_path_buf(), Some(h)));
+    }
+    let mut out = Vec::new();
+    for p in all {
+        out.extend(p.config.parent().map(Path::to_path_buf));
+        out.push(p.state);
+        out.extend(p.scry_home);
+    }
+    out
 }
 
 /// A folder opened through the folders above it, with its parent held too.
@@ -257,11 +289,17 @@ pub struct Stopped {
 }
 
 /// Deletes the held folder and everything in it. `progress` runs after each entry goes,
-/// with the count so far.
-pub fn remove(held: Held, progress: &mut dyn FnMut(&Removed)) -> Result<Removed, Stopped> {
+/// with the count so far. A folder inside that the fence keeps, moved there while it runs,
+/// stops it before anything in that folder goes.
+pub fn remove(
+    held: Held,
+    fence: &Fence,
+    progress: &mut dyn FnMut(&Removed),
+) -> Result<Removed, Stopped> {
     let dev = held.id.0;
     let mut removed = Removed::default();
-    empty(&held.dir, dev, Path::new(""), 0, &mut removed, progress)?;
+    let at = Path::new("");
+    empty(&held.dir, (dev, fence), at, 0, &mut removed, progress)?;
     let stop = |removed: Removed, error: String| Stopped {
         removed,
         error,
@@ -322,9 +360,10 @@ fn names(dir: &OwnedFd) -> io::Result<Vec<CString>> {
     Ok(out)
 }
 
+/// Empties `dir`, never leaving the device `dev` and never entering a folder `fence` keeps.
 fn empty(
     dir: &OwnedFd,
-    dev: i32,
+    (dev, fence): (i32, &Fence),
     rel: &Path,
     depth: usize,
     removed: &mut Removed,
@@ -354,6 +393,15 @@ fn empty(
                     "a volume is mounted there, and Scry never deletes across volumes".into(),
                 ));
             }
+            // Desktop, Documents, Downloads, a folder above one, or Scry's own, moved inside
+            // since the folder was held.
+            if !fence.allows((st.st_dev, st.st_ino)) {
+                return Err(stop(
+                    removed,
+                    at,
+                    "a protected folder is inside it now, and Scry never deletes one".into(),
+                ));
+            }
             let child = open_at(dir, &name, (st.st_dev, st.st_ino)).map_err(|e| {
                 let why = match e {
                     HoldError::Io(e) => e,
@@ -361,7 +409,7 @@ fn empty(
                 };
                 stop(removed, at.clone(), why)
             })?;
-            empty(&child, dev, &at, depth + 1, removed, progress)?;
+            empty(&child, (dev, fence), &at, depth + 1, removed, progress)?;
             drop(child);
             if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
                 return Err(stop(removed, at, io::Error::last_os_error().to_string()));
