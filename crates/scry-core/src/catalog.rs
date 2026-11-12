@@ -309,7 +309,6 @@ pub fn classify_with(exe: &str, argv: &[String], facts: Facts) -> Option<&'stati
 /// The `ssh` options that take a value, from ssh(1).
 const SSH_VALUED: &str = "BbcDEeFIiJLlmOoPpQRSWw";
 
-
 /// Reads `ssh`'s options as ssh does: clusters such as `-fNL`, values glued on (`-p2222`) or
 /// in the next argument, and nothing after the destination, which starts the remote command.
 fn ssh_serves(argv: &[String]) -> bool {

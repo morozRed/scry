@@ -58,7 +58,9 @@ pub fn run(a: ReapArgs) -> Result<()> {
 
     if list.is_empty() {
         if a.json {
-            print_json(&json!({ "dry_run": a.dry_run, "targets": list, "report": Report::default() }));
+            print_json(
+                &json!({ "dry_run": a.dry_run, "targets": list, "report": Report::default() }),
+            );
         } else {
             println!("No leftovers to reap.");
         }
@@ -214,7 +216,10 @@ pub fn keep(a: KeepArgs) -> Result<()> {
     }
     let file = paths.tilde(&edit.config);
     if edit.already {
-        println!("`{}` is already on the keep list in {file}.", printable(&entry));
+        println!(
+            "`{}` is already on the keep list in {file}.",
+            printable(&entry)
+        );
         return Ok(());
     }
     let done = if a.dry_run { "Would change" } else { "Changed" };

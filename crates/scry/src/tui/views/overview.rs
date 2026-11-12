@@ -20,8 +20,8 @@ pub const VIEW: ViewDef = ViewDef {
          A filling disk and stale worktrees will show up here too.",
     ),
     badge,
-    hints: &[("⏎", "go to")],
-    reap: None,
+    hints: &[("⏎", "go to"), ("X", "reap")],
+    reap: Some(super::agents::reap),
 };
 
 fn rows(board: &Board) -> Load<Vec<Row>> {

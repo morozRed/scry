@@ -733,7 +733,18 @@ fn an_ssh_master_from_ssh_config_is_never_a_leftover() {
     let s = snap(vec![
         ssh(1000, &["ssh", "-fN", "build.example.com"]),
         ssh(1001, &["ssh", "-N", "-L", "5432:db:5432", "bastion"]),
-        ssh(1002, &["ssh", "-o", "ExitOnForwardFailure=yes", "-f", "host", "sleep", "60"]),
+        ssh(
+            1002,
+            &[
+                "ssh",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-f",
+                "host",
+                "sleep",
+                "60",
+            ],
+        ),
         // -N after the host belongs to the remote command, not to ssh.
         ssh(1003, &["ssh", "host", "ls", "-N"]),
         // -p takes 2222 as its value, and -i takes `-f` as a file name.

@@ -466,7 +466,9 @@ mod tests {
             serde_json::to_value(&board).unwrap()
         );
         assert!(
-            serde_json::to_string(&busier).unwrap().contains("hold 1.2G and :3000"),
+            serde_json::to_string(&busier)
+                .unwrap()
+                .contains("hold 1.2G and :3000"),
             "a size in a sentence moved"
         );
         busier.overview.process_count += 7;

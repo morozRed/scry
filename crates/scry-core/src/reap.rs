@@ -17,7 +17,7 @@ use crate::attribution::{Lineage, Verdict};
 use crate::control::{self, Host, Outcome, Refusal, StopTarget};
 use crate::home::Home;
 use crate::live::Collector;
-use crate::model::{Agent, ProcId, Snapshot};
+use crate::model::{ProcId, Snapshot};
 use crate::paths::Paths;
 use crate::store::{AuditRow, Store};
 use crate::view::Evidence;
@@ -28,9 +28,9 @@ use crate::view::agents::{self, Leftover};
 pub struct ReapTarget {
     pub id: ProcId,
     pub command: String,
-    pub agent: Agent,
+    /// The agent and the start of the session id, as `claude 0f1e2d3c`.
     pub session: String,
-    pub evidence: Evidence,
+    pub evidence: Option<Evidence>,
     pub ram: Option<u64>,
 }
 
@@ -42,9 +42,8 @@ impl From<&Leftover> for ReapTarget {
                 start_us: l.start_us,
             },
             command: l.command.clone(),
-            agent: l.agent,
-            session: l.session.clone(),
-            evidence: l.evidence,
+            session: format!("{} {}", l.agent.short(), l.session),
+            evidence: Some(l.evidence),
             ram: l.ram,
         }
     }
@@ -84,21 +83,45 @@ fn children_first(snap: &Snapshot, list: &mut [Leftover]) {
     list.sort_by_key(|l| (Reverse(depth(l.pid)), Reverse(l.start_us), l.pid));
 }
 
-/// Reads whether a process is still a leftover, right before a signal.
+/// The check right before each signal, ahead of the identity check: for a reap, that the
+/// process is still a leftover.
 pub trait Judge {
-    fn still_leftover(&mut self, id: ProcId) -> Result<(), Refusal>;
+    fn check(&mut self, id: ProcId) -> Result<(), Refusal>;
 }
 
 /// The live judge: a fresh reading of the machine for each question.
 pub struct LiveJudge<'a>(pub &'a mut Collector);
 
 impl Judge for LiveJudge<'_> {
-    fn still_leftover(&mut self, id: ProcId) -> Result<(), Refusal> {
+    fn check(&mut self, id: ProcId) -> Result<(), Refusal> {
         let r = self.0.read().map_err(|e| Refusal::NotLeftover {
             pid: id.pid,
             why: format!("the processes could not be read again: {e:#}"),
         })?;
         verdict_of(&r.snap, &r.lineage, id)
+    }
+}
+
+/// The judge for a stop a person chose, any process of theirs: only `scry stop`'s own
+/// checks (theirs, not macOS's, not Scry), read again.
+pub struct StopJudge<'a>(pub &'a mut Collector);
+
+impl Judge for StopJudge<'_> {
+    fn check(&mut self, id: ProcId) -> Result<(), Refusal> {
+        let snap = self
+            .0
+            .read()
+            .map_err(|e| Refusal::SignalFailed {
+                pid: id.pid,
+                error: format!("the processes could not be read again: {e:#}"),
+            })?
+            .snap;
+        let t = control::resolve(&snap, control::Target::Pid(id.pid))?;
+        if t.id == id {
+            Ok(())
+        } else {
+            Err(Refusal::Changed { pid: id.pid })
+        }
     }
 }
 
@@ -253,8 +276,7 @@ pub(crate) fn run_on(
             worker_of: None,
             port: None,
         };
-        let result =
-            control::stop_checked(host, &stop, kill, grace, &mut || judge.still_leftover(t.id));
+        let result = control::stop_checked(host, &stop, kill, grace, &mut || judge.check(t.id));
         let done = Done::new(t.clone(), result);
         audit(&done);
         report.done.push(done);
@@ -277,7 +299,7 @@ pub fn kill_all(
             worker_of: None,
             port: None,
         };
-        let result = control::kill(&stop, &mut || judge.still_leftover(t.id));
+        let result = control::kill(&stop, &mut || judge.check(t.id));
         let done = Done::new(t.clone(), result);
         audit(&done);
         report.done.push(done);
@@ -324,6 +346,7 @@ pub fn audit_row(actor: &str, action: &str, id: ProcId, command: &str, result: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Agent;
     use crate::sys::{self, Liveness};
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -334,9 +357,8 @@ mod tests {
         ReapTarget {
             id: ProcId { pid, start_us },
             command: format!("job {pid}"),
-            agent: Agent::ClaudeCode,
-            session: "s1".into(),
-            evidence: Evidence::Stamp,
+            session: "claude s1".into(),
+            evidence: Some(Evidence::Stamp),
             ram: None,
         }
     }
@@ -382,7 +404,7 @@ mod tests {
     }
 
     impl Judge for Judged<'_> {
-        fn still_leftover(&mut self, id: ProcId) -> Result<(), Refusal> {
+        fn check(&mut self, id: ProcId) -> Result<(), Refusal> {
             self.log.borrow_mut().push(format!("judge {}", id.pid));
             if self.leftovers.contains(&id.pid) {
                 Ok(())
@@ -438,7 +460,10 @@ mod tests {
             Some(Refusal::NotLeftover { pid: 12, .. })
         ));
         assert_eq!(audited.len(), 3, "every target is audited");
-        assert_eq!(report.summary(), "Stopped 1, 1 still running, 1 not signalled.");
+        assert_eq!(
+            report.summary(),
+            "Stopped 1, 1 still running, 1 not signalled."
+        );
         assert_eq!(report.exit_code(), 2);
         assert!(host.alive.borrow().contains_key(&12), "spared");
     }
@@ -487,7 +512,7 @@ mod tests {
         let mut calls = 0;
         struct Once<'a>(&'a mut i32);
         impl Judge for Once<'_> {
-            fn still_leftover(&mut self, id: ProcId) -> Result<(), Refusal> {
+            fn check(&mut self, id: ProcId) -> Result<(), Refusal> {
                 *self.0 += 1;
                 if *self.0 == 1 {
                     Ok(())
@@ -533,7 +558,7 @@ mod tests {
 
     struct Everything;
     impl Judge for Everything {
-        fn still_leftover(&mut self, _: ProcId) -> Result<(), Refusal> {
+        fn check(&mut self, _: ProcId) -> Result<(), Refusal> {
             Ok(())
         }
     }

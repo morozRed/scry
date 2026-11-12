@@ -55,7 +55,10 @@ impl Fixture {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        let session = format!("{:08x}-4b5a-4968-8776-a5b4c3d2e1f0", nanos ^ std::process::id());
+        let session = format!(
+            "{:08x}-4b5a-4968-8776-a5b4c3d2e1f0",
+            nanos ^ std::process::id()
+        );
 
         let mut agent = Command::new(&agent_exe);
         agent
@@ -75,7 +78,10 @@ impl Fixture {
         let mut out = BufReader::new(agent.stdout.take().unwrap());
         let (child, grandchild) = loop {
             let mut line = String::new();
-            assert!(out.read_line(&mut line).unwrap() > 0, "the agent said nothing");
+            assert!(
+                out.read_line(&mut line).unwrap() > 0,
+                "the agent said nothing"
+            );
             if let Some(rest) = line.trim().strip_prefix("tree ") {
                 let (c, g) = rest.split_once(' ').unwrap();
                 break (c.parse().unwrap(), g.parse().unwrap());
@@ -157,7 +163,12 @@ fn pids(v: &Value) -> Vec<i64> {
     v.as_array()
         .unwrap()
         .iter()
-        .map(|t| t["pid"].as_i64().or(t["target"]["id"]["pid"].as_i64()).unwrap())
+        .map(|t| {
+            t["pid"]
+                .as_i64()
+                .or(t["target"]["id"]["pid"].as_i64())
+                .unwrap()
+        })
         .collect()
 }
 
@@ -200,9 +211,19 @@ fn reaping_the_m2_fixture_kills_its_tree_children_first_and_nothing_else() {
     // Each accepted action is audited, in order.
     let audit = f.audit();
     assert_eq!(audit.len(), 2, "{audit:?}");
-    assert!(audit[0].1.starts_with(&format!("pid {g} started ")), "{audit:?}");
-    assert!(audit[1].1.starts_with(&format!("pid {c} started ")), "{audit:?}");
-    assert!(audit.iter().all(|a| a.0 == "reap" && a.2.starts_with("exited after SIGTERM")));
+    assert!(
+        audit[0].1.starts_with(&format!("pid {g} started ")),
+        "{audit:?}"
+    );
+    assert!(
+        audit[1].1.starts_with(&format!("pid {c} started ")),
+        "{audit:?}"
+    );
+    assert!(
+        audit
+            .iter()
+            .all(|a| a.0 == "reap" && a.2.starts_with("exited after SIGTERM"))
+    );
 
     // Nothing left to reap.
     let (code, v) = f.json(&["reap", "--yes", "--json", "--session", &f.session]);
@@ -229,7 +250,12 @@ fn destructive_false_refuses_and_names_its_line() {
     // The dry run still lists, and says it would be refused.
     let v = f.dry_run();
     assert_eq!(pids(&v["targets"]).len(), 2);
-    assert!(v["disabled"].as_str().unwrap().contains("destructive = false"));
+    assert!(
+        v["disabled"]
+            .as_str()
+            .unwrap()
+            .contains("destructive = false")
+    );
     assert!(alive(f.child) && alive(f.grandchild));
     assert!(f.audit().is_empty());
 }
@@ -241,13 +267,19 @@ fn a_kept_process_is_not_listed_again() {
     let (code, v) = f.json(&["keep", &child, "--json"]);
     assert_eq!(code, Some(0), "{v:#}");
     let entry = v["edit"]["entry"].as_str().unwrap().to_string();
-    assert!(entry.ends_with("/9.9.9") || entry.contains("reap-"), "{entry}");
+    assert!(
+        entry.ends_with("/9.9.9") || entry.contains("reap-"),
+        "{entry}"
+    );
     let config = std::fs::read_to_string(f.home.join("config.toml")).unwrap();
     assert!(
         config.starts_with("leftover_grace_secs = 0\nkeep = ["),
         "{config}"
     );
-    assert_eq!(v["diff"][0].as_str().unwrap(), format!("+ {}", config.lines().nth(1).unwrap()));
+    assert_eq!(
+        v["diff"][0].as_str().unwrap(),
+        format!("+ {}", config.lines().nth(1).unwrap())
+    );
     // The same program runs as the grandchild, so the entry keeps both.
     let v = f.dry_run();
     assert_eq!(v["targets"], Value::Array(vec![]), "{v:#}");
@@ -289,7 +321,10 @@ fn fixture_agent() {
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let grandchild = loop {
         let mut line = String::new();
-        assert!(out.read_line(&mut line).unwrap() > 0, "the child said nothing");
+        assert!(
+            out.read_line(&mut line).unwrap() > 0,
+            "the child said nothing"
+        );
         if let Some(pid) = line.trim().strip_prefix("grandchild ") {
             break pid.to_string();
         }
@@ -309,7 +344,7 @@ fn fixture_child() {
         return;
     }
     unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
-    let grandchild = Command::new(std::env::current_exe().unwrap())
+    let mut grandchild = Command::new(std::env::current_exe().unwrap())
         .args(["fixture_grandchild", "--exact", "--nocapture", "--quiet"])
         .env_remove("SCRY_FIXTURE_CHILD")
         .env("SCRY_FIXTURE_GRANDCHILD", "1")
@@ -319,7 +354,9 @@ fn fixture_child() {
         .unwrap();
     println!("grandchild {}", grandchild.id());
     std::io::stdout().flush().unwrap();
+    // Outlives its grandchild: reaped first, the grandchild must not end this one.
     std::thread::sleep(Duration::from_secs(600));
+    let _ = grandchild.wait();
 }
 
 #[test]

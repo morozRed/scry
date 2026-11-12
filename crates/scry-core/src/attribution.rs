@@ -828,8 +828,7 @@ fn judge(
                 ..
             }
     );
-    if stamped && let Some((pid, what)) = cx.carrier_of(p, session)
-    {
+    if stamped && let Some((pid, what)) = cx.carrier_of(p, session) {
         return spared(Spare::StampCarried { pid, what });
     }
     if let Some(tty) = &p.tty {

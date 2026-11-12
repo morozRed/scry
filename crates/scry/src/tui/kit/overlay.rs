@@ -8,6 +8,8 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Row, Table, Wr
 use scry_core::view::{human_age, human_bytes};
 
 use super::wrapped_lines;
+use scry_core::keep::KeepEdit;
+
 use crate::tui::app::{Sheet, SheetKind};
 use crate::tui::theme::{Chrome, Theme};
 
@@ -42,12 +44,17 @@ pub fn confirm_label(kind: SheetKind) -> &'static str {
     match kind {
         SheetKind::Stop => "send SIGTERM",
         SheetKind::Reap => "reap all",
+        SheetKind::Kill => "send SIGKILL",
+        SheetKind::Keep => "write config",
     }
 }
 
 /// Rises from the bottom of the body and lists every target before anything is sent.
 /// Returns where it was drawn, for the fade.
 pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
+    if let Some((edit, file)) = sheet.keep.as_deref() {
+        return keep_sheet(f, body, theme, edit, file);
+    }
     let n = sheet.targets.len();
     let (title, what) = match sheet.kind {
         SheetKind::Stop => (
@@ -57,6 +64,10 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
         SheetKind::Reap => (
             format!("Reap {}?", plural(n, "leftover", "leftovers")),
             "Children first, each re-checked by pid and start time just before its signal. Processes tied only by a guess are never included.",
+        ),
+        SheetKind::Kill | SheetKind::Keep => (
+            format!("Send SIGKILL to {}?", plural(n, "process", "processes")),
+            "Still running 3 s after SIGTERM. SIGKILL cannot be caught or cleaned up after; each is re-checked just before it.",
         ),
     };
     let frees: u64 = sheet.targets.iter().filter_map(|t| t.frees).sum();
@@ -183,7 +194,58 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
     area
 }
 
-const KEYS: [(&str, &str, &str); 14] = [
+/// The keep list's change as a diff, with the config it goes into.
+fn keep_sheet(f: &mut Frame, body: Rect, theme: &Theme, edit: &KeepEdit, file: &str) -> Rect {
+    let what = format!(
+        "Adds it to the keep list in {file}, so no rule selects it, or anything else that matches it, again. Nothing else in the file changes."
+    );
+    let mut text = vec![
+        Line::styled(format!("Keep `{}`?", edit.entry), theme.strong),
+        Line::styled(what.clone(), theme.muted),
+        Line::raw(""),
+        Line::styled(format!("{file} line {}", edit.line), theme.heading),
+    ];
+    for l in &edit.before {
+        text.push(Line::styled(format!("- {l}"), theme.danger));
+    }
+    for l in &edit.after {
+        text.push(Line::styled(format!("+ {l}"), theme.ok));
+    }
+    let padding = Padding::new(2, 2, 1, 1);
+    let probe = card(theme, Borders::TOP).padding(padding).inner(body);
+    let lines = text.len() as u16 + wrapped_lines(&what, probe.width);
+    let mut height = ((body.height - probe.height) + lines).min(body.height);
+    if body.height - height < PEEK_MIN {
+        height = body.height;
+    }
+    let borders = if height == body.height {
+        Borders::NONE
+    } else {
+        Borders::TOP
+    };
+    let area = Rect {
+        y: body.bottom() - height,
+        height,
+        ..body
+    };
+    let above = area.y.saturating_sub(1).max(body.y);
+    let gap = Rect {
+        y: above,
+        height: area.y - above,
+        ..area
+    };
+    f.render_widget(Clear, gap);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(card(theme, borders).padding(padding)),
+        area,
+    );
+    area
+}
+
+const KEYS: [(&str, &str, &str); 15] = [
     ("Move", "j k ↑ ↓", "up and down, ctrl-d ctrl-u by page"),
     ("", "g G", "first and last row"),
     ("", "⏎", "fold a session, or go to the row"),
@@ -194,6 +256,7 @@ const KEYS: [(&str, &str, &str); 14] = [
     ("", "s  S", "sort by the next column, reverse"),
     ("Act", "x", "stop the selected process"),
     ("", "X", "reap leftovers"),
+    ("", "K", "keep: never select it again"),
     ("", "r", "refresh now; auto every refresh_secs (5 s)"),
     ("App", "?", "this help"),
     ("", "ctrl-z", "suspend to the shell"),

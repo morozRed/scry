@@ -315,7 +315,10 @@ sample_interval_secs = 1
         let c = parse("# off for now\nkeep = []\n  destructive   =  false # agents\n").unwrap();
         assert!(!c.destructive);
         assert_eq!(c.destructive_line, Some(3));
-        assert_eq!(parse("destructive = true\n").unwrap().destructive_line, None);
+        assert_eq!(
+            parse("destructive = true\n").unwrap().destructive_line,
+            None
+        );
         assert_eq!(
             parse("leftover_grace_secs = 0\n").unwrap().leftover_grace,
             std::time::Duration::ZERO

@@ -25,8 +25,8 @@ use crate::paths::Paths;
 /// Executables that run a script or a command line they are given rather than a program of
 /// their own. Matched by file name; `python` also covers `python3.12` and Python.app.
 const RUNNERS: [&str; 22] = [
-    "node", "bun", "deno", "python", "Python", "ruby", "perl", "php", "java", "sh", "bash",
-    "zsh", "dash", "fish", "uv", "uvx", "npm", "npx", "pnpm", "yarn", "tsx", "ts-node",
+    "node", "bun", "deno", "python", "Python", "ruby", "perl", "php", "java", "sh", "bash", "zsh",
+    "dash", "fish", "uv", "uvx", "npm", "npx", "pnpm", "yarn", "tsx", "ts-node",
 ];
 
 /// Whether a process matches a keep entry: its name, its executable's path, or its command
@@ -349,9 +349,16 @@ mod tests {
         assert_eq!(entry_for(&tunnel, Some(&p.user_home)), "~/bin/tunnel");
         let next = process("node", "/opt/homebrew/bin/node", Some("next dev"));
         assert_eq!(entry_for(&next, Some(&p.user_home)), "next dev");
-        let py = process("python3.12", "/usr/local/bin/python3.12", Some("uvicorn app"));
+        let py = process(
+            "python3.12",
+            "/usr/local/bin/python3.12",
+            Some("uvicorn app"),
+        );
         assert_eq!(entry_for(&py, Some(&p.user_home)), "uvicorn app");
-        for (proc, entry) in [(&tunnel, format!("{home}/bin/tunnel")), (&next, "next dev".into())] {
+        for (proc, entry) in [
+            (&tunnel, format!("{home}/bin/tunnel")),
+            (&next, "next dev".into()),
+        ] {
             assert!(matches(proc, &entry));
         }
         assert!(matches(&next, "node"), "by name, as before");
