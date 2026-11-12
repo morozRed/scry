@@ -4,9 +4,12 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Run with a Scry home of its own, so the audit rows `stop` writes stay out of the real store.
 fn scry(args: &[&str]) -> std::process::Output {
+    let home = std::env::temp_dir().join(format!("scry-live-home-{}", std::process::id()));
     Command::new(env!("CARGO_BIN_EXE_scry"))
         .args(args)
+        .env("SCRY_HOME", &home)
         .stdin(Stdio::null())
         .output()
         .expect("scry runs")

@@ -278,6 +278,16 @@ pub fn leftovers(a: LeftoversArgs) -> Result<()> {
         }
         return Ok(());
     }
+    print!("{}", leftover_table(&list));
+    println!("{}", agents::PERSISTENT);
+    if let Some(c) = r.caveat() {
+        println!("{c}");
+    }
+    Ok(())
+}
+
+/// Leftovers as `scry leftovers` and `scry reap` print them, in the order given.
+pub fn leftover_table(list: &[Leftover]) -> String {
     let head = [
         "PID", "COMMAND", "SESSION", "EVIDENCE", "AGE", "RAM", "PORT",
     ];
@@ -300,12 +310,7 @@ pub fn leftovers(a: LeftoversArgs) -> Result<()> {
             .map(|c| printable(&c))
         })
         .collect();
-    print!("{}", columns(&head, &cells));
-    println!("{}", agents::PERSISTENT);
-    if let Some(c) = r.caveat() {
-        println!("{c}");
-    }
-    Ok(())
+    columns(&head, &cells)
 }
 
 /// One JSON line per change: anything in the board other than ages, which move on every

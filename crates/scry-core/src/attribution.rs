@@ -877,11 +877,10 @@ fn tty_below(p: &Process, children: &HashMap<i32, Vec<&Process>>) -> Option<(i32
     None
 }
 
-/// A keep entry names a process by its name or its executable's full path.
+/// A keep entry names a process by its name, its executable's full path or its command
+/// label; see [`crate::keep`].
 fn kept(p: &Process, keep: &[String]) -> Option<String> {
-    keep.iter()
-        .find(|k| **k == p.name || p.exe.as_deref() == Some(k.as_str()))
-        .cloned()
+    keep.iter().find(|k| crate::keep::matches(p, k)).cloned()
 }
 
 #[cfg(test)]

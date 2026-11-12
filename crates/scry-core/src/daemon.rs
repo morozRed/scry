@@ -610,7 +610,9 @@ mod tests {
         Config {
             code_roots: vec![],
             destructive: false,
+            destructive_line: None,
             keep: vec![],
+            leftover_grace: crate::attribution::DEFAULT_GRACE,
             daemon: DaemonConfig {
                 sample_interval_secs: interval,
             },

@@ -2,8 +2,9 @@
 //!
 //! ```toml
 //! code_roots = ["~/sources", "~/work"]   # where projects and worktrees live
-//! destructive = false                      # false disables every write path
+//! destructive = false                      # false refuses every stop, reap and cleanup
 //! keep = ["postgres", "~/bin/tunnel"]      # never selected by a rule
+//! leftover_grace_secs = 300                # how old a leftover must be
 //!
 //! [daemon]
 //! sample_interval_secs = 600               # disk sampling period
@@ -23,15 +24,22 @@ pub const DEFAULT_CODE_ROOTS: [&str; 4] = ["~/sources", "~/code", "~/src", "~/De
 pub const DEFAULT_SAMPLE_INTERVAL_SECS: u64 = 600;
 pub const DEFAULT_REFRESH_SECS: u64 = 5;
 pub const MAX_REFRESH_SECS: u64 = 60;
+/// The longest leftover grace period the config takes: a week, as long as history is kept.
+pub const MAX_GRACE_SECS: u64 = 7 * 86_400;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Absolute. The defaults are the ones in `DEFAULT_CODE_ROOTS` that exist.
     pub code_roots: Vec<PathBuf>,
-    /// False turns every kill and trash path off, for people and agents alike.
+    /// False turns every kill and trash path off, for people and agents alike. True when the
+    /// file does not say: the confirmation sheet and `--yes` guard each action.
     pub destructive: bool,
+    /// The line of `destructive = false`, so a refusal can point at it.
+    pub destructive_line: Option<usize>,
     /// Process names or executable paths that no rule ever selects.
     pub keep: Vec<String>,
+    /// How old a process must be before it can be a leftover.
+    pub leftover_grace: std::time::Duration,
     pub daemon: DaemonConfig,
     pub tui: TuiConfig,
     /// Hex hash of the settings in the file, so a daemon started with other settings can be
@@ -89,6 +97,9 @@ struct FileConfig {
     code_roots: Option<Vec<PathBuf>>,
     destructive: Option<bool>,
     keep: Option<Vec<String>>,
+    /// Left out of the fingerprint: only clients judge leftovers.
+    #[serde(default, skip_serializing)]
+    leftover_grace_secs: Option<Grace>,
     #[serde(default)]
     daemon: FileDaemon,
     /// Left out of the fingerprint: the daemon does not read it, so changing it must not
@@ -118,6 +129,28 @@ impl TryFrom<u64> for Refresh {
             Ok(Refresh(secs))
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(try_from = "u64")]
+struct Grace(u64);
+
+impl TryFrom<u64> for Grace {
+    type Error = String;
+    fn try_from(secs: u64) -> Result<Self, Self::Error> {
+        if secs > MAX_GRACE_SECS {
+            Err(format!("leftover_grace_secs must be 0 to {MAX_GRACE_SECS}"))
+        } else {
+            Ok(Grace(secs))
+        }
+    }
+}
+
+/// Where `destructive` is set, read apart from the settings so their fingerprint stays as it
+/// was.
+#[derive(Deserialize)]
+struct DestructiveAt {
+    destructive: Option<toml::Spanned<bool>>,
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -176,10 +209,20 @@ impl Config {
                 .filter(|r| r.is_dir())
                 .collect(),
         };
+        let destructive = file.destructive.unwrap_or(true);
+        let destructive_line = (!destructive)
+            .then(|| toml::from_str::<DestructiveAt>(text).ok()?.destructive)
+            .flatten()
+            .map(|s| text[..s.span().start].matches('\n').count() + 1);
         Ok(Config {
             code_roots,
-            destructive: file.destructive.unwrap_or(false),
+            destructive,
+            destructive_line,
             keep: file.keep.unwrap_or_default(),
+            leftover_grace: std::time::Duration::from_secs(
+                file.leftover_grace_secs
+                    .map_or(crate::attribution::DEFAULT_GRACE.as_secs(), |g| g.0),
+            ),
             daemon: DaemonConfig {
                 sample_interval_secs: file
                     .daemon
@@ -209,7 +252,9 @@ mod tests {
         let (c, src) = Config::load(&paths(tmp.path())).unwrap();
         assert_eq!(src, Source::Defaults);
         assert_eq!(c.code_roots, vec![tmp.path().join("code")]);
-        assert!(!c.destructive);
+        assert!(c.destructive, "on unless the file turns it off");
+        assert_eq!(c.destructive_line, None);
+        assert_eq!(c.leftover_grace.as_secs(), 300);
         assert!(c.keep.is_empty());
         assert_eq!(c.daemon.sample_interval_secs, 600);
         assert_eq!(c.tui.refresh_secs, 5);
@@ -260,6 +305,28 @@ sample_interval_secs = 1
         assert!(c.destructive);
         assert_eq!(c.keep, vec!["postgres"]);
         assert_eq!(c.daemon.sample_interval_secs, 1);
+    }
+
+    #[test]
+    fn destructive_false_names_its_line_and_grace_takes_0_to_a_week() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let parse = |text: &str| Config::parse(text, &p, Path::new("c.toml"));
+        let c = parse("# off for now\nkeep = []\n  destructive   =  false # agents\n").unwrap();
+        assert!(!c.destructive);
+        assert_eq!(c.destructive_line, Some(3));
+        assert_eq!(parse("destructive = true\n").unwrap().destructive_line, None);
+        assert_eq!(
+            parse("leftover_grace_secs = 0\n").unwrap().leftover_grace,
+            std::time::Duration::ZERO
+        );
+        let e = parse("\nleftover_grace_secs = 604801\n").unwrap_err();
+        assert_eq!(e.line, Some(2), "{e}");
+        assert_eq!(
+            parse("leftover_grace_secs = 60\n").unwrap().fingerprint,
+            parse("").unwrap().fingerprint,
+            "the daemon does not judge leftovers"
+        );
     }
 
     #[test]

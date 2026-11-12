@@ -99,6 +99,20 @@ pub enum Refusal {
         pid: i32,
         error: String,
     },
+    /// The leftover rule no longer selects it, re-checked just before the signal.
+    NotLeftover {
+        pid: i32,
+        why: String,
+    },
+    /// `destructive = false` in the config.
+    Disabled {
+        config: String,
+        line: Option<usize>,
+    },
+    /// The audit row could not be written, so nothing is signalled.
+    Unaudited {
+        error: String,
+    },
 }
 
 impl fmt::Display for Refusal {
@@ -129,6 +143,22 @@ impl fmt::Display for Refusal {
             Refusal::SignalFailed { pid, error } => {
                 write!(f, "Signalling pid {pid} failed: {error}.")
             }
+            Refusal::NotLeftover { pid, why } => write!(
+                f,
+                "pid {pid} is no longer a leftover: {} Nothing was signalled.",
+                why.trim_end_matches('.').to_string() + "."
+            ),
+            Refusal::Disabled { config, line } => {
+                let at = line.map(|l| format!(" line {l}")).unwrap_or_default();
+                write!(
+                    f,
+                    "Stopping is turned off by `destructive = false` in {config}{at}. Set it to true to allow stop and reap."
+                )
+            }
+            Refusal::Unaudited { error } => write!(
+                f,
+                "The audit row could not be written, so nothing was signalled: {error}"
+            ),
         }
     }
 }
@@ -223,17 +253,19 @@ pub enum Outcome {
     Exited { signal: String, after_ms: u64 },
     /// Still alive after SIGTERM and its grace period. SIGKILL needs `--kill`.
     StillRunning { after_ms: u64 },
+    /// Still alive after SIGTERM, and SIGKILL was not sent: the check before it failed.
+    KillRefused { after_ms: u64, why: String },
 }
 
 /// What stopping needs from the system. Tests stand in for it to show the order of the
 /// checks and signals.
-trait Host {
+pub(crate) trait Host {
     fn liveness(&self, pid: i32) -> Option<Liveness>;
     fn holds_port(&self, pid: i32, proto: Proto, port: u16) -> Option<bool>;
     fn signal(&self, pid: i32, sig: libc::c_int) -> std::io::Result<()>;
 }
 
-struct Live;
+pub(crate) struct Live;
 
 impl Host for Live {
     fn liveness(&self, pid: i32) -> Option<Liveness> {
@@ -265,6 +297,18 @@ fn stop_on(
     kill: bool,
     grace: Duration,
 ) -> Result<Outcome, Refusal> {
+    stop_checked(host, t, kill, grace, &mut || Ok(()))
+}
+
+/// [`stop`], with `recheck` run before each signal, ahead of the identity check: `reap`
+/// checks there that the process is still a leftover.
+pub(crate) fn stop_checked(
+    host: &impl Host,
+    t: &StopTarget,
+    kill: bool,
+    grace: Duration,
+    recheck: &mut dyn FnMut() -> Result<(), Refusal>,
+) -> Result<Outcome, Refusal> {
     let started = Instant::now();
     let elapsed = || started.elapsed().as_millis() as u64;
     if let Some((proto, port)) = t.port
@@ -275,6 +319,7 @@ fn stop_on(
             port: port_label(proto, port),
         });
     }
+    recheck()?;
     // The port check reads the pid's open files, and the pid can be reused meanwhile, so the
     // identity is read after it, right before the signal.
     check_identity(t.id, host.liveness(t.id.pid))?;
@@ -293,6 +338,16 @@ fn stop_on(
             after_ms: elapsed(),
         });
     }
+    match recheck() {
+        Err(Refusal::Changed { .. }) => return term_worked(),
+        Err(r) => {
+            return Ok(Outcome::KillRefused {
+                after_ms: elapsed(),
+                why: r.to_string(),
+            });
+        }
+        Ok(()) => {}
+    }
     // Gone between the wait and now, or as SIGKILL was sent: SIGTERM ended it.
     if check_identity(t.id, host.liveness(t.id.pid)).is_err() {
         return term_worked();
@@ -302,6 +357,35 @@ fn stop_on(
         other => other?,
     }
     let after_ms = elapsed();
+    if wait_gone(host, t.id, KILL_GRACE) {
+        Ok(Outcome::Exited {
+            signal: "SIGKILL".into(),
+            after_ms,
+        })
+    } else {
+        Ok(Outcome::StillRunning { after_ms })
+    }
+}
+
+/// SIGKILL alone, for a process that outlived SIGTERM and a second confirmation: `recheck`,
+/// then the identity, right before the signal.
+pub fn kill(
+    t: &StopTarget,
+    recheck: &mut dyn FnMut() -> Result<(), Refusal>,
+) -> Result<Outcome, Refusal> {
+    kill_on(&Live, t, recheck)
+}
+
+pub(crate) fn kill_on(
+    host: &impl Host,
+    t: &StopTarget,
+    recheck: &mut dyn FnMut() -> Result<(), Refusal>,
+) -> Result<Outcome, Refusal> {
+    let started = Instant::now();
+    recheck()?;
+    check_identity(t.id, host.liveness(t.id.pid))?;
+    signal(host, t.id, libc::SIGKILL)?;
+    let after_ms = started.elapsed().as_millis() as u64;
     if wait_gone(host, t.id, KILL_GRACE) {
         Ok(Outcome::Exited {
             signal: "SIGKILL".into(),

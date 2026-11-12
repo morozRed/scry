@@ -183,6 +183,8 @@ fn with_leftovers(design: &Board, n: usize) -> Board {
         label,
         context: (depth == 0).then(|| "acme/batch".into()),
         pid,
+        start_us: None,
+        keep: None,
         ram: Some(48 << 20),
         ports: vec![],
         age_s: 5 * 3600,

@@ -21,12 +21,18 @@ pub struct AgentRow {
     /// The project for a session.
     pub context: Option<String>,
     pub pid: Option<i32>,
+    /// With `pid`, the process's identity, which every signal checks again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_us: Option<i64>,
     pub ram: Option<u64>,
     #[serde(default)]
     pub ports: Vec<u16>,
     pub age_s: u64,
     pub evidence: Option<Evidence>,
     pub state: Option<State>,
+    /// The keep-list entry `K` would add for a process row; see [`crate::keep`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep: Option<String>,
     pub detail: Detail,
 }
 
@@ -55,11 +61,13 @@ pub fn reap_targets(rows: &[AgentRow]) -> Vec<Target> {
                 i,
                 Target {
                     pid,
+                    start_us: row.start_us,
                     command: row.label.clone(),
                     session: session.clone(),
                     evidence: row.evidence,
                     age_s: row.age_s,
                     frees: row.ram,
+                    keep: row.keep.clone(),
                 },
             ));
         }
@@ -80,11 +88,13 @@ pub fn stop_target(rows: &[AgentRow], index: usize) -> Option<Target> {
         .map(AgentRow::session_name);
     Some(Target {
         pid,
+        start_us: row.start_us,
         command: row.label.clone(),
         session,
         evidence: row.evidence,
         age_s: row.age_s,
         frees: row.ram,
+        keep: row.keep.clone(),
     })
 }
 
@@ -333,6 +343,8 @@ fn session_row(
         label: s.key.agent.short().into(),
         context: context.clone(),
         pid: agent.map(|a| a.id.pid),
+        start_us: agent.map(|a| a.id.start_us),
+        keep: None,
         ram: (ram > 0).then_some(ram),
         ports: held,
         age_s: age(snap, started_us(snap, s)),
@@ -402,11 +414,13 @@ fn member_row(
         label: command.clone(),
         context: None,
         pid: Some(p.id.pid),
+        start_us: Some(p.id.start_us),
         ram: p.footprint,
         ports: ports.get(&p.id.pid).cloned().unwrap_or_default(),
         age_s: age(snap, p.id.start_us),
         evidence: Some(m.how.evidence()),
         state,
+        keep: Some(crate::keep::entry_for(p, home.map(Home::path).as_deref())),
         detail: Detail {
             title: command,
             facts,
@@ -496,6 +510,8 @@ mod tests {
             label: id.into(),
             context: (depth == 0).then(|| "proj".into()),
             pid: Some(id.len() as i32 * 100 + depth as i32),
+            start_us: None,
+            keep: None,
             ram: Some(1),
             ports: vec![],
             age_s: 60,
