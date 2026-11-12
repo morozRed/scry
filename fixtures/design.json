@@ -155,318 +155,216 @@
     "state": "ready",
     "value": [
       {
-        "id": "p-631-tcp",
+        "proto": "tcp",
         "port": 631,
-        "proto": "tcp",
-        "addr": "127.0.0.1",
-        "command": "cupsd",
+        "addresses": [
+          "127.0.0.1"
+        ],
         "pid": 590,
-        "project": null,
-        "session": null,
+        "start_us": 1762507400000000,
+        "process": "cupsd",
+        "uid": 0,
         "owner": "root",
+        "cwd": null,
+        "project": null,
+        "project_kind": null,
+        "session": null,
+        "age_secs": 345600,
         "ram": null,
-        "age_s": 345600,
-        "evidence": null,
         "state": "system",
-        "detail": {
-          "title": ":631 · cupsd",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "590"
-            },
-            {
-              "label": "user",
-              "value": "root"
-            }
-          ],
-          "sentence": "The print service. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
-          "evidence": []
-        }
+        "sentence": "The print service. macOS runs this listener. Scry shows it so the port list is complete, and never stops it."
       },
       {
-        "id": "p-3000-tcp",
+        "proto": "tcp",
         "port": 3000,
-        "proto": "tcp",
-        "addr": "*",
-        "command": "next dev",
+        "addresses": [
+          "*"
+        ],
         "pid": 48213,
+        "start_us": 1762845800000000,
+        "process": "next dev",
+        "uid": 501,
+        "owner": "you",
+        "cwd": null,
         "project": "acme/wt-auth",
-        "session": "claude acme/wt-auth",
-        "owner": null,
+        "project_kind": "git",
+        "session": {
+          "agent": "claude_code",
+          "id": "7f3a9c2e-1b4d-4e8a-9c3f-2a6b8d0e1f47",
+          "key": "CLAUDE_CODE_SESSION_ID"
+        },
+        "age_secs": 7200,
         "ram": 432013312,
-        "age_s": 7200,
-        "evidence": "stamp",
         "state": "leftover",
-        "detail": {
-          "title": ":3000 · next dev",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "48213"
-            },
-            {
-              "label": "addr",
-              "value": "*:3000"
-            },
-            {
-              "label": "started",
-              "value": "14:02"
-            }
-          ],
-          "sentence": ":3000 is held by next dev in ~/sources/acme/wt-auth. Its Claude Code session ended 2 h ago.",
-          "evidence": [
-            "CLAUDE_CODE_SESSION_ID in the process environment (exact)"
-          ]
-        }
+        "sentence": ":3000 is held by next dev in ~/sources/acme/wt-auth. Its Claude Code session ended 2 h ago."
       },
       {
-        "id": "p-4321-tcp",
+        "proto": "tcp",
         "port": 4321,
-        "proto": "tcp",
-        "addr": "127.0.0.1",
-        "command": "bun run dev",
+        "addresses": [
+          "127.0.0.1"
+        ],
         "pid": 52022,
+        "start_us": 1762852280000000,
+        "process": "bun run dev",
+        "uid": 501,
+        "owner": "you",
+        "cwd": null,
         "project": "notes",
-        "session": "opencode notes",
-        "owner": null,
+        "project_kind": "git",
+        "session": {
+          "agent": "claude_code",
+          "id": "c41d0b9a-5e2f-4a7b-8d16-3f9e0c2a7b58",
+          "key": "SCRY_SESSION"
+        },
+        "age_secs": 720,
         "ram": 146800640,
-        "age_s": 720,
-        "evidence": "stamp",
         "state": "live",
-        "detail": {
-          "title": ":4321 · bun run dev",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "52022"
-            },
-            {
-              "label": "addr",
-              "value": "127.0.0.1:4321"
-            }
-          ],
-          "sentence": ":4321 is held by bun run dev for the live OpenCode session in ~/sources/notes.",
-          "evidence": [
-            "SCRY_SESSION in the process environment (exact)"
-          ]
-        }
+        "sentence": ":4321 is held by bun run dev for the live OpenCode session in ~/sources/notes."
       },
       {
-        "id": "p-5000-tcp",
+        "proto": "tcp",
         "port": 5000,
-        "proto": "tcp",
-        "addr": "*",
-        "command": "ControlCenter",
+        "addresses": [
+          "*"
+        ],
         "pid": 973,
+        "start_us": 1762507400000000,
+        "process": "ControlCenter",
+        "uid": 501,
+        "owner": "you",
+        "cwd": null,
         "project": null,
+        "project_kind": null,
         "session": null,
-        "owner": null,
+        "age_secs": 345600,
         "ram": null,
-        "age_s": 345600,
-        "evidence": null,
         "state": "system",
-        "detail": {
-          "title": ":5000 · ControlCenter",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "973"
-            }
-          ],
-          "sentence": "AirPlay Receiver listens here. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
-          "evidence": [
-            "Executable inside /System/Library"
-          ]
-        }
+        "sentence": "AirPlay Receiver listens here. macOS runs this listener. Scry shows it so the port list is complete, and never stops it."
       },
       {
-        "id": "p-5173-tcp",
+        "proto": "tcp",
         "port": 5173,
-        "proto": "tcp",
-        "addr": "::1",
-        "command": "vite",
+        "addresses": [
+          "::1"
+        ],
         "pid": 50110,
+        "start_us": 1762842200000000,
+        "process": "vite",
+        "uid": 501,
+        "owner": "you",
+        "cwd": null,
         "project": "billing-api",
-        "session": "codex billing-api",
-        "owner": null,
+        "project_kind": "git",
+        "session": {
+          "agent": "codex",
+          "id": "019a7e3c-4b2d-7f10-a8e5-6c1d9b3f2e04",
+          "key": "CODEX_SESSION_ID"
+        },
+        "age_secs": 10800,
         "ram": 432013312,
-        "age_s": 10800,
-        "evidence": "stamp",
         "state": "live",
-        "detail": {
-          "title": ":5173 · vite",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "50110"
-            },
-            {
-              "label": "addr",
-              "value": "[::1]:5173"
-            }
-          ],
-          "sentence": ":5173 is held by vite for the live Codex session in ~/sources/billing-api.",
-          "evidence": [
-            "CODEX_SESSION_ID in the process environment (exact)"
-          ]
-        }
+        "sentence": ":5173 is held by vite for the live Codex session in ~/sources/billing-api."
       },
       {
-        "id": "p-5353-udp",
-        "port": 5353,
         "proto": "udp",
-        "addr": "*",
-        "command": "mDNSResponder",
+        "port": 5353,
+        "addresses": [
+          "*"
+        ],
         "pid": 410,
-        "project": null,
-        "session": null,
+        "start_us": 1762507400000000,
+        "process": "mDNSResponder",
+        "uid": 65,
         "owner": "_mdnsresponder",
+        "cwd": null,
+        "project": null,
+        "project_kind": null,
+        "session": null,
+        "age_secs": 345600,
         "ram": null,
-        "age_s": 345600,
-        "evidence": null,
         "state": "system",
-        "detail": {
-          "title": ":5353 · mDNSResponder",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "410"
-            },
-            {
-              "label": "user",
-              "value": "_mdnsresponder"
-            }
-          ],
-          "sentence": "Bonjour. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
-          "evidence": []
-        }
+        "sentence": "Bonjour. macOS runs this listener. Scry shows it so the port list is complete, and never stops it."
       },
       {
-        "id": "p-5432-tcp",
+        "proto": "tcp",
         "port": 5432,
-        "proto": "tcp",
-        "addr": "127.0.0.1",
-        "command": "postgres",
+        "addresses": [
+          "127.0.0.1"
+        ],
         "pid": 812,
+        "start_us": 1762507400000000,
+        "process": "postgres",
+        "uid": 501,
+        "owner": "you",
+        "cwd": null,
         "project": "~/Library/…/postgresql@17",
+        "project_kind": null,
         "session": null,
-        "owner": null,
+        "age_secs": 345600,
         "ram": 67108864,
-        "age_s": 345600,
-        "evidence": null,
         "state": "unowned",
-        "detail": {
-          "title": ":5432 · postgres",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "812"
-            },
-            {
-              "label": "ppid",
-              "value": "1"
-            },
-            {
-              "label": "addr",
-              "value": "127.0.0.1:5432"
-            }
-          ],
-          "sentence": "postgres was started by launchd 4 days ago, so no agent session owns it.",
-          "evidence": [
-            "No session stamp, and its parent is launchd"
-          ]
-        }
+        "sentence": "postgres was started by launchd 4 days ago, so no agent session owns it."
       },
       {
-        "id": "p-7000-tcp",
+        "proto": "tcp",
         "port": 7000,
-        "proto": "tcp",
-        "addr": "*",
-        "command": "ControlCenter",
+        "addresses": [
+          "*"
+        ],
         "pid": 973,
+        "start_us": 1762507400000000,
+        "process": "ControlCenter",
+        "uid": 501,
+        "owner": "you",
+        "cwd": null,
         "project": null,
+        "project_kind": null,
         "session": null,
-        "owner": null,
+        "age_secs": 345600,
         "ram": null,
-        "age_s": 345600,
-        "evidence": null,
         "state": "system",
-        "detail": {
-          "title": ":7000 · ControlCenter",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "973"
-            }
-          ],
-          "sentence": "AirPlay Receiver listens here. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
-          "evidence": [
-            "Executable inside /System/Library"
-          ]
-        }
+        "sentence": "AirPlay Receiver listens here. macOS runs this listener. Scry shows it so the port list is complete, and never stops it."
       },
       {
-        "id": "p-8000-tcp",
+        "proto": "tcp",
         "port": 8000,
-        "proto": "tcp",
-        "addr": "*",
-        "command": "python3 -m http.server",
+        "addresses": [
+          "*"
+        ],
         "pid": 7731,
+        "start_us": 1762759400000000,
+        "process": "python3 -m http.server",
+        "uid": 501,
+        "owner": "you",
+        "cwd": null,
         "project": "~/Downloads",
-        "session": "claude ~/Downloads",
-        "owner": null,
+        "project_kind": null,
+        "session": null,
+        "age_secs": 93600,
         "ram": 22020096,
-        "age_s": 93600,
-        "evidence": "guess",
         "state": "unowned",
-        "detail": {
-          "title": ":8000 · python3",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "7731"
-            },
-            {
-              "label": "addr",
-              "value": "*:8000"
-            },
-            {
-              "label": "ppid",
-              "value": "1"
-            }
-          ],
-          "sentence": ":8000 is held by python3 in ~/Downloads. It started while a Claude Code session was open there, which is a guess, so Scry never reaps it.",
-          "evidence": [
-            "Started inside the session's time window in its directory (guess)"
-          ]
-        }
+        "sentence": ":8000 is held by python3 in ~/Downloads. It started while a Claude Code session was open there, which is a guess, so Scry never reaps it."
       },
       {
-        "id": "p-49152-tcp",
-        "port": 49152,
         "proto": "tcp",
-        "addr": "*",
-        "command": "rapportd",
+        "port": 49152,
+        "addresses": [
+          "*"
+        ],
         "pid": 886,
+        "start_us": 1762507400000000,
+        "process": "rapportd",
+        "uid": 501,
+        "owner": "you",
+        "cwd": null,
         "project": null,
+        "project_kind": null,
         "session": null,
-        "owner": null,
+        "age_secs": 345600,
         "ram": null,
-        "age_s": 345600,
-        "evidence": null,
         "state": "system",
-        "detail": {
-          "title": ":49152 · rapportd",
-          "facts": [
-            {
-              "label": "pid",
-              "value": "886"
-            }
-          ],
-          "sentence": "Continuity and Handoff. macOS runs this listener. Scry shows it so the port list is complete, and never stops it.",
-          "evidence": []
-        }
+        "sentence": "Continuity and Handoff. macOS runs this listener. Scry shows it so the port list is complete, and never stops it."
       }
     ]
   },

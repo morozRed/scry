@@ -29,21 +29,25 @@ fn rows(board: &Board) -> Load<Vec<Row>> {
     board.ports.as_ref().map(|ports| {
         ports
             .iter()
-            .map(|p| Row {
-                id: p.id.clone(),
-                depth: 0,
-                cells: vec![
-                    Cell::num(format!(":{}", p.port), p.port.into()),
-                    Cell::muted(&p.addr),
-                    Cell::text(&p.command).with_context(p.owner.as_deref()),
-                    Cell::muted(p.project.as_deref().unwrap_or("")),
-                    Cell::text(p.session.as_deref().unwrap_or("")),
-                    Cell::num(human_age(p.age_s), p.age_s),
-                    Cell::state(Some(p.state)),
-                ],
-                detail: Some(p.detail.clone()),
-                target: p.stop_target(),
-                jump: None,
+            .map(|p| {
+                let age = p.age_secs.unwrap_or(0).max(0) as u64;
+                Row {
+                    id: format!("{}-{}-{}", p.proto.name(), p.port, p.pid),
+                    depth: 0,
+                    cells: vec![
+                        Cell::num(format!(":{}", p.port), p.port.into()),
+                        Cell::muted(p.addresses.join(", ")),
+                        Cell::text(p.holder())
+                            .with_context((p.owner != "you").then_some(p.owner.as_str())),
+                        Cell::muted(p.project.as_deref().unwrap_or("")),
+                        Cell::text(p.session.as_ref().map(|s| s.short()).unwrap_or_default()),
+                        Cell::num(human_age(age), age),
+                        Cell::state(p.state),
+                    ],
+                    detail: Some(p.detail()),
+                    target: p.stop_target(),
+                    jump: None,
+                }
             })
             .collect()
     })
@@ -51,6 +55,9 @@ fn rows(board: &Board) -> Load<Vec<Row>> {
 
 fn badge(board: &Board) -> usize {
     board.ports.ready().map_or(0, |ports| {
-        ports.iter().filter(|p| p.state == State::Leftover).count()
+        ports
+            .iter()
+            .filter(|p| p.state == Some(State::Leftover))
+            .count()
     })
 }

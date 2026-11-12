@@ -1,5 +1,7 @@
 mod daemon_cmd;
 mod doctor_cmd;
+mod ports;
+mod stop;
 
 use scry::tui;
 
@@ -29,8 +31,10 @@ enum Command {
     },
     /// Print what needs attention and exit.
     Overview {
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
+        /// Read a recorded snapshot instead of this machine.
         #[arg(long)]
         fixture: Option<PathBuf>,
     },
@@ -40,6 +44,9 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    Ports(ports::PortsArgs),
+    Why(ports::WhyArgs),
+    Stop(stop::StopArgs),
     /// Measure Scry itself.
     Bench {
         #[command(subcommand)]
@@ -59,17 +66,26 @@ enum Command {
 
 #[derive(Subcommand)]
 enum BenchWhat {
-    /// Time a full process scan.
+    /// Time the process scan, the socket table and a full snapshot.
     Scan {
-        #[arg(long, default_value_t = 20)]
-        runs: usize,
+        /// How many times to time each, at least 1.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
+        runs: u32,
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
 }
 
+/// The exit code for arguments Scry cannot parse, from sysexits(3). Clap's own code, 2, is
+/// what `scry stop` returns for a process that is still running.
+const USAGE: i32 = 64;
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|e| {
+        let _ = e.print();
+        std::process::exit(if e.use_stderr() { USAGE } else { 0 });
+    });
     match cli.command {
         None if std::io::stdout().is_terminal() => tui::run(None),
         None => print_overview(&load(None)?, false),
@@ -81,6 +97,9 @@ fn main() -> Result<()> {
         }
         Some(Command::Overview { json, fixture }) => print_overview(&load(fixture)?, json),
         Some(Command::Snapshot { out }) => snapshot(out),
+        Some(Command::Ports(a)) => ports::ports(a),
+        Some(Command::Why(a)) => ports::why(a),
+        Some(Command::Stop(a)) => stop::run(a),
         Some(Command::Bench {
             what: BenchWhat::Scan { runs, json },
         }) => bench_scan(runs, json),
@@ -108,7 +127,10 @@ fn print_overview(snap: &Snapshot, json: bool) -> Result<()> {
 }
 
 fn snapshot(out: Option<PathBuf>) -> Result<()> {
-    let snap = fixture::redact(sys::scan()?, &fixture::home_dir()?);
+    let snap = fixture::redact(
+        scry_core::engine::Engine::new().snapshot()?,
+        &fixture::home_dir()?,
+    );
     let text = serde_json::to_string_pretty(&snap)?;
     match out {
         Some(path) => {
@@ -124,26 +146,47 @@ fn snapshot(out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn bench_scan(runs: usize, json: bool) -> Result<()> {
-    if runs == 0 {
-        bail!("--runs must be at least 1");
-    }
-    let mut times = Vec::with_capacity(runs);
-    let mut count = 0;
+fn bench_scan(runs: u32, json: bool) -> Result<()> {
+    let runs = runs as usize;
+    let (mut procs, mut socks, mut full) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut count, mut sockets) = (0, 0);
+    let mut engine = scry_core::engine::Engine::new();
     for _ in 0..runs {
         let t = Instant::now();
         count = sys::scan()?.processes.len();
-        times.push(t.elapsed());
+        procs.push(t.elapsed());
+        let t = Instant::now();
+        sockets = sys::sockets::read_all()?.len();
+        socks.push(t.elapsed());
+        let t = Instant::now();
+        engine.snapshot()?;
+        full.push(t.elapsed());
     }
-    times.sort();
-    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-    let (min, median, max) = (ms(times[0]), ms(times[runs / 2]), ms(times[runs - 1]));
+    let stats = |times: &mut Vec<Duration>| {
+        times.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        (ms(times[0]), ms(times[runs / 2]), ms(times[runs - 1]))
+    };
+    let (min, median, max) = stats(&mut procs);
+    let (s_min, s_median, s_max) = stats(&mut socks);
+    let (f_min, f_median, f_max) = stats(&mut full);
     if json {
         println!(
             "{}",
-            serde_json::json!({ "processes": count, "runs": runs, "min_ms": min, "median_ms": median, "max_ms": max })
+            serde_json::json!({
+                "processes": count, "runs": runs, "min_ms": min, "median_ms": median, "max_ms": max,
+                "sockets": { "count": sockets, "min_ms": s_min, "median_ms": s_median, "max_ms": s_max },
+                "snapshot": { "min_ms": f_min, "median_ms": f_median, "max_ms": f_max },
+            })
         );
     } else {
+        // local-ci.sh reads the last "median N ms" in this output as the process scan time.
+        println!(
+            "Socket table of {sockets} sockets: {s_median:.1} ms median (min {s_min:.1}, max {s_max:.1})."
+        );
+        println!(
+            "Snapshot with sockets, labels and projects: {f_median:.1} ms median (min {f_min:.1}, max {f_max:.1}), arguments cached after the first run."
+        );
         println!(
             "Full scan of {count} processes: median {median:.1} ms (min {min:.1}, max {max:.1}) over {runs} runs."
         );
