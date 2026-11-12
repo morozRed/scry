@@ -3,10 +3,16 @@
 //! path exists. Folders are compared by device and inode, so a symlink, a `..` or a name
 //! cased differently does not slip past.
 //!
-//! Known limit: git opens a repo's own files itself. An `include.path` or `includeIf` in its
-//! config can name a file inside a protected folder, and so can a symlink inside its git
-//! folder. Scry does not run git on a worktree whose record holds a symlink, but it cannot
-//! see every file git opens, so such a repo can still make macOS ask.
+//! What Scry checks before it runs git on a worktree: its record holds no symlink, its
+//! `commondir` leads back to its repository's own git folder, and no `include.path` or
+//! `includeIf.*.path` in its `config.worktree`, nor in a file that one includes, names a file
+//! inside a protected folder. A worktree that fails any of these is not read.
+//!
+//! Known limit: your own git config can point git at a protected folder; Scry does not follow
+//! it, but git does. That covers the global config (`~/.gitconfig`, itself perhaps a symlink
+//! into one) and what it includes, the repository's own `.git/config` and its includes, a
+//! `core.excludesFile` set in any of them, and `objects/info/alternates`, so a repo set up
+//! that way can still make macOS ask.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;

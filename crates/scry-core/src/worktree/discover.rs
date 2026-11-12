@@ -1,8 +1,10 @@
 //! Finds repositories under the code roots and agent folders, reads git's record of each
 //! linked worktree, looks at each folder with one `git status` and one `git ls-files`, and
 //! sizes them all in one walk that also finds the repositories nested inside. No git runs on
-//! a path inside a protected folder, and no file there is read; `protected` names the one
-//! read git can still make there.
+//! a path inside a protected folder, and no file there is read. No git runs on a worktree
+//! whose record's `commondir` leads anywhere but its repository's git folder, or whose
+//! `config.worktree` includes a file inside a protected folder. `protected` names what the
+//! user's own git config can still lead git to read there.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -405,6 +407,15 @@ struct Record {
     agent_files: Vec<&'static AgentFile>,
     /// Entries that are symlinks. git would follow one wherever it leads, so it is not run.
     symlinks: Vec<String>,
+    /// Why git must not run on it at all, found in the record before any git call.
+    blocked: Option<Blocked>,
+}
+
+/// A record that would lead git somewhere Scry does not let it go.
+enum Blocked {
+    /// Its `commondir` or an include in its `config.worktree` leads into this folder.
+    Protected(PathBuf),
+    Unsafe(String),
 }
 
 /// The worktree's folder, from the record's `gitdir` file.
@@ -594,6 +605,7 @@ fn read_records(repo: &mut Repo, guard: &Protected, timeout: Duration) {
         let mut extras = Vec::new();
         let mut agent_files = Vec::new();
         let mut symlinks = Vec::new();
+        let mut blocked = own_commondir(&admin, &repo.common, guard).err();
         for e in fs::read_dir(&admin).into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let kind = e.file_type();
@@ -611,9 +623,21 @@ fn read_records(repo: &mut Repo, guard: &Protected, timeout: Duration) {
             }
             if file && name == "config.worktree" {
                 match config_extras(&e.path(), &admin, &path, guard, timeout) {
-                    Ok(keys) if keys.is_empty() => {}
-                    Ok(keys) => extras.push(format!("{name} ({})", keys.join(", "))),
-                    Err(_) => extras.push(name),
+                    Ok((keys, includes)) => {
+                        if !keys.is_empty() {
+                            extras.push(format!("{name} ({})", keys.join(", ")));
+                        }
+                        if let Err(b) = check_includes(&includes, &admin, guard, timeout, 0) {
+                            blocked = blocked.or(Some(b));
+                        }
+                    }
+                    Err(e) => {
+                        extras.push(name);
+                        // Its includes are unknown, so git could be led anywhere.
+                        blocked = blocked.or(Some(Blocked::Unsafe(format!(
+                            "its record's config.worktree could not be read: {e}"
+                        ))));
+                    }
                 }
                 continue;
             }
@@ -637,6 +661,7 @@ fn read_records(repo: &mut Repo, guard: &Protected, timeout: Duration) {
             extras,
             agent_files,
             symlinks,
+            blocked,
         });
     }
     repo.records.sort_by(|a, b| a.admin.cmp(&b.admin));
@@ -670,8 +695,9 @@ fn config_extras(
     path: &RecordPath,
     guard: &Protected,
     timeout: Duration,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let out = git::stdout(Path::new("/"), &git::config_list_args(file), timeout)?;
+    let entries = git::parse_config(&out);
     // git reads a relative `core.worktree` from the record's folder.
     let own_folder = |value: &str| match path {
         RecordPath::Folder(folder) => {
@@ -687,14 +713,103 @@ fn config_extras(
             || CONFIG_SECTIONS.iter().any(|s| key.starts_with(s))
             || (key == "core.worktree" && value.is_some_and(own_folder))
     };
-    let mut keys: Vec<String> = git::parse_config(&out)
-        .into_iter()
+    let mut keys: Vec<String> = entries
+        .iter()
         .filter(|(key, value)| !cleared(key, value.as_deref()))
-        .map(|(key, _)| key)
+        .map(|(key, _)| key.clone())
         .collect();
     keys.sort();
     keys.dedup();
-    Ok(keys)
+    Ok((keys, include_paths(&entries)))
+}
+
+/// The files a config's `include.path` and `includeIf.<condition>.path` entries name, whatever
+/// the condition: git may meet it.
+fn include_paths(entries: &[(String, Option<String>)]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|(key, _)| {
+            key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"))
+        })
+        .map(|(_, value)| value.clone().unwrap_or_default())
+        .collect()
+}
+
+/// git follows includes this deep, and stops with an error past it.
+const MAX_INCLUDE_DEPTH: usize = 10;
+
+/// Checks the files a record's config includes, and those they include in turn, before git
+/// reads them. Each is resolved as git resolves it: `~/` from `HOME`, a relative path from the
+/// including file's folder. One inside a protected folder, or one that cannot be resolved,
+/// blocks git.
+fn check_includes(
+    includes: &[String],
+    from: &Path,
+    guard: &Protected,
+    timeout: Duration,
+    depth: usize,
+) -> Result<(), Blocked> {
+    for value in includes {
+        let unsafe_ =
+            |why: &str| Blocked::Unsafe(format!("its record's config includes {value}, {why}"));
+        if depth >= MAX_INCLUDE_DEPTH {
+            return Err(unsafe_("past git's include depth"));
+        }
+        let target = if let Some(rest) = value.strip_prefix("~/") {
+            match std::env::var_os("HOME") {
+                Some(home) => Path::new(&home).join(rest),
+                None => return Err(unsafe_("and HOME is not set")),
+            }
+        } else if value.starts_with('~') || value.is_empty() {
+            return Err(unsafe_("which cannot be resolved"));
+        } else {
+            from.join(value)
+        };
+        let target = match guard.resolve(&target) {
+            Resolved::Inside(folder) => return Err(Blocked::Protected(folder)),
+            Resolved::Unresolvable => return Err(unsafe_("which cannot be resolved")),
+            Resolved::Outside(t) => t,
+        };
+        // git skips an include that is not there.
+        if !target.is_file() {
+            continue;
+        }
+        let out = git::stdout(Path::new("/"), &git::config_list_args(&target), timeout)
+            .map_err(|e| unsafe_(&format!("which could not be read: {e}")))?;
+        let nested = include_paths(&git::parse_config(&out));
+        let dir = target.parent().unwrap_or(Path::new("/"));
+        check_includes(&nested, dir, guard, timeout, depth + 1)?;
+    }
+    Ok(())
+}
+
+/// The record's `commondir`, read without following a symlink, must lead back to the git
+/// folder the record sits in: git reads the repository's config, refs and objects from
+/// wherever it points.
+fn own_commondir(admin: &Path, common: &Path, guard: &Protected) -> Result<(), Blocked> {
+    let unsafe_ = |why: String| Err(Blocked::Unsafe(format!("its record's commondir {why}")));
+    let named = match git::read_path_file(&admin.join("commondir")) {
+        Ok(Some(c)) => c,
+        Ok(None) => return unsafe_("file is missing or empty".into()),
+        Err(e) => return unsafe_(format!("file could not be read: {e}")),
+    };
+    let target = match guard.resolve(&admin.join(&named)) {
+        Resolved::Inside(folder) => return Err(Blocked::Protected(folder)),
+        Resolved::Unresolvable => {
+            return unsafe_(format!(
+                "names {}, which cannot be resolved",
+                named.display()
+            ));
+        }
+        Resolved::Outside(t) => t,
+    };
+    match (fs::metadata(&target), fs::metadata(common)) {
+        (Ok(a), Ok(b)) if file_id(&a) == file_id(&b) => Ok(()),
+        _ => unsafe_(format!(
+            "names {}, not the repository's own git folder",
+            named.display()
+        )),
+    }
 }
 
 fn mtime(file: &Path) -> Option<i64> {
@@ -853,6 +968,21 @@ fn look(rec: &Record, guard: &Protected, timeout: Duration) -> Look {
     match guard.resolve(&gitdir) {
         Resolved::Outside(g) if same(&g, &rec.admin) => {}
         _ => return Look::LinkElsewhere { path, gitdir },
+    }
+    match &rec.blocked {
+        Some(Blocked::Protected(folder)) => {
+            return Look::Protected {
+                path,
+                folder: folder.clone(),
+            };
+        }
+        Some(Blocked::Unsafe(error)) => {
+            return Look::Failed {
+                path,
+                error: error.clone(),
+            };
+        }
+        None => {}
     }
     if !rec.symlinks.is_empty() {
         return Look::Failed {

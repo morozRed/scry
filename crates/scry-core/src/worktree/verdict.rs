@@ -39,8 +39,9 @@ impl Finished {
         &self.kept_by
     }
 
-    /// When the repo last fetched, Unix seconds; the claim holds as of then. None when git
-    /// left no record of a fetch.
+    /// When the repo last fetched, Unix seconds, for a claim about a remote-tracking ref,
+    /// which holds as of the last fetch or push. None when git left no record of a fetch, and
+    /// for a local branch, which no fetch changes.
     pub fn fetched_at(&self) -> Option<i64> {
         self.fetched_at
     }
@@ -54,8 +55,20 @@ pub enum KeptBy {
     Upstream { name: String },
 }
 
+impl KeptBy {
+    /// Whether the ref is remote-tracking, so it is as of the last fetch or push. The default
+    /// branch is named `origin/<name>` when its remote-tracking ref holds HEAD, and plain
+    /// `<name>` for the local branch. An upstream tracked here is always a remote's.
+    pub fn is_remote(&self) -> bool {
+        match self {
+            KeptBy::DefaultBranch { name } => name.starts_with("origin/"),
+            KeptBy::Upstream { .. } => true,
+        }
+    }
+}
+
 /// Proof that a worktree can go: nothing would be lost, its work is finished, and no stash
-/// entry was made on it.
+/// entry names its branch, or, when its HEAD is detached, none was made at its HEAD commit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Safe {
     #[serde(skip)]
@@ -280,9 +293,10 @@ fn loss(facts: &GitFacts, lock: Option<&Lock>) -> Result<NothingLost, Lost> {
 }
 
 fn finished(_: &NothingLost, facts: &GitFacts) -> Option<Finished> {
+    let kept_by = kept_by(facts)?;
     Some(Finished {
-        kept_by: kept_by(facts)?,
-        fetched_at: facts.fetched_at,
+        fetched_at: facts.fetched_at.filter(|_| kept_by.is_remote()),
+        kept_by,
     })
 }
 

@@ -383,7 +383,7 @@ fn can_go_only_with_proof_from_the_default_branch_or_a_live_upstream() {
     assert!(
         row(&v, "app-pushed").sentence.starts_with(
             "app-pushed is clean and every commit is on origin/feat-pushed as of the last \
-             fetch, "
+             fetch or push (last fetch "
         ),
         "{}",
         row(&v, "app-pushed").sentence
@@ -399,7 +399,7 @@ fn can_go_only_with_proof_from_the_default_branch_or_a_live_upstream() {
     let stash = row(&v, "app-stash");
     assert_eq!(
         stash.sentence,
-        "app-stash needs a look: 1 stash entry was made on its branch."
+        "app-stash needs a look: 1 stash entry names its branch."
     );
 }
 
@@ -515,7 +515,7 @@ fn the_view_explains_each_row_in_one_sentence() {
     let merged = &row(&v, "app-merged").sentence;
     assert!(
         merged
-            .starts_with("app-merged is clean and merged into origin/main as of the last fetch, ")
+            .starts_with("app-merged is clean and merged into origin/main as of the last fetch or push (last fetch ")
             && merged.contains("; deleting it frees at least "),
         "{merged}"
     );
@@ -786,6 +786,152 @@ fn never_follows_a_dangling_dotdot_or_a_symlinked_record_file_into_a_protected_f
         assert_eq!(r.status.word(), word, "{name}: {r:?}");
         assert!(says(r, why), "{name} should say {why:?}: {r:?}");
     }
+}
+
+/// A record git would read from a protected folder through its own files: an include in its
+/// `config.worktree`, directly, under a condition or through another included file, or a
+/// `commondir` that leads into one or to another repository's git folder. No git runs on it.
+#[test]
+fn a_record_that_leads_git_into_a_protected_folder_is_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let code = home.join("code");
+    let documents = home.join("Documents");
+    fs::create_dir_all(&documents).unwrap();
+    write(&documents.join("inc.gitconfig"), "[user]\n\tname = x\n");
+    let app = code.join("app");
+    new_repo(&base, &app);
+    git(&app, &["config", "core.repositoryformatversion", "1"]);
+    git(&app, &["config", "extensions.worktreeConfig", "true"]);
+    let other = code.join("other");
+    new_repo(&base, &other);
+    let record = |name: &str| app.join(".git/worktrees").join(name);
+    let inc = s(&documents.join("inc.gitconfig")).to_string();
+    // Outside, but it includes a file in Documents by a path relative to itself.
+    write(
+        &code.join("outer.gitconfig"),
+        "[include]\n\tpath = ../Documents/inc.gitconfig\n",
+    );
+    write(&code.join("plain.gitconfig"), "[user]\n\tname = y\n");
+    let configs = [
+        ("inc-docs", format!("[include]\n\tpath = {inc}\n")),
+        (
+            "inc-if",
+            format!("[includeIf \"gitdir:/nowhere/\"]\n\tpath = {inc}\n"),
+        ),
+        (
+            "inc-nested",
+            format!("[include]\n\tpath = {}\n", s(&code.join("outer.gitconfig"))),
+        ),
+        (
+            "inc-plain",
+            format!("[include]\n\tpath = {}\n", s(&code.join("plain.gitconfig"))),
+        ),
+    ];
+    for (name, config) in &configs {
+        add(&app, name, name);
+        write(&record(name).join("config.worktree"), config);
+    }
+    add(&app, "common-docs", "common-docs");
+    write(
+        &record("common-docs").join("commondir"),
+        &format!("{}\n", s(&documents.join("appgit"))),
+    );
+    add(&app, "common-other", "common-other");
+    write(
+        &record("common-other").join("commondir"),
+        &format!("{}\n", s(&other.join(".git"))),
+    );
+
+    let scan = locked_away(&[&documents], || {
+        let mut scan = scan(&ScanOptions::new(&home, vec![code.clone()]));
+        measure(&mut scan, &home);
+        scan
+    });
+    let v = WorktreesView::new(&scan, now(), &home);
+    for name in ["inc-docs", "inc-if", "inc-nested", "common-docs"] {
+        let r = row(&v, name);
+        assert_eq!(r.status.word(), "not read", "{name}: {r:?}");
+        assert!(says(r, "not read: protected folder"), "{name}: {r:?}");
+    }
+    let r = row(&v, "common-other");
+    assert_eq!(r.status.word(), "not read", "{r:?}");
+    assert!(says(r, "not the repository's own git folder"), "{r:?}");
+    // An include that stays outside is read, and kept for a look as the worktree's own config.
+    let r = row(&v, "inc-plain");
+    assert_eq!(r.status.word(), "needs a look", "{r:?}");
+    assert!(says(r, "config.worktree (include.path)"), "{r:?}");
+}
+
+/// The stash check names exactly what it matched, and a worktree kept by a local branch makes
+/// no claim about a fetch.
+#[test]
+fn says_what_the_stash_check_matched_and_dates_only_remote_branches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let code = home.join("code");
+    // A repo with no remote: its default branch is the local `main`.
+    let solo = code.join("solo");
+    fs::create_dir_all(&solo).unwrap();
+    git(&solo, &["init", "-q"]);
+    commit(&solo, "README");
+    add(&solo, "done", "solo-done");
+    let detached = solo.parent().unwrap().join("solo-detached");
+    git(
+        &solo,
+        &["worktree", "add", "-q", "--detach", s(&detached), "main"],
+    );
+    write(&detached.join("README"), "changed\n");
+    git(&detached, &["stash", "-q"]);
+    // A cloned repo, where `origin/main` keeps the worktree.
+    let app = code.join("app");
+    new_repo(&base, &app);
+    add(&app, "merged", "app-merged");
+
+    let mut scan = scan(&ScanOptions::new(&home, vec![code.clone()]));
+    measure(&mut scan, &home);
+    let v = WorktreesView::new(&scan, now(), &home);
+
+    let r = row(&v, "solo-done");
+    assert_eq!(r.status.word(), "can go", "{r:?}");
+    assert!(
+        r.sentence
+            .starts_with("solo-done is clean and merged into main; "),
+        "{}",
+        r.sentence
+    );
+    let finished = r
+        .evidence
+        .iter()
+        .find(|e| e.starts_with("finished:"))
+        .unwrap();
+    assert_eq!(
+        finished,
+        "finished: main holds every commit of HEAD, and no stash entry names its branch"
+    );
+
+    let r = row(&v, "solo-detached");
+    assert_eq!(r.status.word(), "needs a look", "{r:?}");
+    assert!(
+        says(r, "1 stash entry was made at its HEAD commit"),
+        "{r:?}"
+    );
+
+    let r = row(&v, "app-merged");
+    assert_eq!(r.status.word(), "can go", "{r:?}");
+    assert!(
+        r.sentence
+            .contains("merged into origin/main as of the last fetch or push ("),
+        "{}",
+        r.sentence
+    );
+    assert!(
+        says(r, "remote branches are as of the last fetch or push")
+            || says(r, "no fetch on record"),
+        "{r:?}"
+    );
 }
 
 /// Documents is a symlink to a folder under `.claude/worktrees`, and another entry there is a

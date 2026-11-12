@@ -10,12 +10,14 @@
 //!   that a detached HEAD is held by a local branch or tag, and that it is not locked. Ignored
 //!   files are not checked: a local `.env` goes with the folder.
 //! - **Finished: is its work done?** Asked only when nothing is lost: HEAD is in the default
-//!   branch or on its upstream, as of the repo's last fetch. Scry never fetches.
+//!   branch or on its upstream; a remote branch as of the last fetch or push. Scry never
+//!   fetches.
 //!
-//! "Can go" needs both, and no stash entry made on the worktree: stash entries belong to the
-//! repo and outlive it, but one may be work set aside and forgotten. Scry's cleanup is meant
-//! to move a folder to the Trash rather than delete it, so anything these checks miss can
-//! still be put back.
+//! "Can go" needs both, and no stash entry whose message names its branch, or, when its HEAD
+//! is detached, none made at its HEAD commit. Stash entries belong to the repo and outlive
+//! it, but one may be work set aside and forgotten. An entry whose message is not git's own
+//! is tied to no worktree. Scry's cleanup is meant to move a folder to the Trash rather than
+//! delete it, so anything these checks miss can still be put back.
 
 mod creator;
 mod discover;

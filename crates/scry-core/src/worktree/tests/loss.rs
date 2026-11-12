@@ -556,12 +556,12 @@ fn finished_means_merged_or_pushed_as_of_the_last_fetch_with_no_stash() {
             (
                 "live-upstream",
                 "can go",
-                "every commit is on origin/live-upstream as of the last fetch, ",
+                "every commit is on origin/live-upstream as of the last fetch or push (last fetch ",
             ),
             (
                 "stale-upstream",
                 "can go",
-                "every commit is on origin/stale-upstream as of the last fetch, ",
+                "every commit is on origin/stale-upstream as of the last fetch or push (last fetch ",
             ),
             (
                 "gone-only",
@@ -572,7 +572,7 @@ fn finished_means_merged_or_pushed_as_of_the_last_fetch_with_no_stash() {
             (
                 "stash-branch",
                 "needs a look",
-                "1 stash entry was made on its branch",
+                "1 stash entry names its branch",
             ),
             ("stash-detached", "needs a look", "stash entr"),
             ("stash-detached-moved", "can go", "as of the last fetch"),

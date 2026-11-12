@@ -8,8 +8,8 @@ use serde::Serialize;
 
 use super::human_bytes;
 use crate::worktree::{
-    Changes, Concern, GitFacts, Head, KeptBy, Merge, NotRead, ReposInside, Upstream, Worktree,
-    WorktreeScan, WorktreeState,
+    Changes, Concern, Finished, GitFacts, Head, KeptBy, Merge, NotRead, ReposInside, Upstream,
+    Worktree, WorktreeScan, WorktreeState,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -226,13 +226,13 @@ fn sentence(w: &Worktree, now: i64, home: &Path) -> String {
     };
     match &w.state {
         WorktreeState::CanGo(safe) => {
-            let as_of = as_of_fetch(safe.finished().fetched_at(), now);
+            let as_of = as_of_fetch(safe.finished(), now);
             match safe.finished().kept_by() {
                 KeptBy::DefaultBranch { name: into } => {
-                    format!("{name} is clean and merged into {into} {as_of}{frees}.")
+                    format!("{name} is clean and merged into {into}{as_of}{frees}.")
                 }
                 KeptBy::Upstream { name: up } => {
-                    format!("{name} is clean and every commit is on {up} {as_of}{frees}.")
+                    format!("{name} is clean and every commit is on {up}{as_of}{frees}.")
                 }
             }
         }
@@ -305,12 +305,19 @@ fn active(name: &str, f: &GitFacts, now: i64) -> String {
     }
 }
 
-/// When the claims about remote branches were last true: git's refs for them change only on
-/// a fetch, and Scry never fetches.
-fn as_of_fetch(fetched_at: Option<i64>, now: i64) -> String {
-    match fetched_at {
-        Some(t) => format!("as of the last fetch, {}", long_age(now - t)),
-        None => "as of the last fetch (time unknown)".into(),
+/// When a claim about a remote branch was last true, with a leading space: git's refs for
+/// remote branches change only on a fetch or a push, and Scry does neither. Nothing for a
+/// local branch, which no fetch changes.
+fn as_of_fetch(finished: &Finished, now: i64) -> String {
+    if !finished.kept_by().is_remote() {
+        return String::new();
+    }
+    match finished.fetched_at() {
+        Some(t) => format!(
+            " as of the last fetch or push (last fetch {})",
+            long_age(now - t)
+        ),
+        None => " as of the last fetch or push (no fetch on record)".into(),
     }
 }
 
@@ -330,14 +337,16 @@ fn concern(w: &Worktree, c: &Concern, home: &Path) -> String {
             "{} nowhere else",
             count_verb(*commits as usize, "commit", "exists", "exist")
         ),
-        Concern::Stashed { entries } => format!(
-            "{} made {}",
-            count_verb(*entries as usize, "stash entry", "was", "were"),
-            match w.head {
-                Head::Detached { .. } => "at its HEAD",
-                _ => "on its branch",
-            }
-        ),
+        Concern::Stashed { entries } => match w.head {
+            Head::Detached { .. } => format!(
+                "{} made at its HEAD commit",
+                count_verb(*entries as usize, "stash entry", "was", "were")
+            ),
+            _ => format!(
+                "{} its branch",
+                count_verb(*entries as usize, "stash entry", "names", "name")
+            ),
+        },
         Concern::Locked { .. } => format!("it is locked{}", locked_by(w)),
         Concern::HiddenFromStatus { files } => format!(
             "{} hidden from git status",
@@ -436,9 +445,12 @@ fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
             let finished = safe.finished();
             let (KeptBy::DefaultBranch { name } | KeptBy::Upstream { name }) = finished.kept_by();
             out.push(format!(
-                "finished: {name} holds every commit of HEAD {}, and no stash entry was made \
-                 on it",
-                as_of_fetch(finished.fetched_at(), now)
+                "finished: {name} holds every commit of HEAD{}, and {}",
+                as_of_fetch(finished, now),
+                match w.head {
+                    Head::Detached { .. } => "no stash entry was made at its HEAD commit",
+                    _ => "no stash entry names its branch",
+                }
             ));
         }
         WorktreeState::CanPrune(p) => {
@@ -614,7 +626,7 @@ fn facts_evidence(f: &GitFacts, now: i64, home: &Path, out: &mut Vec<String>) {
     }
     if f.stashes > 0 {
         out.push(format!(
-            "{} made on its branch or at its HEAD",
+            "{} naming its branch, or made at its detached HEAD commit",
             count(f.stashes as usize, "stash entry")
         ));
     }
@@ -630,7 +642,7 @@ fn facts_evidence(f: &GitFacts, now: i64, home: &Path, out: &mut Vec<String>) {
     }
     out.push(match f.fetched_at {
         Some(t) => format!(
-            "the repo last fetched {}; remote branches are as of then",
+            "the repo last fetched {}; remote branches are as of the last fetch or push",
             long_age(now - t)
         ),
         None => "no fetch on record; remote branches are as of the clone or a push".into(),
