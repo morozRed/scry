@@ -31,19 +31,22 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::{DefaultTerminal, Terminal};
 use scry_core::config::Config;
+use scry_core::control::TERM_GRACE;
 use scry_core::disk::cache::SizeCache;
 use scry_core::disk::clean::{self, Context, Done, Plan, Refusal};
 use scry_core::disk::{self, Layout, catalog};
 use scry_core::engine::Labels;
 use scry_core::live::Collector;
+use scry_core::model::ProcId;
 use scry_core::paths::Paths;
+use scry_core::reap::{self, LiveJudge, ReapTarget, Report, StopJudge, StoreAudit};
 use scry_core::store::Store;
 use scry_core::view::{Board, DiskList, Load, Tab, Tone, WorktreeList};
 use scry_core::worktree::{self, ScanOptions, WorktreeScan};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use app::{Action, App, Mode, Source};
+use app::{Action, App, Mode, Request, SheetKind, Source};
 use motion::Motion;
 use theme::{Colors, Env, SHIPPED, Theme};
 use tty::LateReply;
@@ -96,6 +99,7 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     let mut motion = Motion::new(theme.motion);
     let mut app = App::new(board, source, theme);
     if live.is_some() {
+        app.paths = Paths::from_env().ok();
         app.writer = clean::writer_running;
     }
 
@@ -150,6 +154,9 @@ impl Live {
         let every = self.every;
         let to = tx.clone();
         std::thread::spawn(move || read_processes(&to, &asks, every));
+        let (act, asks) = mpsc::channel();
+        let (to, rescan) = (tx.clone(), now.clone());
+        std::thread::spawn(move || carry_out(&to, &asks, &rescan));
         let (worktrees, asks) = mpsc::channel();
         let to = tx.clone();
         let storage = self.storage;
@@ -164,6 +171,7 @@ impl Live {
         Workers {
             now,
             worktrees,
+            act,
             clean,
             every,
         }
@@ -176,6 +184,7 @@ enum Update {
     Board(Box<Board>),
     Failed(String),
     Worktrees(Load<WorktreeList>),
+    Acted(Box<(Request, Result<Report, String>)>),
     Disk(Box<Load<DiskList>>),
     /// The disk reading is done, sizes included.
     StorageDone,
@@ -187,6 +196,7 @@ struct Workers {
     now: mpsc::Sender<()>,
     /// Worktrees and the disk, read together.
     worktrees: mpsc::Sender<()>,
+    act: mpsc::Sender<Request>,
     clean: mpsc::Sender<(Plan, Option<String>)>,
     every: Option<Duration>,
 }
@@ -237,6 +247,82 @@ fn read_processes(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, every: O
         }
         while asks.try_recv().is_ok() {}
     }
+}
+
+/// Carries out confirmed stops, reaps and SIGKILLs, one at a time, off the UI thread: each
+/// waits up to 3 s per process. The same checks as `scry stop` and `scry reap` run here,
+/// with the TUI as the actor in the audit rows.
+fn carry_out(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<Request>, rescan: &mpsc::Sender<()>) {
+    while let Ok(req) = asks.recv() {
+        let result = act(&req);
+        if tx.send(Update::Acted(Box::new((req, result)))).is_err() {
+            return;
+        }
+        // The lists show what is left at once, not at the next refresh.
+        let _ = rescan.send(());
+    }
+}
+
+/// One confirmed request. A reap's targets, and a SIGKILL after a reap, pass the leftover
+/// rule read afresh before each signal; a stop's pass `scry stop`'s checks. Each signal has
+/// its audit row first, and nothing is sent when the store cannot take it.
+fn act(req: &Request) -> std::result::Result<Report, String> {
+    let paths = Paths::from_env()
+        .map_err(|_| "Scry cannot tell the home directory, so nothing was sent.")?;
+    let refused = |r: scry_core::control::Refusal| format!("Nothing was sent: {}", r.brief());
+    reap::allowed(&paths).map_err(refused)?;
+    let action = match (req.kind, req.origin) {
+        (SheetKind::Kill, SheetKind::Reap) => "reap, SIGKILL",
+        (SheetKind::Kill, _) => "stop, SIGKILL",
+        (SheetKind::Reap, _) => "reap",
+        _ => "stop",
+    };
+    let mut audit = StoreAudit::open(&paths, "tui", action).map_err(refused)?;
+    let targets: Vec<ReapTarget> = req
+        .targets
+        .iter()
+        .map(|t| ReapTarget {
+            // A row without a start time cannot pass the identity check, so it is refused.
+            id: ProcId {
+                pid: t.pid,
+                start_us: t.start_us.unwrap_or(i64::MIN),
+            },
+            command: t.command.clone(),
+            session: t.session.clone().unwrap_or_default(),
+            session_id: t
+                .session_id
+                .clone()
+                .filter(|_| req.origin == SheetKind::Reap),
+            evidence: t.evidence,
+            ram: t.frees,
+        })
+        .collect();
+    let reaping = req.origin == SheetKind::Reap;
+    let each = &mut |_: &reap::Done| {};
+    Ok(match (req.kind, reaping) {
+        (SheetKind::Kill, true) => {
+            reap::kill_all(&targets, &mut LiveJudge::new(paths), &mut audit, each)
+        }
+        (SheetKind::Kill, false) => {
+            reap::kill_all(&targets, &mut StopJudge::new(paths), &mut audit, each)
+        }
+        (_, true) => reap::run(
+            &targets,
+            false,
+            TERM_GRACE,
+            &mut LiveJudge::new(paths),
+            &mut audit,
+            each,
+        ),
+        (_, false) => reap::run(
+            &targets,
+            false,
+            TERM_GRACE,
+            &mut StopJudge::new(paths),
+            &mut audit,
+            each,
+        ),
+    })
 }
 
 /// Worktrees and the disk, from the size cache first: the catalog's items at once, the
@@ -424,6 +510,11 @@ fn event_loop(
             match app.on_key(key) {
                 Action::Quit => return Ok(()),
                 Action::Suspend => suspend(terminal)?,
+                Action::Reread => {
+                    if let Some(w) = workers {
+                        let _ = w.now.send(());
+                    }
+                }
                 Action::Rescan => match workers {
                     Some(w) => {
                         app.fresh.asked = true;
@@ -442,6 +533,12 @@ fn event_loop(
                         }
                         Err(e) => app.notify(format!("Refresh failed: {e:#}"), Tone::Danger),
                     },
+                },
+                Action::Act(req) => match workers {
+                    Some(w) => {
+                        let _ = w.act.send(req);
+                    }
+                    None => app.acted(&req, Err("This is a fixture, so nothing was sent.".into())),
                 },
                 Action::Clean(job) => match workers {
                     Some(w) => {
@@ -530,6 +627,15 @@ fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
                 app.board.ports = Load::Failed(why.clone());
             }
             finish_scan(app, Some(why))
+        }
+        Update::Acted(done) => {
+            let (req, result) = *done;
+            let had_sheet = matches!(app.mode, Mode::Sheet(_));
+            app.acted(&req, result);
+            if !had_sheet && matches!(app.mode, Mode::Sheet(_)) {
+                motion.sheet_opened();
+            }
+            true
         }
         Update::Worktrees(list) => {
             let mut board = app.board.clone();

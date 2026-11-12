@@ -278,6 +278,16 @@ pub fn leftovers(a: LeftoversArgs) -> Result<()> {
         }
         return Ok(());
     }
+    print!("{}", leftover_table(&list));
+    println!("{}", agents::PERSISTENT);
+    if let Some(c) = r.caveat() {
+        println!("{c}");
+    }
+    Ok(())
+}
+
+/// Leftovers as `scry leftovers` and `scry reap` print them, in the order given.
+pub fn leftover_table(list: &[Leftover]) -> String {
     let head = [
         "PID", "COMMAND", "SESSION", "EVIDENCE", "AGE", "RAM", "PORT",
     ];
@@ -300,16 +310,13 @@ pub fn leftovers(a: LeftoversArgs) -> Result<()> {
             .map(|c| printable(&c))
         })
         .collect();
-    print!("{}", columns(&head, &cells));
-    println!("{}", agents::PERSISTENT);
-    if let Some(c) = r.caveat() {
-        println!("{c}");
-    }
-    Ok(())
+    columns(&head, &cells)
 }
 
-/// One JSON line per change: anything in the board other than ages, which move on every
-/// reading by themselves.
+/// One JSON line per change in what the board shows: the sessions, processes, ports and
+/// attention items, their states, labels and ports. Ages, RAM, the pulse and the counts of
+/// every process on the machine move on almost every reading by themselves, so they do not
+/// start a line on their own.
 pub fn watch(a: WatchArgs) -> Result<()> {
     let mut c = Collector::new(Labels::All);
     let mut last: Option<serde_json::Value> = None;
@@ -337,45 +344,86 @@ pub fn watch(a: WatchArgs) -> Result<()> {
     }
 }
 
-/// The board as JSON with every age taken out: the `age_s` and `age_secs` fields, and the
-/// `<n><unit> ago` that [`human_age`] writes into sentences.
+/// Fields that move by themselves: ages, RAM, the header's pulse, and counts of every process
+/// on the machine (with the `checked` lines that quote them).
+const RESTLESS: [&str; 10] = [
+    "age_s",
+    "age_secs",
+    "ram",
+    "frees",
+    "size",
+    "own_footprint",
+    "process_count",
+    "own_count",
+    "checked",
+    "pulse",
+];
+
+/// The board as JSON without what moves by itself: the [`RESTLESS`] fields, and the ages and
+/// sizes that [`human_age`] and [`human_bytes`] write into sentences.
 fn signature(b: &Board) -> serde_json::Value {
     let mut v = serde_json::to_value(b).unwrap_or_default();
-    strip_ages(&mut v);
+    strip_restless(&mut v);
     v
 }
 
-fn strip_ages(v: &mut serde_json::Value) {
+fn strip_restless(v: &mut serde_json::Value) {
     use serde_json::Value;
     match v {
         Value::Object(m) => {
-            m.retain(|k, _| k != "age_s" && k != "age_secs");
-            m.values_mut().for_each(strip_ages);
+            m.retain(|k, _| !RESTLESS.contains(&k.as_str()));
+            m.values_mut().for_each(strip_restless);
         }
-        Value::Array(a) => a.iter_mut().for_each(strip_ages),
-        Value::String(s) if s.contains(" ago") => *s = without_ages(s),
+        Value::Array(a) => a.iter_mut().for_each(strip_restless),
+        Value::String(s) => *s = without_sizes(&without_ages(s)),
         _ => {}
     }
 }
 
-/// `ended 41m ago, started 2h ago` → `ended ago, started ago`.
+/// `ended 41m ago, started 2h ago` → `ended ago, started ago`, and `4s old` → `old`.
 fn without_ages(s: &str) -> String {
+    if !s.contains(" ago") && !s.contains(" old") {
+        return s.to_string();
+    }
     let words: Vec<&str> = s.split(' ').collect();
-    let age = |w: &str| {
-        w.len() >= 2
-            && w[..w.len() - 1].bytes().all(|b| b.is_ascii_digit())
-            && matches!(w.as_bytes()[w.len() - 1], b's' | b'm' | b'h' | b'd')
+    // By bytes: a word can be `…`, whose last byte is not a character of its own.
+    let age = |w: &str| match w.as_bytes() {
+        [digits @ .., unit] if !digits.is_empty() => {
+            digits.iter().all(u8::is_ascii_digit) && matches!(unit, b's' | b'm' | b'h' | b'd')
+        }
+        _ => false,
     };
     words
         .iter()
         .enumerate()
         .filter(|&(i, w)| {
             !(age(w)
-                && words
-                    .get(i + 1)
-                    .is_some_and(|n| n.trim_end_matches([',', '.', ';', ')']) == "ago"))
+                && words.get(i + 1).is_some_and(|n| {
+                    matches!(n.trim_end_matches([',', '.', ';', ')']), "ago" | "old")
+                }))
         })
         .map(|(_, w)| *w)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `It holds 412M and :3000.` → `It holds and :3000.`: a size as [`human_bytes`] writes
+/// it, a number with a unit letter, as a word of its own.
+fn without_sizes(s: &str) -> String {
+    let size = |w: &str| {
+        let w = w.trim_end_matches([',', '.', ';', ')']);
+        let Some(num) = w.strip_suffix(['B', 'K', 'M', 'G', 'T']) else {
+            return false;
+        };
+        !num.is_empty()
+            && num.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+            && num.bytes().next().is_some_and(|b| b.is_ascii_digit())
+    };
+    if !s.split(' ').any(size) {
+        return s.to_string();
+    }
+    s.split(' ')
+        .map(|w| if size(w) { "" } else { w })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -404,17 +452,75 @@ mod tests {
         }
         assert_eq!(signature(&older), sig, "only ages moved");
 
-        let mut more_ram = board.clone();
-        if let Load::Ready(rows) = &mut more_ram.agents {
-            rows[0].ram = Some(rows[0].ram.unwrap_or(0) + 1);
+        // RAM, the pulse and machine-wide counts move on every reading: no line.
+        let mut busier = board.clone();
+        if let Load::Ready(rows) = &mut busier.agents {
+            for r in rows.iter_mut() {
+                r.ram = r.ram.map(|b| b * 3 + 1);
+            }
         }
-        assert_ne!(signature(&more_ram), sig);
+        for a in &mut busier.overview.attention {
+            a.size = a.size.map(|b| b + 1);
+            a.detail.sentence = a.detail.sentence.replace("953M", "1.2G");
+        }
+        assert_ne!(
+            serde_json::to_value(&busier).unwrap(),
+            serde_json::to_value(&board).unwrap()
+        );
+        assert!(
+            serde_json::to_string(&busier)
+                .unwrap()
+                .contains("hold 1.2G and :3000"),
+            "a size in a sentence moved"
+        );
+        busier.overview.process_count += 7;
+        busier.overview.own_footprint += 1 << 20;
+        busier.overview.checked = vec!["420 of your processes".into()];
+        busier.pulse = None;
+        assert_eq!(signature(&busier), sig, "only RAM and counts moved");
+
+        // A new state, label or port does.
+        let mut left = board.clone();
+        if let Load::Ready(rows) = &mut left.agents {
+            let r = rows.iter_mut().find(|r| r.depth > 0).unwrap();
+            r.state = Some(scry_core::view::State::Kept);
+        }
+        assert_ne!(signature(&left), sig);
+        let mut relabelled = board.clone();
+        if let Load::Ready(rows) = &mut relabelled.agents {
+            rows[1].label.push_str(" --watch");
+        }
+        assert_ne!(signature(&relabelled), sig);
+        let mut ported = board.clone();
+        if let Load::Ready(rows) = &mut ported.agents {
+            rows[1].ports.push(5173);
+        }
+        assert_ne!(signature(&ported), sig);
+        let mut fewer = board.clone();
+        if let Load::Ready(rows) = &mut fewer.agents {
+            rows.pop();
+        }
+        assert_ne!(signature(&fewer), sig);
         let mut retitled = board.clone();
         retitled.overview.attention[0].title.push('!');
         assert_ne!(signature(&retitled), sig);
         assert_eq!(
             without_ages("ended 41m ago, started 2h ago. Port 3000 at 5s"),
             "ended ago, started ago. Port 3000 at 5s"
+        );
+        assert_eq!(
+            without_sizes("It holds 412M and :3000. Together 1.5G, 3 ports, 512B."),
+            "It holds  and :3000. Together  3 ports, "
+        );
+        assert_eq!(without_sizes("v2 of acme 3000M5"), "v2 of acme 3000M5");
+        // A label's `…` beside an age, as live data has it.
+        assert_eq!(
+            without_ages("`python3 …` started 2h ago, in …"),
+            "`python3 …` started ago, in …"
+        );
+        assert_eq!(
+            without_ages("It is 4s old, under the 5m grace period."),
+            "It is old, under the 5m grace period."
         );
     }
 }

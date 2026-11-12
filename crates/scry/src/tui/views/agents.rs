@@ -24,7 +24,7 @@ pub const VIEW: ViewDef = ViewDef {
          `scry hook install claude` makes Claude Code attribution exact.",
     ),
     badge,
-    hints: &[("⏎", "fold"), ("x", "stop"), ("X", "reap")],
+    hints: &[("⏎", "fold"), ("x", "stop"), ("X", "reap"), ("K", "keep")],
     reap: Some(reap),
 };
 
@@ -71,7 +71,7 @@ fn badge(board: &Board) -> usize {
     })
 }
 
-fn reap(board: &Board) -> Vec<Target> {
+pub(super) fn reap(board: &Board) -> Vec<Target> {
     board
         .agents
         .ready()

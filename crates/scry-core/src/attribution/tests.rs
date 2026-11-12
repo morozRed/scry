@@ -27,6 +27,8 @@ fn proc(pid: i32, ppid: i32, name: &str) -> Process {
         worker: false,
         tty: None,
         role: None,
+        script: None,
+        file_args: false,
     }
 }
 
@@ -658,4 +660,123 @@ fn a_resumed_session_is_open_again() {
     known.apply(&[ev("e2", NOW_MS - 3_000_000, end, &old)]);
     known.apply(&[ev("e1", NOW_MS - 7_000_000, start(None), &old)]);
     assert_eq!(known.sessions[0].ended_at_ms, Some(NOW_MS - 3_000_000));
+}
+
+fn gemini(pid: i32) -> Process {
+    let mut p = proc(pid, 1, "gemini");
+    p.role = Some(Role::Agent(Agent::Gemini));
+    p.id.start_us -= HOUR_US / 2;
+    p
+}
+
+#[test]
+fn a_live_nested_agent_with_the_session_stamp_keeps_what_it_started() {
+    // Claude Code 900 ran a headless Gemini 950, which inherited Claude's stamps, and
+    // exited. Gemini still runs and started a daemon that detached to launchd.
+    let nested = stamped(gemini(950), "s1", Some(900));
+    let daemon = stamped(proc(1000, 1, "node"), "s1", Some(900));
+    let s = snap(vec![nested.clone(), daemon.clone()]);
+    assert_eq!(spare(&build(&s), 1000), Spare::AgentLive { pid: 950 });
+
+    // Started before the nested agent: its stamp did not come through it.
+    let mut early = daemon.clone();
+    early.id.start_us = nested.id.start_us - 1;
+    assert!(build(&snap(vec![nested.clone(), early])).is_leftover(1000));
+
+    // A nested agent of another session keeps nothing of s1's.
+    let other = stamped(gemini(950), "s2", Some(900));
+    assert!(build(&snap(vec![other, daemon.clone()])).is_leftover(1000));
+
+    // Once the nested agent exits too, the daemon is a leftover.
+    assert!(build(&snap(vec![daemon])).is_leftover(1000));
+}
+
+#[test]
+fn a_carrier_spares_a_process_owned_through_recorded_stamp_evidence() {
+    // tmux was started inside s1 and carries its stamp. A job from a pane was recorded with
+    // s1's stamp, then exec'd with a clean environment and detached.
+    let tmux = classified(
+        stamped(proc(1000, 1, "tmux"), "s1", Some(900)),
+        "/opt/homebrew/bin/tmux",
+        &["tmux", "new-session", "-d"],
+    );
+    let job = proc(1001, 1, "redis-server");
+    let mut row = recorded(key("s1"), job.id, Part::Child, NOW_MS - 3_000_000);
+    row.evidence = Evidence::Stamp;
+    let gone = ProcId {
+        pid: 900,
+        start_us: at(3 * HOUR_US),
+    };
+    let known = Known {
+        sessions: Vec::new(),
+        processes: vec![
+            recorded(key("s1"), gone, Part::Agent, NOW_MS - 5_000_000),
+            row,
+        ],
+    };
+    let l = Lineage::build(&snap(vec![tmux, job.clone()]), &known, &policy());
+    assert_eq!(
+        spare(&l, 1001),
+        Spare::StampCarried {
+            pid: 1000,
+            what: Infra::Multiplexer
+        }
+    );
+    // Without the carrier it is a leftover.
+    let l = Lineage::build(&snap(vec![job]), &known, &policy());
+    assert!(l.is_leftover(1001));
+}
+
+#[test]
+fn an_ssh_master_from_ssh_config_is_never_a_leftover() {
+    // `ControlMaster auto` in ssh_config, then `ssh -fN host`: no -M on the command line.
+    let dead = |p| stamped(p, "s1", Some(900));
+    let ssh = |pid, argv: &[&str]| classified(dead(proc(pid, 1, "ssh")), "/usr/bin/ssh", argv);
+    let s = snap(vec![
+        ssh(1000, &["ssh", "-fN", "build.example.com"]),
+        ssh(1001, &["ssh", "-N", "-L", "5432:db:5432", "bastion"]),
+        ssh(
+            1002,
+            &[
+                "ssh",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-f",
+                "host",
+                "sleep",
+                "60",
+            ],
+        ),
+        // -N after the host belongs to the remote command, not to ssh.
+        ssh(1003, &["ssh", "host", "ls", "-N"]),
+        // -p takes 2222 as its value, and -i takes `-f` as a file name.
+        ssh(1004, &["ssh", "-p", "2222", "-i", "-f", "host"]),
+    ]);
+    let l = build(&s);
+    for pid in [1000, 1001, 1002] {
+        assert_eq!(
+            spare(&l, pid),
+            Spare::NeverReap {
+                what: Infra::SshMaster
+            },
+            "{pid}"
+        );
+    }
+    assert!(l.is_leftover(1003));
+    assert!(l.is_leftover(1004));
+
+    // A master that holds its control socket, whatever its arguments say.
+    let mut listening = dead(proc(1005, 1, "ssh"));
+    listening.exe = Some("/usr/bin/ssh".into());
+    let argv = ["ssh".to_string(), "host".to_string()];
+    let facts = crate::catalog::Facts {
+        unix_listener: true,
+    };
+    listening.role = crate::catalog::classify_with("/usr/bin/ssh", &argv, facts).map(|r| r.role);
+    assert_eq!(
+        spare(&build(&snap(vec![listening])), 1005),
+        Spare::NeverReap {
+            what: Infra::SshMaster
+        }
+    );
 }

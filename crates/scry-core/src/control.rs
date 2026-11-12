@@ -1,7 +1,25 @@
-//! Stopping a process. Every caller, human or agent, goes through the same checks: the
-//! viewer's own processes only, never the system's, and the identity `(pid, start_time)` is
-//! read again right before each signal, after every other check, so a reused pid is never
-//! signalled.
+//! Stopping a process. Every caller, human or agent, goes through the same steps before
+//! each signal, SIGKILL included, in this order:
+//!
+//! 1. a kqueue watch is put on the pid, for its exit and for an exec;
+//! 2. for a target named by port, the process must still hold that port;
+//! 3. a [`Gate`] reads the machine and the config again: stopping is still allowed, the
+//!    process is still the viewer's own and not the system's, and, for a reap, still a
+//!    leftover of the session it was listed under;
+//! 4. the gate writes an audit row saying what is about to be sent, flushed to disk, and
+//!    nothing is sent when it cannot;
+//! 5. the gate reads `destructive` and the keep list once more, after that row;
+//! 6. the identity `(pid, start_time)` is read again, then the watch is asked, without
+//!    waiting, whether that process exited or exec'd at any point since step 1;
+//! 7. the signal.
+//!
+//! The watch belongs to the process, not the number, so a process that exits after step 1
+//! is caught even when its pid is handed to another before the identity is read, and one
+//! that execs another program while it is being judged, keeping its pid and start time, is
+//! caught as well. What remains is the few microseconds between the last question to the
+//! watch and `kill(2)`: the process would have to exit and macOS hand its pid to a new
+//! process in that time, which takes the pid counter going all the way round. No call on
+//! macOS signals a process by anything but its pid, so that window cannot be closed.
 
 use std::fmt;
 use std::str::FromStr;
@@ -99,36 +117,108 @@ pub enum Refusal {
         pid: i32,
         error: String,
     },
+    /// The leftover rule no longer selects it, re-checked just before the signal.
+    NotLeftover {
+        pid: i32,
+        why: String,
+    },
+    /// `destructive = false` in the config.
+    Disabled {
+        config: String,
+        line: Option<usize>,
+    },
+    /// The audit row could not be written, so nothing is signalled.
+    Unaudited {
+        error: String,
+    },
+    /// `--session` named the start of more than one session's id.
+    AmbiguousSession {
+        session: String,
+        ids: Vec<String>,
+    },
+    /// `--session` named no session Scry knows.
+    NoSession {
+        session: String,
+    },
 }
 
-impl fmt::Display for Refusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Refusal {
+    /// Why, in a sentence, without saying that nothing was signalled.
+    pub fn reason(&self) -> String {
         match self {
-            Refusal::NotFound { target } => write!(f, "Nothing found for {target}."),
-            Refusal::NotYours { pid, owner } => write!(
-                f,
-                "pid {pid} is owned by {owner}. Scry stops only your own processes."
-            ),
-            Refusal::Protected { pid, reason } => write!(f, "pid {pid} is protected: {reason}."),
-            Refusal::Ambiguous { port, pids } => write!(
-                f,
+            Refusal::NotFound { target } => format!("Nothing found for {target}."),
+            Refusal::NotYours { pid, owner } => {
+                format!("pid {pid} is owned by {owner}. Scry stops only your own processes.")
+            }
+            Refusal::Protected { pid, reason } => format!("pid {pid} is protected: {reason}."),
+            Refusal::Ambiguous { port, pids } => format!(
                 ":{port} is held by several processes ({}). Stop one by pid.",
                 pids.iter()
                     .map(|p| p.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Refusal::Changed { pid } => write!(
-                f,
-                "pid {pid} is no longer the process that was chosen. Nothing was signalled."
-            ),
-            Refusal::NotHolding { pid, port } => write!(
-                f,
-                "pid {pid} no longer has {port} open. Nothing was signalled."
-            ),
-            Refusal::SignalFailed { pid, error } => {
-                write!(f, "Signalling pid {pid} failed: {error}.")
+            Refusal::Changed { pid } => {
+                format!("pid {pid} is no longer the process that was chosen.")
             }
+            Refusal::NotHolding { pid, port } => format!("pid {pid} no longer has {port} open."),
+            Refusal::SignalFailed { pid, error } => {
+                format!("Signalling pid {pid} failed: {error}.")
+            }
+            Refusal::NotLeftover { pid, why } => format!(
+                "pid {pid} is no longer a leftover: {}.",
+                why.trim_end_matches('.')
+            ),
+            Refusal::Disabled { config, line } => {
+                let at = line.map(|l| format!(" line {l}")).unwrap_or_default();
+                format!(
+                    "Stopping is turned off by `destructive = false` in {config}{at}. Set it to true to allow stop and reap."
+                )
+            }
+            Refusal::Unaudited { error } => {
+                format!("The audit row could not be written: {error}")
+            }
+            Refusal::AmbiguousSession { session, ids } => format!(
+                "`{session}` starts more than one session's id: {}. Give more of it.",
+                ids.join(", ")
+            ),
+            Refusal::NoSession { session } => {
+                format!("No session Scry knows has an id that is or starts with `{session}`.")
+            }
+        }
+    }
+
+    /// The reason short enough for one footer line at 80 columns.
+    pub fn brief(&self) -> String {
+        match self {
+            Refusal::NotYours { pid, .. } => format!("pid {pid} is not yours."),
+            Refusal::Protected { pid, .. } => format!("pid {pid} is protected."),
+            Refusal::NotHolding { pid, .. } => format!("pid {pid} closed its port."),
+            Refusal::SignalFailed { pid, .. } => format!("signalling pid {pid} failed."),
+            Refusal::NotLeftover { pid, .. } => format!("pid {pid} is no longer a leftover."),
+            Refusal::Disabled { config, line } => {
+                let name = config.rsplit('/').next().unwrap_or(config);
+                let name = name.split(' ').next().unwrap_or(name);
+                let at = line.map(|l| format!(" line {l}")).unwrap_or_default();
+                format!("`destructive = false` in {name}{at}.")
+            }
+            Refusal::Unaudited { .. } => "the audit row could not be written.".into(),
+            other => other.reason(),
+        }
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::Changed { .. } | Refusal::NotHolding { .. } | Refusal::NotLeftover { .. } => {
+                write!(f, "{} Nothing was signalled.", self.reason())
+            }
+            Refusal::Unaudited { error } => write!(
+                f,
+                "The audit row could not be written, so nothing was signalled: {error}"
+            ),
+            other => f.write_str(&other.reason()),
         }
     }
 }
@@ -179,7 +269,9 @@ pub fn system_prefix(exe: &str) -> Option<&'static str> {
     SYSTEM_PREFIXES.iter().copied().find(|s| exe.starts_with(s))
 }
 
-fn guard(p: &Process, snap: &Snapshot) -> Result<(), Refusal> {
+/// Refuses what Scry never stops, whatever chose it: pids below 100, launchd, macOS's own
+/// executables, other users' processes and this process.
+pub fn guard(p: &Process, snap: &Snapshot) -> Result<(), Refusal> {
     let pid = p.id.pid;
     let protected = |reason: &str| {
         Err(Refusal::Protected {
@@ -223,17 +315,47 @@ pub enum Outcome {
     Exited { signal: String, after_ms: u64 },
     /// Still alive after SIGTERM and its grace period. SIGKILL needs `--kill`.
     StillRunning { after_ms: u64 },
+    /// Still alive after SIGTERM, and SIGKILL was not sent: the check before it failed.
+    KillRefused { after_ms: u64, why: String },
+}
+
+/// What must hold right before each signal besides the identity, and the audit row that
+/// comes before it. Every stop and reap passes one; see the module's steps.
+pub trait Gate {
+    /// Everything but the identity, read again: allowed, the viewer's own and not the
+    /// system's, and for a reap still a leftover.
+    fn check(&mut self, id: ProcId) -> Result<(), Refusal>;
+    /// Records that `signal` is about to go to `id`. An error refuses the signal.
+    fn intend(&mut self, id: ProcId, signal: &str) -> Result<(), Refusal>;
+    /// After the audit row, right before the identity and the signal: the config read
+    /// once more, so a `destructive = false` or a keep entry saved while the row was
+    /// written still refuses.
+    fn confirm(&mut self, id: ProcId) -> Result<(), Refusal>;
 }
 
 /// What stopping needs from the system. Tests stand in for it to show the order of the
 /// checks and signals.
-trait Host {
+pub(crate) trait Host {
     fn liveness(&self, pid: i32) -> Option<Liveness>;
     fn holds_port(&self, pid: i32, proto: Proto, port: u16) -> Option<bool>;
+    /// Starts watching the process that holds `pid` for its exit or an exec.
+    fn watch(&self, pid: i32) -> std::io::Result<Box<dyn Watch>>;
     fn signal(&self, pid: i32, sig: libc::c_int) -> std::io::Result<()>;
 }
 
-struct Live;
+/// A watch from [`Host::watch`].
+pub(crate) trait Watch {
+    /// Whether the process exited or exec'd since the watch began. An error counts as yes.
+    fn changed(&self) -> bool;
+}
+
+impl Watch for sys::kqueue::ChangeWatch {
+    fn changed(&self) -> bool {
+        sys::kqueue::ChangeWatch::changed(self).unwrap_or(true)
+    }
+}
+
+pub(crate) struct Live;
 
 impl Host for Live {
     fn liveness(&self, pid: i32) -> Option<Liveness> {
@@ -242,6 +364,10 @@ impl Host for Live {
 
     fn holds_port(&self, pid: i32, proto: Proto, port: u16) -> Option<bool> {
         sys::sockets::pid_holds_port(pid, proto, port)
+    }
+
+    fn watch(&self, pid: i32) -> std::io::Result<Box<dyn Watch>> {
+        Ok(Box::new(sys::kqueue::ChangeWatch::new(pid)?))
     }
 
     fn signal(&self, pid: i32, sig: libc::c_int) -> std::io::Result<()> {
@@ -254,31 +380,26 @@ impl Host for Live {
 }
 
 /// SIGTERM, then up to `grace` for the process to exit. With `kill`, a process still alive
-/// after that gets SIGKILL, after its identity is checked once more.
-pub fn stop(t: &StopTarget, kill: bool, grace: Duration) -> Result<Outcome, Refusal> {
-    stop_on(&Live, t, kill, grace)
+/// after that gets SIGKILL. `gate` comes before each signal.
+pub fn stop(
+    t: &StopTarget,
+    kill: bool,
+    grace: Duration,
+    gate: &mut dyn Gate,
+) -> Result<Outcome, Refusal> {
+    stop_on(&Live, t, kill, grace, gate)
 }
 
-fn stop_on(
+pub(crate) fn stop_on(
     host: &impl Host,
     t: &StopTarget,
     kill: bool,
     grace: Duration,
+    gate: &mut dyn Gate,
 ) -> Result<Outcome, Refusal> {
     let started = Instant::now();
     let elapsed = || started.elapsed().as_millis() as u64;
-    if let Some((proto, port)) = t.port
-        && host.holds_port(t.id.pid, proto, port) != Some(true)
-    {
-        return Err(Refusal::NotHolding {
-            pid: t.id.pid,
-            port: port_label(proto, port),
-        });
-    }
-    // The port check reads the pid's open files, and the pid can be reused meanwhile, so the
-    // identity is read after it, right before the signal.
-    check_identity(t.id, host.liveness(t.id.pid))?;
-    signal(host, t.id, libc::SIGTERM)?;
+    authorised_signal(host, t, gate, libc::SIGTERM)?;
     let term_worked = || {
         Ok(Outcome::Exited {
             signal: "SIGTERM".into(),
@@ -293,13 +414,19 @@ fn stop_on(
             after_ms: elapsed(),
         });
     }
-    // Gone between the wait and now, or as SIGKILL was sent: SIGTERM ended it.
-    if check_identity(t.id, host.liveness(t.id.pid)).is_err() {
-        return term_worked();
-    }
-    match signal(host, t.id, libc::SIGKILL) {
+    // A port target that let go of its port after SIGTERM is not escalated: the process
+    // still running is no longer the one named by that port.
+    match authorised_signal(host, t, gate, libc::SIGKILL) {
+        Ok(()) => {}
+        // Gone between the wait and now, or as SIGKILL was sent: SIGTERM ended it.
         Err(Refusal::Changed { .. }) => return term_worked(),
-        other => other?,
+        Err(r @ Refusal::SignalFailed { .. }) => return Err(r),
+        Err(r) => {
+            return Ok(Outcome::KillRefused {
+                after_ms: elapsed(),
+                why: r.reason(),
+            });
+        }
     }
     let after_ms = elapsed();
     if wait_gone(host, t.id, KILL_GRACE) {
@@ -312,7 +439,77 @@ fn stop_on(
     }
 }
 
-fn signal(host: &impl Host, id: ProcId, sig: libc::c_int) -> Result<(), Refusal> {
+/// SIGKILL alone, for a process that outlived SIGTERM and a second confirmation, after
+/// `gate`.
+pub fn kill(t: &StopTarget, gate: &mut dyn Gate) -> Result<Outcome, Refusal> {
+    kill_on(&Live, t, gate)
+}
+
+pub(crate) fn kill_on(
+    host: &impl Host,
+    t: &StopTarget,
+    gate: &mut dyn Gate,
+) -> Result<Outcome, Refusal> {
+    let started = Instant::now();
+    authorised_signal(host, t, gate, libc::SIGKILL)?;
+    let after_ms = started.elapsed().as_millis() as u64;
+    if wait_gone(host, t.id, KILL_GRACE) {
+        Ok(Outcome::Exited {
+            signal: "SIGKILL".into(),
+            after_ms,
+        })
+    } else {
+        Ok(Outcome::StillRunning { after_ms })
+    }
+}
+
+/// The module's steps for one signal: the watch first, then the port, the gate, the audit
+/// row and the config once more, then the identity and the watch again, then the signal.
+fn authorised_signal(
+    host: &impl Host,
+    t: &StopTarget,
+    gate: &mut dyn Gate,
+    sig: libc::c_int,
+) -> Result<(), Refusal> {
+    let id = t.id;
+    let watch = host.watch(id.pid).map_err(|e| match e.raw_os_error() {
+        Some(libc::ESRCH) => Refusal::Changed { pid: id.pid },
+        _ => Refusal::SignalFailed {
+            pid: id.pid,
+            error: format!("cannot watch it: {e}"),
+        },
+    })?;
+    // The same process, unchanged since the watch began: nothing it did after that can
+    // pass for what was checked.
+    let unchanged = || -> Result<(), Refusal> {
+        check_identity(id, host.liveness(id.pid))?;
+        if watch.changed() {
+            return Err(Refusal::Changed { pid: id.pid });
+        }
+        Ok(())
+    };
+    if let Some((proto, port)) = t.port
+        && host.holds_port(id.pid, proto, port) != Some(true)
+    {
+        unchanged()?;
+        return Err(Refusal::NotHolding {
+            pid: id.pid,
+            port: port_label(proto, port),
+        });
+    }
+    gate.check(id)?;
+    gate.intend(
+        id,
+        if sig == libc::SIGKILL {
+            "SIGKILL"
+        } else {
+            "SIGTERM"
+        },
+    )?;
+    gate.confirm(id)?;
+    // The port check and the gate read the pid's files, and the pid can be reused
+    // meanwhile, so the identity is read after them, right before the signal.
+    unchanged()?;
     match host.signal(id.pid, sig) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Err(Refusal::Changed { pid: id.pid }),
@@ -449,7 +646,14 @@ mod tests {
         reused_as: Option<i64>,
         /// The process exits on its own once `liveness` has been asked this many times.
         exits_after: Cell<Option<usize>>,
+        /// The watch reports an exit that came after the identity was read.
+        exits_after_identity: bool,
         ignores_term: bool,
+        /// Closes its port when SIGTERM arrives, and keeps running when it ignores it.
+        closes_port_on_term: bool,
+        termed: Cell<bool>,
+        /// Execs so far. A watch sees those after it began.
+        execs: std::rc::Rc<Cell<u32>>,
         log: RefCell<Vec<&'static str>>,
     }
 
@@ -459,6 +663,18 @@ mod tests {
                 self.exited.set(true);
             }
             self.exited.get()
+        }
+    }
+
+    struct FakeWatch {
+        exits_after_identity: bool,
+        execs_at_start: u32,
+        execs: std::rc::Rc<Cell<u32>>,
+    }
+
+    impl Watch for FakeWatch {
+        fn changed(&self) -> bool {
+            self.exits_after_identity || self.execs.get() > self.execs_at_start
         }
     }
 
@@ -480,7 +696,19 @@ mod tests {
             if let Some(s) = self.reused_as {
                 self.start_us.set(s);
             }
-            Some(true)
+            Some(!(self.closes_port_on_term && self.termed.get()))
+        }
+
+        fn watch(&self, _pid: i32) -> std::io::Result<Box<dyn Watch>> {
+            self.log.borrow_mut().push("watch");
+            if self.gone() {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(Box::new(FakeWatch {
+                exits_after_identity: self.exits_after_identity,
+                execs_at_start: self.execs.get(),
+                execs: self.execs.clone(),
+            }))
         }
 
         fn signal(&self, _pid: i32, sig: libc::c_int) -> std::io::Result<()> {
@@ -491,9 +719,50 @@ mod tests {
             if self.gone() {
                 return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
             }
+            self.termed.set(true);
             if kill || !self.ignores_term {
                 self.exited.set(true);
             }
+            Ok(())
+        }
+    }
+
+    /// A gate that allows everything and logs, in the host's log, each time it is asked.
+    struct Logged<'a>(&'a RefCell<Vec<&'static str>>);
+
+    impl Gate for Logged<'_> {
+        fn check(&mut self, _: ProcId) -> Result<(), Refusal> {
+            self.0.borrow_mut().push("check");
+            Ok(())
+        }
+
+        fn intend(&mut self, _: ProcId, signal: &str) -> Result<(), Refusal> {
+            self.0.borrow_mut().push(match signal {
+                "SIGKILL" => "intend SIGKILL",
+                _ => "intend SIGTERM",
+            });
+            Ok(())
+        }
+
+        fn confirm(&mut self, _: ProcId) -> Result<(), Refusal> {
+            self.0.borrow_mut().push("confirm");
+            Ok(())
+        }
+    }
+
+    /// The gate of a stop that nothing else constrains, for the live tests below.
+    struct Open;
+
+    impl Gate for Open {
+        fn check(&mut self, _: ProcId) -> Result<(), Refusal> {
+            Ok(())
+        }
+
+        fn intend(&mut self, _: ProcId, _: &str) -> Result<(), Refusal> {
+            Ok(())
+        }
+
+        fn confirm(&mut self, _: ProcId) -> Result<(), Refusal> {
             Ok(())
         }
     }
@@ -510,6 +779,10 @@ mod tests {
         }
     }
 
+    fn stop_fake(host: &Fake, t: &StopTarget, kill: bool) -> Result<Outcome, Refusal> {
+        stop_on(host, t, kill, Duration::ZERO, &mut Logged(&host.log))
+    }
+
     #[test]
     fn a_pid_reused_during_the_port_check_is_not_signalled() {
         let host = Fake {
@@ -517,19 +790,29 @@ mod tests {
             ..Fake::default()
         };
         assert_eq!(
-            stop_on(&host, &fake_target(true), true, Duration::ZERO),
+            stop_fake(&host, &fake_target(true), true),
             Err(Refusal::Changed { pid: 500 })
         );
-        assert_eq!(*host.log.borrow(), ["holds_port", "liveness"]);
+        assert_eq!(
+            *host.log.borrow(),
+            [
+                "watch",
+                "holds_port",
+                "check",
+                "intend SIGTERM",
+                "confirm",
+                "liveness"
+            ]
+        );
     }
 
     #[test]
-    fn each_signal_comes_right_after_an_identity_check() {
+    fn each_signal_comes_after_the_gate_the_audit_the_watch_and_the_identity() {
         let host = Fake {
             ignores_term: true,
             ..Fake::default()
         };
-        let out = stop_on(&host, &fake_target(true), true, Duration::ZERO).unwrap();
+        let out = stop_fake(&host, &fake_target(true), true).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGKILL"),
             "{out:?}"
@@ -537,15 +820,167 @@ mod tests {
         assert_eq!(
             *host.log.borrow(),
             [
+                "watch",
                 "holds_port",
+                "check",
+                "intend SIGTERM",
+                "confirm",
                 "liveness",
                 "SIGTERM",
                 "liveness",
+                "watch",
+                "holds_port",
+                "check",
+                "intend SIGKILL",
+                "confirm",
                 "liveness",
                 "SIGKILL",
                 "liveness"
             ]
         );
+    }
+
+    #[test]
+    fn a_process_that_exits_after_its_identity_is_read_is_not_signalled() {
+        let host = Fake {
+            exits_after_identity: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            stop_fake(&host, &fake_target(false), false),
+            Err(Refusal::Changed { pid: 500 })
+        );
+        assert_eq!(
+            *host.log.borrow(),
+            ["watch", "check", "intend SIGTERM", "confirm", "liveness"]
+        );
+    }
+
+    /// A gate that lets the process exec another program while it judges, at the `nth`
+    /// signal, from 1.
+    struct ExecsWhileJudged<'a> {
+        host: &'a Fake,
+        nth: u32,
+        checks: u32,
+    }
+
+    impl Gate for ExecsWhileJudged<'_> {
+        fn check(&mut self, _: ProcId) -> Result<(), Refusal> {
+            self.checks += 1;
+            if self.checks == self.nth {
+                self.host.execs.set(self.host.execs.get() + 1);
+            }
+            Ok(())
+        }
+        fn intend(&mut self, _: ProcId, _: &str) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn confirm(&mut self, _: ProcId) -> Result<(), Refusal> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_process_that_execs_while_it_is_judged_is_not_signalled() {
+        // The exec keeps the pid and the start time, so only the watch can tell.
+        let host = Fake::default();
+        let mut gate = ExecsWhileJudged {
+            host: &host,
+            nth: 1,
+            checks: 0,
+        };
+        let got = stop_on(&host, &fake_target(false), true, Duration::ZERO, &mut gate);
+        assert_eq!(got, Err(Refusal::Changed { pid: 500 }));
+        assert!(!host.log.borrow().contains(&"SIGTERM"));
+        let got = kill_on(
+            &host,
+            &fake_target(false),
+            &mut ExecsWhileJudged {
+                host: &host,
+                nth: 1,
+                checks: 0,
+            },
+        );
+        assert_eq!(got, Err(Refusal::Changed { pid: 500 }));
+        assert!(!host.log.borrow().contains(&"SIGKILL"));
+
+        // Between SIGTERM and SIGKILL: SIGKILL is not sent.
+        let host = Fake {
+            ignores_term: true,
+            ..Fake::default()
+        };
+        let mut gate = ExecsWhileJudged {
+            host: &host,
+            nth: 2,
+            checks: 0,
+        };
+        stop_on(&host, &fake_target(false), true, Duration::ZERO, &mut gate).unwrap();
+        assert!(host.log.borrow().contains(&"SIGTERM"));
+        assert!(!host.log.borrow().contains(&"SIGKILL"));
+    }
+
+    #[test]
+    fn a_port_target_that_lets_go_of_its_port_after_sigterm_is_not_killed() {
+        let host = Fake {
+            ignores_term: true,
+            closes_port_on_term: true,
+            ..Fake::default()
+        };
+        let out = stop_fake(&host, &fake_target(true), true).unwrap();
+        let Outcome::KillRefused { why, .. } = &out else {
+            panic!("{out:?}");
+        };
+        assert_eq!(why, "pid 500 no longer has :3000 open.");
+        let log = host.log.borrow();
+        assert!(!log.contains(&"SIGKILL"), "{log:?}");
+        assert!(
+            !log.contains(&"intend SIGKILL"),
+            "nothing to audit: {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_gate_that_refuses_or_cannot_audit_sends_nothing() {
+        /// Refuses at the check (0), the audit row (1) or the last read of the config (2).
+        struct No(Refusal, u8);
+        impl Gate for No {
+            fn check(&mut self, _: ProcId) -> Result<(), Refusal> {
+                if self.1 == 0 {
+                    Err(self.0.clone())
+                } else {
+                    Ok(())
+                }
+            }
+            fn intend(&mut self, _: ProcId, _: &str) -> Result<(), Refusal> {
+                if self.1 == 1 {
+                    Err(self.0.clone())
+                } else {
+                    Ok(())
+                }
+            }
+            fn confirm(&mut self, _: ProcId) -> Result<(), Refusal> {
+                Err(self.0.clone())
+            }
+        }
+        for refusal in [
+            Refusal::Disabled {
+                config: "~/.config/scry/config.toml".into(),
+                line: Some(3),
+            },
+            Refusal::Unaudited {
+                error: "disk full".into(),
+            },
+        ] {
+            for at in 0..3 {
+                let host = Fake::default();
+                let mut gate = No(refusal.clone(), at);
+                let got = stop_on(&host, &fake_target(false), true, Duration::ZERO, &mut gate);
+                assert_eq!(got, Err(refusal.clone()));
+                let got = kill_on(&host, &fake_target(false), &mut gate);
+                assert_eq!(got, Err(refusal.clone()));
+                assert_eq!(*host.log.borrow(), ["watch", "watch"], "no signal");
+            }
+        }
     }
 
     #[test]
@@ -556,7 +991,7 @@ mod tests {
             exits_after: Cell::new(Some(2)),
             ..Fake::default()
         };
-        let out = stop_on(&host, &fake_target(false), true, Duration::ZERO).unwrap();
+        let out = stop_fake(&host, &fake_target(false), true).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGTERM"),
             "{out:?}"
@@ -569,7 +1004,7 @@ mod tests {
             exits_after: Cell::new(Some(3)),
             ..Fake::default()
         };
-        let out = stop_on(&host, &fake_target(false), true, Duration::ZERO).unwrap();
+        let out = stop_fake(&host, &fake_target(false), true).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGTERM"),
             "{out:?}"
@@ -578,11 +1013,12 @@ mod tests {
     }
 
     /// `sleep 30` under `sh`, ignoring SIGTERM when asked. It returns once the shell has set
-    /// its trap, which a fixed wait cannot promise on a busy machine.
+    /// its trap and exec'd `sleep`, which a fixed wait cannot promise on a busy machine: an
+    /// exec after the watch begins would refuse the signal.
     fn spawn(ignore_term: bool) -> (Child, StopTarget) {
         let trap = if ignore_term { "trap '' TERM; " } else { "" };
         let mut child = Command::new("/bin/sh")
-            .args(["-c", &format!("{trap}echo ready; exec sleep 30")])
+            .args(["-c", &format!("{trap}echo ready; exec /bin/sleep 30")])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -592,6 +1028,11 @@ mod tests {
             .unwrap();
         assert_eq!(ready, "ready\n");
         let pid = child.id() as i32;
+        let until = Instant::now() + Duration::from_secs(5);
+        while sys::exe_path(pid).as_deref() != Some("/bin/sleep") {
+            assert!(Instant::now() < until, "sh never exec'd sleep");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let live = sys::liveness(pid).unwrap();
         let t = StopTarget {
             id: ProcId {
@@ -610,7 +1051,7 @@ mod tests {
         let (mut child, mut t) = spawn(false);
         t.id.start_us += 1;
         assert_eq!(
-            stop(&t, true, Duration::from_millis(200)),
+            stop(&t, true, Duration::from_millis(200), &mut Open),
             Err(Refusal::Changed { pid: t.id.pid })
         );
         assert!(child.try_wait().unwrap().is_none(), "still running");
@@ -621,7 +1062,7 @@ mod tests {
     #[test]
     fn sigterm_stops_a_process_and_reports_it() {
         let (mut child, t) = spawn(false);
-        let out = stop(&t, false, TERM_GRACE).unwrap();
+        let out = stop(&t, false, TERM_GRACE, &mut Open).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGTERM"),
             "{out:?}"
@@ -633,10 +1074,10 @@ mod tests {
     #[test]
     fn sigkill_comes_only_with_kill() {
         let (mut child, t) = spawn(true);
-        let out = stop(&t, false, Duration::from_millis(300)).unwrap();
+        let out = stop(&t, false, Duration::from_millis(300), &mut Open).unwrap();
         assert!(matches!(out, Outcome::StillRunning { .. }), "{out:?}");
         assert!(child.try_wait().unwrap().is_none());
-        let out = stop(&t, true, Duration::from_millis(300)).unwrap();
+        let out = stop(&t, true, Duration::from_millis(300), &mut Open).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGKILL"),
             "{out:?}"
@@ -645,11 +1086,59 @@ mod tests {
     }
 
     #[test]
+    fn a_live_process_that_execs_while_it_is_judged_is_not_signalled() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read go; exec /bin/sleep 30"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let t = StopTarget {
+            id: ProcId {
+                pid,
+                start_us: sys::liveness(pid).unwrap().start_us,
+            },
+            process: "sh".into(),
+            worker_of: None,
+            port: None,
+        };
+        /// Lets the shell exec `sleep` during the check, and waits until it has.
+        struct Exec(Option<std::process::ChildStdin>, i32);
+        impl Gate for Exec {
+            fn check(&mut self, _: ProcId) -> Result<(), Refusal> {
+                let seen = sys::kqueue::ChangeWatch::new(self.1).unwrap();
+                use std::io::Write;
+                writeln!(self.0.take().unwrap(), "go").unwrap();
+                let until = Instant::now() + Duration::from_secs(5);
+                while !seen.changed().unwrap() {
+                    assert!(Instant::now() < until, "the shell never exec'd");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            }
+            fn intend(&mut self, _: ProcId, _: &str) -> Result<(), Refusal> {
+                Ok(())
+            }
+            fn confirm(&mut self, _: ProcId) -> Result<(), Refusal> {
+                Ok(())
+            }
+        }
+        let mut gate = Exec(child.stdin.take(), pid);
+        assert_eq!(
+            stop(&t, true, Duration::from_millis(200), &mut gate),
+            Err(Refusal::Changed { pid })
+        );
+        assert!(child.try_wait().unwrap().is_none(), "never signalled");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
     fn a_port_target_must_still_hold_its_port() {
         let (mut child, mut t) = spawn(false);
         t.port = Some((Proto::Tcp, 1));
         assert_eq!(
-            stop(&t, false, TERM_GRACE),
+            stop(&t, false, TERM_GRACE, &mut Open),
             Err(Refusal::NotHolding {
                 pid: t.id.pid,
                 port: ":1".into()

@@ -15,7 +15,7 @@ use crate::label::{self, CommandLabel, Facts, LiveFiles};
 use crate::model::{ProcId, Project, Proto, Snapshot, Stamps};
 use crate::sys::procinfo::ArgsReader;
 use crate::sys::pulse::PulseSampler;
-use crate::{project, sys};
+use crate::{keep, project, sys};
 
 /// Which of the viewer's processes get a command label. Building one can look up each
 /// argument as a file, and every CLI command builds a fresh engine, so a command labels only
@@ -41,6 +41,11 @@ struct Args {
     stamps: Stamps,
     worker: bool,
     role: Option<Role>,
+    /// For an interpreter, the real path of its script, resolved against the working
+    /// directory it had when the arguments were read.
+    script: Option<String>,
+    /// For any other program, whether an argument names an existing file.
+    file_args: bool,
     /// The label and the listening ports it was built with. It is built again when they change.
     label: Option<(Vec<u16>, CommandLabel)>,
 }
@@ -114,10 +119,18 @@ impl Engine {
                         .as_deref()
                         .and_then(|exe| catalog::classify(exe, &read.argv))
                         .map(|r| r.role);
+                    let cwd = p.cwd.as_deref().map(Path::new);
+                    let runner = p.exe.as_deref().is_some_and(keep::is_runner);
+                    let script = runner
+                        .then(|| keep::script_of(&read.argv, cwd, &self.files))
+                        .flatten();
+                    let file_args = !runner && keep::has_file_arg(&read.argv, cwd, &self.files);
                     self.args.insert(
                         p.id,
                         Args {
                             role,
+                            script,
+                            file_args,
                             exe: p.exe.clone(),
                             worker: label::multiprocessing_worker(&read.argv),
                             argv: read.argv,
@@ -127,10 +140,24 @@ impl Engine {
                     );
                 }
             }
-            if let Some(a) = self.args.get(&p.id) {
+            if let Some(a) = self.args.get_mut(&p.id) {
+                // An ssh master configured in ssh_config can look like any other ssh on its
+                // command line, but it holds its control socket. Its socket can open after
+                // the first scan saw it, so an unclassified ssh is looked at again each scan.
+                if a.role.is_none()
+                    && let Some(exe) = p.exe.as_deref().filter(|e| e.ends_with("/ssh"))
+                    && sys::sockets::holds_unix_listener(p.id.pid) == Some(true)
+                {
+                    let facts = catalog::Facts {
+                        unix_listener: true,
+                    };
+                    a.role = catalog::classify_with(exe, &a.argv, facts).map(|r| r.role);
+                }
                 p.stamps = a.stamps.clone();
                 p.worker = a.worker;
                 p.role = a.role;
+                p.script = a.script.clone();
+                p.file_args = a.file_args;
             }
             if let Some(cwd) = &p.cwd {
                 p.project = roots

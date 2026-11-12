@@ -11,6 +11,9 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use scry_core::disk::catalog::Kind;
 use scry_core::disk::clean::{Allows, Plan};
 use scry_core::engine::Labels;
+use scry_core::keep::{self, KeepAs, KeepEdit};
+use scry_core::paths::Paths;
+use scry_core::reap::Report;
 use scry_core::view::{Board, Load, Tab, Target, Tone};
 
 use super::theme::Theme;
@@ -93,11 +96,17 @@ pub struct CleanSheet {
     pub warning: Option<String>,
 }
 
-/// A confirmation listing exactly what an action would touch.
+/// A confirmation listing exactly what an action would touch. What it lists and what its
+/// signal follows are fixed when it opens: nothing that finishes meanwhile changes them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sheet {
     pub kind: SheetKind,
+    /// For `Kill`, the stop or reap whose targets outlived SIGTERM, which decides the checks
+    /// before SIGKILL. Otherwise `kind`.
+    pub origin: SheetKind,
     pub targets: Vec<Target>,
+    /// For `Keep`: the change to the config, shown as a diff, and the config as shown.
+    pub keep: Option<Box<(KeepEdit, String)>>,
     /// First target on screen when they do not all fit. Kept as it is through a resize; the
     /// sheet draws it clamped to the size of the moment.
     pub offset: Cell<usize>,
@@ -109,9 +118,29 @@ impl Sheet {
     pub fn new(kind: SheetKind, targets: Vec<Target>) -> Sheet {
         Sheet {
             kind,
+            origin: kind,
             targets,
+            keep: None,
             offset: Cell::new(0),
             max_offset: Cell::new(usize::MAX),
+        }
+    }
+
+    /// SIGKILL for what outlived SIGTERM in a stop or reap, with each age as of now.
+    pub fn kill(origin: SheetKind, targets: &[Target]) -> Sheet {
+        let now_us = scry_core::sys::now_ms() * 1000;
+        let targets = targets
+            .iter()
+            .map(|t| Target {
+                age_s: t
+                    .start_us
+                    .map_or(t.age_s, |s| ((now_us - s).max(0) / 1_000_000) as u64),
+                ..t.clone()
+            })
+            .collect();
+        Sheet {
+            origin,
+            ..Sheet::new(SheetKind::Kill, targets)
         }
     }
 }
@@ -120,6 +149,21 @@ impl Sheet {
 pub enum SheetKind {
     Stop,
     Reap,
+    /// SIGKILL for what outlived SIGTERM, a second confirmation after a stop or a reap.
+    Kill,
+    /// Adding a process to the keep list.
+    Keep,
+}
+
+/// A confirmed action for the live TUI to carry out off the UI thread.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Request {
+    /// `Stop`, `Reap` or `Kill`.
+    pub kind: SheetKind,
+    /// What a `Kill` follows, which decides the check before its signal: a reaped process
+    /// must still be a leftover.
+    pub origin: SheetKind,
+    pub targets: Vec<Target>,
 }
 
 /// What each view remembers while you look elsewhere.
@@ -152,13 +196,16 @@ pub struct Toast {
     pub until: Instant,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum Action {
     None,
     Redraw,
     Quit,
     Suspend,
     Rescan,
+    /// A reading for the lists to show a change at once, with no "Refreshed." after it.
+    Reread,
+    Act(Request),
     /// Run this cleanup, with what was typed to confirm a delete.
     Clean(Box<(Plan, Option<String>)>),
 }
@@ -175,6 +222,14 @@ pub struct App {
     /// How wide the list was last drawn, which decides the columns on screen. Keys act on
     /// what was last drawn.
     pub list_width: Cell<u16>,
+    /// Where the config is, in the live TUI. `K` writes the keep list there; a fixture has
+    /// none, so nothing is written.
+    pub paths: Option<Paths>,
+    /// A confirmed action is running.
+    pub acting: Option<SheetKind>,
+    /// What outlived SIGTERM in the last stop or reap, and which it was. `X` offers SIGKILL
+    /// for them until it is sent or declined.
+    pub stubborn: Option<(SheetKind, Vec<Target>)>,
     /// Says which agent that writes into a disk item is running, if one is; asked as a
     /// cleanup's sheet opens. Nothing for a fixture.
     pub writer: fn(&str) -> Option<String>,
@@ -192,6 +247,9 @@ impl App {
             toast: None,
             fresh: Fresh::default(),
             list_width: Cell::new(MIN_W),
+            paths: None,
+            acting: None,
+            stubborn: None,
             writer: |_| None,
         }
     }
@@ -453,6 +511,7 @@ impl App {
             }
             KeyCode::Char('x') => self.ask_stop(),
             KeyCode::Char('X') => self.ask_reap(),
+            KeyCode::Char('K') => self.ask_keep(),
             KeyCode::Char('t') => self.ask_clean(),
             KeyCode::Char('r') => Action::Rescan,
             _ => Action::None,
@@ -503,17 +562,20 @@ impl App {
                 let Mode::Sheet(sheet) = std::mem::replace(&mut self.mode, Mode::Normal) else {
                     return Action::None;
                 };
-                let verb = match sheet.kind {
-                    SheetKind::Stop => "Stopping",
-                    SheetKind::Reap => "Reaping",
-                };
-                self.notify(
-                    format!("Nothing was sent. {verb} is not built yet."),
-                    Tone::Info,
-                );
-                Action::Redraw
+                self.confirm(sheet)
             }
-            KeyCode::Esc | KeyCode::Char('n' | 'q') => self.enter(Mode::Normal),
+            KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                if let Mode::Sheet(s) = &self.mode
+                    && s.kind == SheetKind::Kill
+                {
+                    // Only what this sheet offered; a later stop's leftovers stay offered.
+                    if self.stubborn.as_ref() == Some(&(s.origin, s.targets.clone())) {
+                        self.stubborn = None;
+                    }
+                    self.notify("SIGKILL was not sent.", Tone::Quiet);
+                }
+                self.enter(Mode::Normal)
+            }
             KeyCode::Char('j') | KeyCode::Down => self.scroll_sheet(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_sheet(-1),
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_sheet(PAGE),
@@ -522,6 +584,130 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => self.scroll_sheet(isize::MAX / 2),
             _ => Action::None,
         }
+    }
+
+    /// Carries out a confirmed sheet: writes the keep list at once, and hands a signal to
+    /// the live TUI's worker with the sheet's own targets and origin, which the worker
+    /// checks again in full before each signal. A fixture sends and writes nothing.
+    fn confirm(&mut self, sheet: Sheet) -> Action {
+        if sheet.kind == SheetKind::Keep {
+            let Some((edit, _)) = sheet.keep.map(|b| *b) else {
+                return Action::Redraw;
+            };
+            let Some(paths) = self.paths.clone() else {
+                self.notify("This is a fixture, so nothing was written.", Tone::Info);
+                return Action::Redraw;
+            };
+            return match keep::apply_audited(&edit, &paths, "tui") {
+                Ok(()) => {
+                    let file = self.config_name(&edit);
+                    self.notify_for(
+                        format!("Kept `{}`: added to {file} line {}.", edit.entry, edit.line),
+                        Tone::Ok,
+                        TOAST_FOR * 2,
+                    );
+                    Action::Reread
+                }
+                Err(e) => {
+                    self.notify(format!("Nothing was written: {e:#}"), Tone::Danger);
+                    Action::Redraw
+                }
+            };
+        }
+        if !matches!(self.source, Source::Live) {
+            self.notify("This is a fixture, so nothing was sent.", Tone::Info);
+            return Action::Redraw;
+        }
+        if let Some(kind) = self.acting {
+            self.notify(format!("Still {}…", doing(kind)), Tone::Quiet);
+            return Action::Redraw;
+        }
+        let origin = sheet.origin;
+        if sheet.kind == SheetKind::Kill
+            && self.stubborn.as_ref() == Some(&(origin, sheet.targets.clone()))
+        {
+            self.stubborn = None;
+        }
+        let n = sheet.targets.len();
+        self.acting = Some(sheet.kind);
+        // Shown until the outcome replaces it.
+        self.notify_for(
+            format!(
+                "{} {n} {}…",
+                capital(doing(sheet.kind)),
+                if n == 1 { "process" } else { "processes" }
+            ),
+            Tone::Info,
+            Duration::from_secs(3600),
+        );
+        Action::Act(Request {
+            kind: sheet.kind,
+            origin,
+            targets: sheet.targets,
+        })
+    }
+
+    /// Takes in what a confirmed action did: the outcome in the footer, and SIGKILL offered
+    /// on a sheet of its own for whatever outlived SIGTERM.
+    pub fn acted(&mut self, req: &Request, result: Result<Report, String>) {
+        self.acting = None;
+        let report = match result {
+            Ok(r) => r,
+            Err(why) => {
+                self.notify_for(why, Tone::Danger, TOAST_FOR * 2);
+                return;
+            }
+        };
+        let still: Vec<Target> = report
+            .still_running()
+            .iter()
+            .filter_map(|d| req.targets.iter().find(|t| t.pid == d.target.id.pid))
+            .cloned()
+            .collect();
+        let tone = if !still.is_empty() {
+            Tone::Warn
+        } else if report.stopped() == report.done.len() {
+            Tone::Ok
+        } else {
+            Tone::Quiet
+        };
+        let mut text = report.summary();
+        if let Some(u) = report.unaudited().first() {
+            text = format!(
+                "{text} The outcome for pid {} was not audited.",
+                u.target.id.pid
+            );
+            self.notify_for(text, Tone::Danger, TOAST_FOR * 2);
+        } else {
+            if let Some(r) = report.done.iter().find_map(|d| d.refusal.as_ref()) {
+                text = format!("{}: {}", text.trim_end_matches('.'), r.brief());
+            }
+            self.notify_for(text, tone, TOAST_FOR * 2);
+        }
+        // An open sheet is never touched: it keeps its own targets and origin.
+        if still.is_empty() || req.kind == SheetKind::Kill {
+            // What another action left still waits for its SIGKILL.
+            let about_these = |(_, offered): &(SheetKind, Vec<Target>)| {
+                offered
+                    .iter()
+                    .any(|o| req.targets.iter().any(|t| t.pid == o.pid))
+            };
+            if self.stubborn.as_ref().is_some_and(about_these) {
+                self.stubborn = None;
+            }
+            return;
+        }
+        self.stubborn = Some((req.origin, still.clone()));
+        if self.mode == Mode::Normal {
+            self.mode = Mode::Sheet(Sheet::kill(req.origin, &still));
+        }
+    }
+
+    /// The config's path as the sheet and the footer show it; a fixture's is only a name.
+    pub fn config_name(&self, edit: &KeepEdit) -> String {
+        self.paths
+            .as_ref()
+            .map_or_else(|| "config.toml".into(), |p| p.tilde(&edit.config))
     }
 
     /// Enter confirms, once a delete's word is typed exactly; esc cancels. A delete's sheet
@@ -620,10 +806,10 @@ impl App {
         };
         // From where the sheet is on screen, so a key never moves an offset that a smaller
         // terminal clamped away.
-        let max = sheet
-            .max_offset
-            .get()
-            .min(sheet.targets.len().saturating_sub(1));
+        let mut max = sheet.max_offset.get();
+        if sheet.keep.is_none() {
+            max = max.min(sheet.targets.len().saturating_sub(1));
+        }
         let at = sheet.offset.get().min(max) as isize;
         sheet
             .offset
@@ -759,22 +945,78 @@ impl App {
         }
     }
 
+    /// `K`: shows how the keep list would change to spare the selected process.
+    fn ask_keep(&mut self) -> Action {
+        let Some(t) = self.selected_row().and_then(|r| r.target) else {
+            self.notify("Nothing on this row can be kept.", Tone::Quiet);
+            return Action::Redraw;
+        };
+        let entry = match &t.keep {
+            Some(KeepAs::Entry(e)) => e.clone(),
+            Some(KeepAs::Refused(_)) => {
+                let what = super::kit::fit(vec![t.command.as_str().into()], 24);
+                self.notify(
+                    format!("No entry keeps only `{what}`. Add one to keep by hand."),
+                    Tone::Quiet,
+                );
+                return Action::Redraw;
+            }
+            None => {
+                self.notify(
+                    "Only a process an agent session started can go on the keep list.",
+                    Tone::Quiet,
+                );
+                return Action::Redraw;
+            }
+        };
+        // A fixture plans against an empty config of its own and never writes it.
+        let edit = match &self.paths {
+            Some(paths) => keep::plan(paths, &entry),
+            None => keep::plan(&fixture_paths(), &entry),
+        };
+        match edit {
+            Ok(edit) if edit.already => {
+                let file = self.config_name(&edit);
+                self.notify(
+                    format!("`{entry}` is already on the keep list in {file}."),
+                    Tone::Quiet,
+                );
+                Action::Redraw
+            }
+            Ok(edit) => {
+                let mut sheet = Sheet::new(SheetKind::Keep, vec![t]);
+                let file = self.config_name(&edit);
+                sheet.keep = Some(Box::new((edit, file)));
+                self.enter(Mode::Sheet(sheet))
+            }
+            Err(e) => {
+                self.notify(
+                    format!("The keep list cannot be changed: {e:#}"),
+                    Tone::Danger,
+                );
+                Action::Redraw
+            }
+        }
+    }
+
     fn ask_reap(&mut self) -> Action {
         let Some(reap) = views::view(self.tab).reap else {
             return Action::None;
         };
-        // Nothing to reap is an all-clear only when the view knows what is running.
-        match self.rows() {
+        if let Some((origin, still)) = &self.stubborn {
+            let sheet = Sheet::kill(*origin, still);
+            return self.enter(Mode::Sheet(sheet));
+        }
+        // Nothing to reap is an all-clear only once the agent sessions were read, which the
+        // Overview needs as much as the Agents view.
+        match (views::view(Tab::Agents).rows)(&self.board) {
             Load::Ready(_) => {}
             Load::Unavailable(why) | Load::Failed(why) => {
                 self.notify(why, Tone::Quiet);
                 return Action::Redraw;
             }
             Load::Loading => {
-                self.notify(
-                    format!("Still reading {}.", self.tab.title().to_lowercase()),
-                    Tone::Quiet,
-                );
+                self.notify("Still reading agent sessions.", Tone::Quiet);
                 return Action::Redraw;
             }
         }
@@ -785,6 +1027,29 @@ impl App {
         }
         self.enter(Mode::Sheet(Sheet::new(SheetKind::Reap, targets)))
     }
+}
+
+/// Paths whose config does not exist, for a fixture's `K` to plan against.
+fn fixture_paths() -> Paths {
+    let home = std::env::temp_dir().join("scry-fixture");
+    Paths::new(home.clone(), Some(home.join("no-config-here")))
+}
+
+/// The words for an action in progress.
+fn doing(kind: SheetKind) -> &'static str {
+    match kind {
+        SheetKind::Stop => "stopping",
+        SheetKind::Reap => "reaping",
+        SheetKind::Kill => "sending SIGKILL to",
+        SheetKind::Keep => "keeping",
+    }
+}
+
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 fn has_children(rows: &[Row], i: usize) -> bool {

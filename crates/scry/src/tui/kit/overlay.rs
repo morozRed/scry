@@ -11,6 +11,8 @@ use scry_core::disk::clean::Action;
 use scry_core::view::worktrees::bytes;
 
 use super::wrapped_lines;
+use scry_core::keep::KeepEdit;
+
 use crate::tui::app::{CleanSheet, Sheet, SheetKind};
 use crate::tui::theme::{Chrome, Theme};
 
@@ -45,12 +47,17 @@ pub fn confirm_label(kind: SheetKind) -> &'static str {
     match kind {
         SheetKind::Stop => "send SIGTERM",
         SheetKind::Reap => "reap all",
+        SheetKind::Kill => "send SIGKILL",
+        SheetKind::Keep => "write config",
     }
 }
 
 /// Rises from the bottom of the body and lists every target before anything is sent.
 /// Returns where it was drawn, for the fade.
 pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
+    if let Some((edit, file)) = sheet.keep.as_deref() {
+        return keep_sheet(f, body, theme, sheet, edit, file);
+    }
     let n = sheet.targets.len();
     let (title, what) = match sheet.kind {
         SheetKind::Stop => (
@@ -60,6 +67,10 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
         SheetKind::Reap => (
             format!("Reap {}?", plural(n, "leftover", "leftovers")),
             "Children first, each re-checked by pid and start time just before its signal. Processes tied only by a guess are never included.",
+        ),
+        SheetKind::Kill | SheetKind::Keep => (
+            format!("Send SIGKILL to {}?", plural(n, "process", "processes")),
+            "Still running 3 s after SIGTERM. SIGKILL cannot be caught or cleaned up after; each is re-checked just before it.",
         ),
     };
     let frees: u64 = sheet.targets.iter().filter_map(|t| t.frees).sum();
@@ -184,6 +195,126 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
         table,
     );
     area
+}
+
+/// The keep list's change as a diff, with the config it goes into. The sheet is as tall as
+/// the whole diff, each line wrapped to the width; when even the body cannot hold it, it
+/// scrolls like a long list of targets.
+fn keep_sheet(
+    f: &mut Frame,
+    body: Rect,
+    theme: &Theme,
+    sheet: &Sheet,
+    edit: &KeepEdit,
+    file: &str,
+) -> Rect {
+    let what = format!(
+        "Adds it to the keep list in {file}, so no rule selects it, or anything else that matches it, again. Nothing else in the file changes."
+    );
+    let padding = Padding::new(2, 2, 1, 1);
+    let probe = card(theme, Borders::TOP).padding(padding).inner(body);
+    let width = probe.width.max(8) as usize;
+    let mut head: Vec<Line> = hard_wrap(&format!("Keep `{}`?", edit.entry), width)
+        .into_iter()
+        .map(|l| Line::styled(l, theme.strong))
+        .collect();
+    let what_lines = wrapped_lines(&what, probe.width);
+    head.push(Line::styled(what.clone(), theme.muted));
+    head.push(Line::raw(""));
+    head.push(Line::styled(
+        format!("{file} line {}", edit.line),
+        theme.heading,
+    ));
+    let head_height = head.len() as u16 - 1 + what_lines;
+    let mut diff: Vec<Line> = Vec::new();
+    for (sign, lines, style) in [
+        ("- ", &edit.before, theme.danger),
+        ("+ ", &edit.after, theme.ok),
+    ] {
+        for l in lines {
+            for (i, part) in hard_wrap(l, width.saturating_sub(2).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if i == 0 { sign } else { "  " };
+                diff.push(Line::styled(format!("{lead}{part}"), style));
+            }
+        }
+    }
+    let chrome = body.height - probe.height;
+    let mut height = (chrome + head_height + diff.len() as u16).min(body.height);
+    if body.height - height < PEEK_MIN {
+        height = body.height;
+    }
+    let borders = if height == body.height {
+        Borders::NONE
+    } else {
+        Borders::TOP
+    };
+    let area = Rect {
+        y: body.bottom() - height,
+        height,
+        ..body
+    };
+    let above = area.y.saturating_sub(1).max(body.y);
+    let gap = Rect {
+        y: above,
+        height: area.y - above,
+        ..area
+    };
+    f.render_widget(Clear, gap);
+    f.render_widget(Clear, area);
+    let block = card(theme, borders).padding(padding);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let head_area = Rect {
+        height: head_height.min(inner.height),
+        ..inner
+    };
+    f.render_widget(Paragraph::new(head).wrap(Wrap { trim: false }), head_area);
+    let list = Rect {
+        y: head_area.bottom(),
+        height: inner.height - head_area.height,
+        ..inner
+    };
+    let room = list.height as usize;
+    let n = diff.len();
+    let shown = if n <= room { n } else { room.saturating_sub(1) };
+    sheet.max_offset.set(n - shown);
+    let top = sheet.offset.get().min(n - shown);
+    let mut lines: Vec<Line> = diff.into_iter().skip(top).take(shown).collect();
+    if shown < n {
+        let below = n - top - shown;
+        let mut more = Vec::new();
+        if top > 0 {
+            more.push(Span::styled(format!("↑ {top} above   "), theme.muted));
+        }
+        if below > 0 {
+            more.push(Span::styled(format!("↓ {below} more   "), theme.text));
+        }
+        more.push(Span::styled("j k", theme.key));
+        more.push(Span::styled(" scroll", theme.muted));
+        lines.push(Line::from(more));
+    }
+    f.render_widget(Paragraph::new(lines), list);
+    area
+}
+
+/// `text` cut into pieces of at most `width` columns, so a path with no spaces wraps too.
+fn hard_wrap(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = vec![String::new()];
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width && used > 0 {
+            out.push(String::new());
+            used = 0;
+        }
+        out.last_mut().expect("never empty").push(c);
+        used += w;
+    }
+    out
 }
 
 /// The key that confirms a cleanup, worded for what it does.
@@ -311,7 +442,7 @@ pub fn clean_sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &CleanSheet)
     area
 }
 
-const KEYS: [(&str, &str, &str); 15] = [
+const KEYS: [(&str, &str, &str); 16] = [
     ("Move", "j k ↑ ↓", "up and down, ctrl-d ctrl-u by page"),
     ("", "g G", "first and last row"),
     ("", "⏎", "fold a session, or go to the row"),
@@ -322,6 +453,7 @@ const KEYS: [(&str, &str, &str); 15] = [
     ("", "s  S", "sort by the next column, reverse"),
     ("Act", "x", "stop the selected process"),
     ("", "X", "reap leftovers"),
+    ("", "K", "keep: never select it again"),
     ("", "t", "clean up a disk item or worktree"),
     ("", "r", "refresh now; auto every refresh_secs (5 s)"),
     ("App", "?", "this help"),

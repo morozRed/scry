@@ -52,6 +52,15 @@ pub struct Process {
     /// because only their arguments are readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
+    /// For an interpreter, the real path of the script it runs; see [`crate::keep`]. Read
+    /// to match the keep list and never written to a snapshot or JSON.
+    #[serde(skip)]
+    pub script: Option<String>,
+    /// For a program that is not an interpreter, whether an argument names an existing
+    /// file, such as a config or a script it runs. Its executable alone would then keep it
+    /// whatever file it is given; see [`crate::keep::entry_for`]. Never written out.
+    #[serde(skip)]
+    pub file_args: bool,
 }
 
 /// The allowlisted agent keys from a process's environment. Every other variable is dropped

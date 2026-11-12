@@ -126,6 +126,8 @@ fn outputs(command: &CommandLabel) -> Vec<(&'static str, String)> {
             worker: false,
             tty: None,
             role: None,
+            script: None,
+            file_args: false,
         }],
         sockets: vec![Socket {
             proto: Proto::Tcp,

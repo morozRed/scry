@@ -4,6 +4,7 @@ mod disk;
 mod doctor_cmd;
 mod hook;
 mod ports;
+mod reap;
 mod stop;
 mod worktrees;
 
@@ -50,6 +51,8 @@ enum Command {
     Ports(ports::PortsArgs),
     Why(ports::WhyArgs),
     Stop(stop::StopArgs),
+    Reap(reap::ReapArgs),
+    Keep(reap::KeepArgs),
     /// List linked worktrees with their state, size and probable creator.
     Worktrees(worktrees::WorktreesArgs),
     Disk(disk::DiskArgs),
@@ -114,6 +117,8 @@ fn main() -> Result<()> {
         Some(Command::Ports(a)) => ports::ports(a),
         Some(Command::Why(a)) => ports::why(a),
         Some(Command::Stop(a)) => stop::run(a),
+        Some(Command::Reap(a)) => reap::run(a),
+        Some(Command::Keep(a)) => reap::keep(a),
         Some(Command::Worktrees(args)) => worktrees::run(args),
         Some(Command::Disk(args)) => disk::run(args),
         Some(Command::Clean(args)) => disk::clean(args),

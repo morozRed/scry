@@ -8,9 +8,13 @@ use std::path::{Path, PathBuf};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use scry::tui::app::{App, Source};
+use scry::tui::app::{App, Mode, Request, SheetKind, Source};
 use scry::tui::theme::{Colors, Look, Rgb, SHIPPED, Theme};
 use scry::tui::ui;
+use scry_core::ProcId;
+use scry_core::control::Outcome;
+use scry_core::keep::KeepAs;
+use scry_core::reap::{Done, ReapTarget, Report};
 use scry_core::view::agents::AgentRow;
 use scry_core::view::{Board, Detail, Evidence, Load, State};
 use svg::{Palette, SOLARIZED_LIGHT, TERMINAL_BASIC, TOMORROW_NIGHT};
@@ -24,6 +28,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(out.join("compare"))?;
     let design = Board::parse(&std::fs::read_to_string(root.join("fixtures/design.json"))?)?;
     let long = with_leftovers(&design, 20);
+    let keepable = keepable(&design);
     let shots = Shots { out: &out };
     let mut n = 0;
 
@@ -66,6 +71,8 @@ fn main() -> anyhow::Result<()> {
             ("agents-{p}-150x40", &design, "3jj", (150, 40)),
             ("ports-{p}-150x40", &design, "2jj", (150, 40)),
             ("sheet-{p}", &design, "3X", (120, 40)),
+            ("sheet-{p}-80x24", &design, "3X", (80, 24)),
+            ("keep-{p}", &keepable, "3jjK", (80, 24)),
             ("sheet-long-{p}", &long, "3X", (80, 24)),
             ("sheet-long-end-{p}", &long, "3XG", (80, 24)),
             ("sheet-long-{p}-150x40", &long, "3X", (150, 40)),
@@ -76,6 +83,19 @@ fn main() -> anyhow::Result<()> {
         ] {
             let name = name.replace("{p}", p);
             n += shots.take(&name, board, theme(), keys, pal, size)?;
+        }
+        // The reap sheet confirmed: the outcome in the footer, SIGKILL offered on its own.
+        for size in [(120, 40), (80, 24)] {
+            let (w, h) = size;
+            n += shots.take_then(
+                &format!("sheet-done-{p}-{w}x{h}"),
+                &design,
+                theme(),
+                "3X",
+                pal,
+                size,
+                confirmed,
+            )?;
         }
         let ansi = || Theme::new(SHIPPED, Colors::Ansi);
         n += shots.take(&format!("ansi-{p}"), &design, ansi(), "3jj", pal, (80, 24))?;
@@ -185,6 +205,10 @@ fn with_leftovers(design: &Board, n: usize) -> Board {
         label,
         context: (depth == 0).then(|| "acme/batch".into()),
         pid,
+        start_us: None,
+        keep: None,
+        ancestors: 0,
+        session_id: None,
         ram: Some(48 << 20),
         ports: vec![],
         age_s: 5 * 3600,
@@ -211,6 +235,64 @@ fn with_leftovers(design: &Board, n: usize) -> Board {
         ));
     }
     board
+}
+
+/// The design board with the keep entry a live reading gives each process row: the real
+/// path of the script node runs.
+fn keepable(design: &Board) -> Board {
+    let mut board = design.clone();
+    if let Load::Ready(rows) = &mut board.agents {
+        for r in rows.iter_mut().filter(|r| r.depth > 0) {
+            let tool = r.label.split(' ').next().unwrap_or("node");
+            r.keep = Some(KeepAs::Entry(format!(
+                "~/sources/acme/node_modules/{tool}/dist/bin/{tool}"
+            )));
+        }
+    }
+    board
+}
+
+/// What the live TUI shows once a confirmed reap comes back with one process that ignored
+/// SIGTERM. Nothing is signalled: the outcome is made up from the sheet's targets.
+fn confirmed(app: &mut App) {
+    let Mode::Sheet(sheet) = std::mem::replace(&mut app.mode, Mode::Normal) else {
+        return;
+    };
+    let last = sheet.targets.len() - 1;
+    let done = sheet
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(i, t)| Done {
+            target: ReapTarget {
+                id: ProcId {
+                    pid: t.pid,
+                    start_us: 0,
+                },
+                command: t.command.clone(),
+                session: t.session.clone().unwrap_or_default(),
+                session_id: None,
+                evidence: t.evidence,
+                ram: t.frees,
+            },
+            outcome: Some(if i == last {
+                Outcome::StillRunning { after_ms: 3000 }
+            } else {
+                Outcome::Exited {
+                    signal: "SIGTERM".into(),
+                    after_ms: 120,
+                }
+            }),
+            refusal: None,
+            unaudited: None,
+        })
+        .collect();
+    let req = Request {
+        kind: SheetKind::Reap,
+        origin: SheetKind::Reap,
+        targets: sheet.targets,
+    };
+    app.acted(&req, Ok(Report { done }));
 }
 
 /// The design board's worktrees while their sizes are measured, or none found at all.
@@ -245,7 +327,23 @@ impl Shots<'_> {
         theme: Theme,
         keys: &str,
         pal: &Palette,
+        size: (u16, u16),
+    ) -> anyhow::Result<usize> {
+        self.take_then(name, board, theme, keys, pal, size, |_| {})
+    }
+
+    /// [`Shots::take`], with `then` changing the app after the keys, as a reply from the
+    /// live TUI's worker would.
+    #[allow(clippy::too_many_arguments)]
+    fn take_then(
+        &self,
+        name: &str,
+        board: &Board,
+        theme: Theme,
+        keys: &str,
+        pal: &Palette,
         (w, h): (u16, u16),
+        then: impl FnOnce(&mut App),
     ) -> anyhow::Result<usize> {
         let mut app = App::new(
             board.clone(),
@@ -264,6 +362,7 @@ impl Shots<'_> {
             };
             app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
         }
+        then(&mut app);
         term.draw(|f| {
             ui::draw(f, &app);
         })?;

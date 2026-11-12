@@ -172,11 +172,22 @@ pub fn footer(f: &mut Frame, area: Rect, theme: &Theme, left: Vec<Span>, hints: 
         spans.push(Span::raw("    "));
     }
     let room = area.width as usize;
+    let need = |hints: &[(&str, &str)], gap: usize| {
+        hints
+            .iter()
+            .map(|(key, what)| key.width() + 1 + what.width() + gap)
+            .sum::<usize>()
+            .saturating_sub(gap)
+    };
+    // When even two columns apart they do not fit, the hints just before the last three
+    // (refresh, help and quit, which every view ends with) give way first: each is in the
+    // help card too.
+    let mut hints: Vec<(&str, &str)> = hints.to_vec();
+    while width(&spans) + need(&hints, 2) > room && hints.len() > 4 {
+        hints.remove(hints.len() - 4);
+    }
+    let all = need(&hints, 3) + 3;
     // Hints sit three columns apart, or two when that keeps the last of them on screen.
-    let all = hints
-        .iter()
-        .map(|(key, what)| key.width() + 1 + what.width() + 3)
-        .sum::<usize>();
     let gap = if width(&spans) + all <= room + 3 {
         "   "
     } else {

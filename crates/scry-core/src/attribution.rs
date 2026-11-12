@@ -332,12 +332,22 @@ struct Ctx<'a> {
     /// Live multiplexers and apps with a stamp. Each hands its environment to every job it
     /// starts, long after the session that stamped it.
     carriers: Vec<(&'a Process, Infra)>,
+    /// Live agents with a stamp: an agent another agent started, such as a headless Gemini
+    /// that Claude Code ran, inherits the outer session's stamp and passes it on.
+    nested: Vec<&'a Process>,
+}
+
+/// Whether `q` carries `session`'s stamp.
+fn carries(q: &Process, session: &SessionKey) -> bool {
+    q.stamps.sessions().iter().any(|&(agent, id, _)| {
+        agent == session.agent && session.id == SessionId::Known(id.to_string())
+    })
 }
 
 impl<'a> Ctx<'a> {
     fn new(snap: &'a Snapshot) -> Self {
         let by_pid: HashMap<i32, &Process> = snap.processes.iter().map(|p| (p.id.pid, p)).collect();
-        let hosts = snap
+        let hosts: HashMap<i32, Agent> = snap
             .own_processes()
             .filter_map(|p| Some((p.id.pid, p.role.and_then(Role::hosts)?)))
             .collect();
@@ -349,10 +359,15 @@ impl<'a> Ctx<'a> {
                 _ => None,
             })
             .collect();
+        let nested = snap
+            .own_processes()
+            .filter(|p| !p.stamps.is_empty() && hosts.contains_key(&p.id.pid))
+            .collect();
         Ctx {
             by_pid,
             hosts,
             carriers,
+            nested,
         }
     }
 
@@ -362,12 +377,22 @@ impl<'a> Ctx<'a> {
         self.carriers
             .iter()
             .filter(|(q, _)| q.id.pid != p.id.pid && q.id.start_us <= p.id.start_us)
-            .find(|(q, _)| {
-                q.stamps.sessions().iter().any(|&(agent, id, _)| {
-                    agent == session.agent && session.id == SessionId::Known(id.to_string())
-                })
-            })
+            .find(|(q, _)| carries(q, session))
             .map(|(q, what)| (q.id.pid, *what))
+    }
+
+    /// A live agent with `session`'s stamp that started before `p`. It may have started `p`
+    /// and still be working with it, so it keeps `session`'s processes alive the way the
+    /// session's own agent would.
+    fn nested_agent(&self, p: &Process, session: &SessionKey) -> Option<AgentState> {
+        self.nested
+            .iter()
+            .filter(|q| q.id.pid != p.id.pid && q.id.start_us <= p.id.start_us)
+            .find(|q| carries(q, session))
+            .map(|q| AgentState::Live {
+                pid: q.id.pid,
+                start_us: q.id.start_us,
+            })
     }
 
     /// The nearest agent process above `p`, through live parents.
@@ -638,7 +663,13 @@ impl Lineage {
             let owner = owners.get(&p.id.pid);
             // A leftover only when every session that claims it has lost its agent.
             let agent = claims.get(&p.id.pid).map(|keys| {
-                let states: Vec<AgentState> = keys.iter().map(&state).collect();
+                let states: Vec<AgentState> = keys
+                    .iter()
+                    .map(|k| match state(k) {
+                        live @ AgentState::Live { .. } => live,
+                        other => cx.nested_agent(p, k).unwrap_or(other),
+                    })
+                    .collect();
                 let live = states.iter().find(|a| matches!(a, AgentState::Live { .. }));
                 let unsure = states
                     .iter()
@@ -787,9 +818,17 @@ fn judge(
     if let Some((pid, what)) = cx.never_reap_above(p) {
         return spared(Spare::UnderNeverReap { pid, what });
     }
-    if let How::Stamp { .. } = how
-        && let Some((pid, what)) = cx.carrier_of(p, session)
-    {
+    // Recorded stamp evidence is the same stamp, read before the process dropped it (a job
+    // that exec'd with a clean environment), so a carrier spares it just as well.
+    let stamped = matches!(
+        how,
+        How::Stamp { .. }
+            | How::Recorded {
+                evidence: Evidence::Stamp,
+                ..
+            }
+    );
+    if stamped && let Some((pid, what)) = cx.carrier_of(p, session) {
         return spared(Spare::StampCarried { pid, what });
     }
     if let Some(tty) = &p.tty {
@@ -837,11 +876,10 @@ fn tty_below(p: &Process, children: &HashMap<i32, Vec<&Process>>) -> Option<(i32
     None
 }
 
-/// A keep entry names a process by its name or its executable's full path.
+/// A keep entry names a process by its name, its executable's full path or its command
+/// label; see [`crate::keep`].
 fn kept(p: &Process, keep: &[String]) -> Option<String> {
-    keep.iter()
-        .find(|k| **k == p.name || p.exe.as_deref() == Some(k.as_str()))
-        .cloned()
+    keep.iter().find(|k| crate::keep::matches(p, k)).cloned()
 }
 
 #[cfg(test)]

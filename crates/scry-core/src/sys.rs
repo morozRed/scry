@@ -281,6 +281,8 @@ fn read_process(id: ProcId) -> Option<Process> {
         worker: false,
         tty: None,
         role: None,
+        script: None,
+        file_args: false,
     })
 }
 

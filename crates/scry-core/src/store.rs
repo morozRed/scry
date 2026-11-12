@@ -177,6 +177,22 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::open`], with every commit synced to disk before it returns
+    /// (`synchronous = FULL`), for audit rows that must be on disk before the action they
+    /// announce. The daemon's samples keep the cheaper `NORMAL`.
+    pub fn open_durable(path: &Path) -> Result<Store> {
+        let store = Store::open(path)?;
+        store.conn.pragma_update(None, "synchronous", "FULL")?;
+        Ok(store)
+    }
+
+    /// SQLite's `synchronous` level on this connection: 1 `NORMAL`, 2 `FULL`.
+    pub fn synchronous(&self) -> Result<u32> {
+        Ok(self
+            .conn
+            .pragma_query_value(None, "synchronous", |r| r.get(0))?)
+    }
+
     pub fn schema_version(&self) -> Result<u32> {
         Ok(self
             .conn

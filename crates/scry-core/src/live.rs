@@ -2,8 +2,6 @@
 //! and the lineage built from both. Clients only read: the daemon alone writes sessions and
 //! ancestry, and without it the spool is applied in memory.
 
-use std::path::PathBuf;
-
 use anyhow::Result;
 use serde::Serialize;
 
@@ -47,28 +45,27 @@ impl Collector {
     /// A config that cannot be read leaves the keep list unknown, so the policy then
     /// selects no leftovers; [`Collector::config_error`] says why.
     pub fn new(labels: Labels) -> Collector {
-        let paths = Paths::from_env().ok();
-        let (keep, config_error) = match paths.as_ref().map(|p| (Config::load(p), p)) {
-            Some((Ok((c, _)), p)) => (
-                c.keep
-                    .iter()
-                    .map(|k| p.expand(&PathBuf::from(k)).display().to_string())
-                    .collect(),
-                None,
-            ),
-            Some((Err(e), _)) => (Vec::new(), Some(e.to_string())),
-            None => (Vec::new(), None),
-        };
+        Collector::with_paths(labels, Paths::from_env().ok())
+    }
+
+    /// A collector for the config and store at `paths`.
+    pub fn with_paths(labels: Labels, paths: Option<Paths>) -> Collector {
         Collector {
             engine: Engine::labelling(labels),
+            policy: policy(paths.as_ref()),
             paths,
-            policy: Policy {
-                keep,
-                config_error,
-                ..Policy::default()
-            },
             home: Home::from_env(),
         }
+    }
+
+    /// The rule's settings in effect: the keep list and grace period from the config, which
+    /// is read again on every reading, so a `K` takes effect on the next one.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    pub fn paths(&self) -> Option<&Paths> {
+        self.paths.as_ref()
     }
 
     /// Why the config could not be read. While it is broken no process is a leftover.
@@ -77,6 +74,7 @@ impl Collector {
     }
 
     pub fn read(&mut self) -> Result<Reading> {
+        self.policy = policy(self.paths.as_ref());
         let snap = self.engine.snapshot()?;
         let (known, history) = self.known(snap.taken_at_ms);
         let lineage = Lineage::build(&snap, &known, &self.policy);
@@ -133,5 +131,22 @@ impl Collector {
         };
         known.apply(&spool::read_all(&paths.spool()));
         (known, history)
+    }
+}
+
+/// The leftover rule's settings from the config. A config that cannot be read leaves the
+/// keep list unknown, so no process is a leftover until it is fixed.
+fn policy(paths: Option<&Paths>) -> Policy {
+    match paths.map(|p| (Config::load(p), p)) {
+        Some((Ok((c, _)), p)) => Policy {
+            keep: c.keep.iter().map(|k| crate::keep::expand(k, p)).collect(),
+            grace: c.leftover_grace,
+            ..Policy::default()
+        },
+        Some((Err(e), _)) => Policy {
+            config_error: Some(e.to_string()),
+            ..Policy::default()
+        },
+        None => Policy::default(),
     }
 }

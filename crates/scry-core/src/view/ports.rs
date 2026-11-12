@@ -121,11 +121,14 @@ impl PortRow {
         (self.mine() && self.start_us.is_some() && self.state != Some(State::System)).then(|| {
             Target {
                 pid: self.pid,
+                start_us: self.start_us,
                 command: self.holder(),
                 session: self.session.as_ref().map(SessionRef::short),
+                session_id: None,
                 evidence: self.session.as_ref().map(|_| Evidence::Stamp),
                 age_s: self.age_secs.unwrap_or(0).max(0) as u64,
                 frees: self.ram,
+                keep: None,
             }
         })
     }
