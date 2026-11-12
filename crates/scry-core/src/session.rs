@@ -115,6 +115,14 @@ pub struct Session {
     pub source: Source,
 }
 
+impl Session {
+    /// Whether a SessionStart at `at_ms` reopens it: `resume` starts an ended session again,
+    /// and a start older than the end changes nothing.
+    pub fn reopened_by(&self, at_ms: i64) -> bool {
+        self.ended_at_ms.is_some_and(|end| end <= at_ms)
+    }
+}
+
 /// A process's part in a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

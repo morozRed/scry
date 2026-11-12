@@ -64,7 +64,7 @@ pub fn run(paths: &Paths) -> Vec<Check> {
         Err(e) => {
             checks.push(fail(
                 "config",
-                e.to_string(),
+                format!("{e}; until it is fixed, no process is selected as a leftover"),
                 "Fix that line, or move the file away to use the defaults.",
             ));
             DEFAULT_SAMPLE_INTERVAL_SECS

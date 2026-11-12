@@ -36,6 +36,12 @@ pub fn empty(view: &ViewDef, board: &Board) -> (String, String) {
     }
 }
 
+/// Whether an empty list is an all-clear, drawn with ✓. No agent sessions says nothing
+/// about the machine's health, so Agents shows the neutral ○.
+pub fn empty_is_clear(view: &ViewDef) -> bool {
+    view.tab != Tab::Agents
+}
+
 pub struct ViewDef {
     pub tab: Tab,
     pub columns: &'static [Column],

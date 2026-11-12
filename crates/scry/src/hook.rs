@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Subcommand, ValueEnum};
 use scry_core::catalog::{self, Role};
-use scry_core::claude_hooks::{self, MANAGED, Plan};
+use scry_core::claude_hooks::{self, ManagedSources, Plan};
 use scry_core::model::{Agent, ProcId};
 use scry_core::paths::Paths;
 use scry_core::session::{EventKind, SessionEvent, valid_id};
@@ -74,13 +74,17 @@ fn change(install: bool, dry_run: bool) -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     let plan = if install {
-        let blockers = claude_hooks::managed_blockers(&MANAGED.map(PathBuf::from))
+        let user = std::env::var("USER").ok();
+        let blockers = claude_hooks::managed_blockers(&ManagedSources::macos(user.as_deref()))
             .context("reading Claude Code's managed settings")?;
         if !blockers.is_empty() {
             for b in &blockers {
                 eprintln!("{}", b.sentence());
             }
             bail!("not installed: managed settings would stop the hooks from running");
+        }
+        if let Err(why) = claude_hooks::check_exec_form(&claude_version()) {
+            bail!("not installed: {why}");
         }
         // The Homebrew link rather than the Cellar path, so an upgrade keeps the hook working.
         let exe = std::env::current_exe()?;
@@ -120,6 +124,44 @@ fn change(install: bool, dry_run: bool) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+/// What `claude --version` prints, or why it printed nothing. `SCRY_CLAUDE` names another
+/// `claude` to ask.
+fn claude_version() -> String {
+    let bin = std::env::var_os("SCRY_CLAUDE")
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| "claude".into());
+    let shown = PathBuf::from(&bin).display().to_string();
+    let child = std::process::Command::new(&bin)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return format!("{shown} --version: {e}"),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return format!("{shown} --version did not answer");
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut out);
+    }
+    out
 }
 
 fn show(plan: &Plan) {

@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Args;
 use scry_core::attribution::{Known, Lineage, Policy};
 use scry_core::engine::Labels;
@@ -69,6 +69,7 @@ struct Reading {
     lineage: Lineage,
     history: Option<History>,
     home: Option<Home>,
+    config_error: Option<String>,
 }
 
 fn read(fixture: Option<PathBuf>, labels: Labels) -> Result<Reading> {
@@ -80,21 +81,28 @@ fn read(fixture: Option<PathBuf>, labels: Labels) -> Result<Reading> {
             lineage,
             history: None,
             home: None,
+            config_error: None,
         });
     }
     let mut c = Collector::new(labels);
+    let config_error = c.config_error().map(str::to_string);
     let r = c.read()?;
     Ok(Reading {
         snap: r.snap,
         lineage: r.lineage,
         history: Some(r.history),
         home: Home::from_env(),
+        config_error,
     })
 }
 
 impl Reading {
     fn board(&self) -> Board {
-        Board::build(&self.snap, &self.lineage, self.home.as_ref())
+        let mut board = Board::build(&self.snap, &self.lineage, self.home.as_ref());
+        if let Some(e) = &self.config_error {
+            board.overview.config_unread(e);
+        }
+        board
     }
 
     /// What the reading lacked, as a line to print under the answer.
@@ -178,6 +186,9 @@ pub fn agents(a: AgentsArgs) -> Result<()> {
         return Ok(());
     }
     print!("{}", table(&rows));
+    if let Some(e) = &r.config_error {
+        println!("Your config could not be read, so no process is marked a leftover: {e}");
+    }
     if let Some(c) = r.caveat() {
         println!("{c}");
     }
@@ -247,6 +258,10 @@ fn columns<const N: usize>(head: &[&str; N], cells: &[[String; N]]) -> String {
 
 pub fn leftovers(a: LeftoversArgs) -> Result<()> {
     let r = read(a.fixture, Labels::All)?;
+    // Without the keep list the rule would select what the user asked to keep.
+    if let Some(e) = &r.config_error {
+        bail!("{e}\nScry selects no leftovers until the config is fixed; `scry doctor` checks it.");
+    }
     let list: Vec<Leftover> = agents::leftovers(&r.snap, &r.lineage, r.home.as_ref());
     if a.json {
         println!("{}", serde_json::to_string_pretty(&list)?);
@@ -286,17 +301,18 @@ pub fn leftovers(a: LeftoversArgs) -> Result<()> {
         })
         .collect();
     print!("{}", columns(&head, &cells));
+    println!("{}", agents::PERSISTENT);
     if let Some(c) = r.caveat() {
         println!("{c}");
     }
     Ok(())
 }
 
-/// One JSON line per change. A change is a row added, removed or changing state, not RAM or
-/// age moving, so an idle machine prints nothing after the first line.
+/// One JSON line per change: anything in the board other than ages, which move on every
+/// reading by themselves.
 pub fn watch(a: WatchArgs) -> Result<()> {
     let mut c = Collector::new(Labels::All);
-    let mut last: Option<Vec<(String, Option<&'static str>)>> = None;
+    let mut last: Option<serde_json::Value> = None;
     let stdout = std::io::stdout();
     loop {
         match c.board() {
@@ -321,26 +337,84 @@ pub fn watch(a: WatchArgs) -> Result<()> {
     }
 }
 
-fn signature(b: &Board) -> Vec<(String, Option<&'static str>)> {
-    let mut sig: Vec<(String, Option<&'static str>)> = b
-        .overview
-        .attention
+/// The board as JSON with every age taken out: the `age_s` and `age_secs` fields, and the
+/// `<n><unit> ago` that [`human_age`] writes into sentences.
+fn signature(b: &Board) -> serde_json::Value {
+    let mut v = serde_json::to_value(b).unwrap_or_default();
+    strip_ages(&mut v);
+    v
+}
+
+fn strip_ages(v: &mut serde_json::Value) {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) => {
+            m.retain(|k, _| k != "age_s" && k != "age_secs");
+            m.values_mut().for_each(strip_ages);
+        }
+        Value::Array(a) => a.iter_mut().for_each(strip_ages),
+        Value::String(s) if s.contains(" ago") => *s = without_ages(s),
+        _ => {}
+    }
+}
+
+/// `ended 41m ago, started 2h ago` → `ended ago, started ago`.
+fn without_ages(s: &str) -> String {
+    let words: Vec<&str> = s.split(' ').collect();
+    let age = |w: &str| {
+        w.len() >= 2
+            && w[..w.len() - 1].bytes().all(|b| b.is_ascii_digit())
+            && matches!(w.as_bytes()[w.len() - 1], b's' | b'm' | b'h' | b'd')
+    };
+    words
         .iter()
-        .map(|a| (a.id.clone(), Some(a.state.word())))
-        .collect();
-    if let Some(rows) = b.agents.ready() {
-        sig.extend(
-            rows.iter()
-                .map(|r| (r.id.clone(), r.state.map(|s| s.word()))),
+        .enumerate()
+        .filter(|&(i, w)| {
+            !(age(w)
+                && words
+                    .get(i + 1)
+                    .is_some_and(|n| n.trim_end_matches([',', '.', ';', ')']) == "ago"))
+        })
+        .map(|(_, w)| *w)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scry_core::view::Load;
+
+    #[test]
+    fn watch_signatures_ignore_ages_and_nothing_else() {
+        let board = Board::parse(include_str!("../../../fixtures/design.json")).unwrap();
+        let sig = signature(&board);
+        let mut older = board.clone();
+        if let Load::Ready(rows) = &mut older.agents {
+            for r in rows.iter_mut() {
+                r.age_s += 7200;
+                r.detail.sentence = r.detail.sentence.replace(" 2h ago", " 4h ago");
+            }
+        }
+        for a in &mut older.overview.attention {
+            a.detail.sentence = a
+                .detail
+                .sentence
+                .replace("started 2h ago", "started 3d ago");
+        }
+        assert_eq!(signature(&older), sig, "only ages moved");
+
+        let mut more_ram = board.clone();
+        if let Load::Ready(rows) = &mut more_ram.agents {
+            rows[0].ram = Some(rows[0].ram.unwrap_or(0) + 1);
+        }
+        assert_ne!(signature(&more_ram), sig);
+        let mut retitled = board.clone();
+        retitled.overview.attention[0].title.push('!');
+        assert_ne!(signature(&retitled), sig);
+        assert_eq!(
+            without_ages("ended 41m ago, started 2h ago. Port 3000 at 5s"),
+            "ended ago, started ago. Port 3000 at 5s"
         );
     }
-    if let Some(rows) = b.ports.ready() {
-        sig.extend(rows.iter().map(|r| {
-            (
-                format!("{}-{}-{}", r.proto.name(), r.port, r.pid),
-                r.state.map(|s| s.word()),
-            )
-        }));
-    }
-    sig
 }

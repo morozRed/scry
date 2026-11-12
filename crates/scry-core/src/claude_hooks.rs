@@ -27,6 +27,59 @@ pub const MANAGED: [&str; 2] = [
     "/Library/Application Support/ClaudeCode/managed-settings.d",
 ];
 
+/// The managed preferences domain an MDM profile sets.
+pub const PREFERENCES_DOMAIN: &str = "com.anthropic.claudecode";
+
+/// The first Claude Code that runs exec-form hooks (`command` plus `args`). An older one
+/// runs `command` alone, which would print `scry`'s overview into every session.
+pub const MIN_EXEC_FORM: (u32, u32, u32) = (2, 1, 139);
+
+/// Every place managed settings can come from that Scry can read: MDM preference files,
+/// device-wide first, then the managed-settings file and its drop-in directory.
+#[derive(Clone, Debug, Default)]
+pub struct ManagedSources {
+    pub preferences: Vec<PathBuf>,
+    pub files: Vec<PathBuf>,
+}
+
+impl ManagedSources {
+    /// The macOS locations, for the user named `user`.
+    pub fn macos(user: Option<&str>) -> ManagedSources {
+        let prefs = Path::new("/Library/Managed Preferences");
+        let mut preferences = vec![prefs.join(format!("{PREFERENCES_DOMAIN}.plist"))];
+        if let Some(u) = user.filter(|u| !u.is_empty() && !u.contains('/')) {
+            preferences.push(prefs.join(u).join(format!("{PREFERENCES_DOMAIN}.plist")));
+        }
+        ManagedSources {
+            preferences,
+            files: MANAGED.map(PathBuf::from).to_vec(),
+        }
+    }
+}
+
+/// Whether the Claude Code that `claude --version` described runs exec-form hooks. An
+/// answer Scry cannot read is a no, with why.
+pub fn check_exec_form(version_output: &str) -> std::result::Result<(), String> {
+    let need = format!(
+        "{}.{}.{}",
+        MIN_EXEC_FORM.0, MIN_EXEC_FORM.1, MIN_EXEC_FORM.2
+    );
+    let word = version_output.split_whitespace().next().unwrap_or("");
+    let parts: Vec<u32> = word.split('.').map_while(|p| p.parse().ok()).collect();
+    let [a, b, c] = parts[..] else {
+        return Err(format!(
+            "could not read Claude Code's version from `{}`; Scry's hooks need {need} or newer",
+            version_output.trim()
+        ));
+    };
+    if (a, b, c) < MIN_EXEC_FORM {
+        return Err(format!(
+            "Claude Code {word} runs a hook's `command` without its `args`, so the hook would print Scry's overview into every session. Update Claude Code to {need} or newer, then install again"
+        ));
+    }
+    Ok(())
+}
+
 /// The user's `settings.json`: in `$CLAUDE_CONFIG_DIR` when that is set, else `~/.claude`.
 pub fn settings_path(home: &Path, config_dir: Option<&Path>) -> PathBuf {
     config_dir
@@ -52,10 +105,73 @@ impl Blocker {
     }
 }
 
-/// Reads the managed settings in `places` (files, and directories of `*.json`) for the keys
-/// that would override a user hook. A file that cannot be parsed is reported as an error,
-/// since it could hold either.
-pub fn managed_blockers(places: &[PathBuf]) -> Result<Vec<Blocker>> {
+/// The keys that stop user hooks from running.
+const BLOCKING: [&str; 2] = ["allowManagedHooksOnly", "disableAllHooks"];
+
+/// Reads the managed settings for the keys that would stop a user hook, as Claude Code
+/// applies them: the first source that sets any key wins whole (MDM preferences before the
+/// files), unless one sets `managedSourcesBehavior` to `merge`, when any source's `true`
+/// holds. Within a source, later files replace earlier values. A file that cannot be read
+/// is an error, since it could hold either key.
+pub fn managed_blockers(sources: &ManagedSources) -> Result<Vec<Blocker>> {
+    let mut prefs = Vec::new();
+    for p in sources.preferences.iter().filter(|p| p.is_file()) {
+        prefs.push((p.clone(), read_plist(p)?));
+    }
+    let files = read_managed_files(&sources.files)?;
+    let merge = prefs
+        .iter()
+        .chain(&files)
+        .any(|(_, v)| v.get("managedSourcesBehavior") == Some(&json!("merge")));
+    let delivers = |list: &[(PathBuf, Value)]| {
+        list.iter()
+            .any(|(_, v)| v.as_object().is_some_and(|m| !m.is_empty()))
+    };
+    let chosen: Vec<&[(PathBuf, Value)]> = if merge {
+        vec![&prefs, &files]
+    } else if delivers(&prefs) {
+        vec![&prefs]
+    } else {
+        vec![&files]
+    };
+    let mut out = Vec::new();
+    for key in BLOCKING {
+        for source in &chosen {
+            // The last file in a source that sets the key decides it.
+            if let Some((file, _)) = source
+                .iter()
+                .rev()
+                .find(|(_, v)| v.get(key).is_some())
+                .filter(|(_, v)| v.get(key) == Some(&Value::Bool(true)))
+            {
+                out.push(Blocker {
+                    file: file.clone(),
+                    key,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// An MDM preference file as JSON, by `plutil`, which reads the binary form too.
+fn read_plist(path: &Path) -> Result<Value> {
+    let out = std::process::Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("running plutil on {}", path.display()))?;
+    if !out.status.success() {
+        bail!(
+            "reading {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&out.stdout).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn read_managed_files(places: &[PathBuf]) -> Result<Vec<(PathBuf, Value)>> {
     let mut files = Vec::new();
     for p in places {
         if p.is_dir() {
@@ -80,14 +196,7 @@ pub fn managed_blockers(places: &[PathBuf]) -> Result<Vec<Blocker>> {
         let text = fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?;
         let v: Value =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", f.display()))?;
-        for key in ["allowManagedHooksOnly", "disableAllHooks"] {
-            if v.get(key) == Some(&Value::Bool(true)) {
-                out.push(Blocker {
-                    file: f.clone(),
-                    key,
-                });
-            }
-        }
+        out.push((f, v));
     }
     Ok(out)
 }
@@ -112,25 +221,23 @@ impl Plan {
     }
 
     /// Backs the old file up beside it as `settings.json.scry-backup-<ms>`, then writes the
-    /// new text to a temporary file and renames it over, keeping the old file's mode.
+    /// new text to a temporary file and renames it over, keeping the old file's mode. A
+    /// symlinked `settings.json` is written through to its target, so the link stays.
     /// Returns the backup's path, `None` when there was no file to back up.
     pub fn apply(&self, now_ms: i64) -> Result<Option<PathBuf>> {
+        self.apply_then(now_ms, || {})
+    }
+
+    /// [`Plan::apply`], running `meanwhile` after the new text is written and before the
+    /// file is compared and replaced, so a test can change the file in between.
+    fn apply_then(&self, now_ms: i64, meanwhile: impl FnOnce()) -> Result<Option<PathBuf>> {
         if !self.changes() {
             return Ok(None);
         }
-        let dir = self
-            .path
-            .parent()
-            .context("settings.json has no directory")?;
+        let target = resolve(&self.path);
+        let dir = target.parent().context("settings.json has no directory")?;
         fs::create_dir_all(dir)?;
-        let current = fs::read_to_string(&self.path).ok();
-        if current != self.before {
-            bail!(
-                "{} changed while Scry was planning; run the command again",
-                self.path.display()
-            );
-        }
-        let mode = fs::metadata(&self.path)
+        let mode = fs::metadata(&target)
             .map(|m| m.permissions().mode() & 0o777)
             .unwrap_or(0o600);
         let backup = match &self.before {
@@ -143,14 +250,39 @@ impl Plan {
             }
             None => None,
         };
-        let tmp = self
-            .path
-            .with_file_name(format!(".settings.json.scry-{now_ms}"));
+        let name = target
+            .file_name()
+            .map_or("settings.json".into(), |n| n.to_string_lossy());
+        let tmp = target.with_file_name(format!(".{name}.scry-{now_ms}"));
         write_new(&tmp, &self.after, mode)?;
-        fs::rename(&tmp, &self.path)
-            .with_context(|| format!("replacing {}", self.path.display()))?;
+        meanwhile();
+        // Compared last, so a save made while the files above were written is not lost.
+        if fs::read_to_string(&target).ok() != self.before {
+            let _ = fs::remove_file(&tmp);
+            if let Some(b) = &backup {
+                let _ = fs::remove_file(b);
+            }
+            bail!(
+                "{} changed while Scry was working; nothing was written. Run the command again",
+                self.path.display()
+            );
+        }
+        fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))?;
         Ok(backup)
     }
+}
+
+/// The file a chain of symlinks ends at, which may not exist yet.
+fn resolve(path: &Path) -> PathBuf {
+    let mut p = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::read_link(&p) {
+            Ok(t) if t.is_absolute() => p = t,
+            Ok(t) => p = p.parent().unwrap_or(Path::new("/")).join(t),
+            Err(_) => break,
+        }
+    }
+    p
 }
 
 fn write_new(path: &Path, text: &str, mode: u32) -> Result<()> {
@@ -167,7 +299,8 @@ fn write_new(path: &Path, text: &str, mode: u32) -> Result<()> {
 
 /// Adds Scry's two hooks, replacing any Scry hooks already there (from another path, say).
 pub fn plan_install(path: &Path, before: Option<String>, scry: &Path) -> Result<Plan> {
-    let mut root = parse(&before)?;
+    let original = parse(&before)?;
+    let mut root = original.clone();
     remove_ours(&mut root);
     let hooks = root
         .entry("hooks")
@@ -191,9 +324,14 @@ pub fn plan_install(path: &Path, before: Option<String>, scry: &Path) -> Result<
             }]
         }));
     }
+    // Installed already: the text stays as it is, however it is laid out.
+    let after = match &before {
+        Some(text) if root == original => text.clone(),
+        _ => render(&root, before.as_deref()),
+    };
     Ok(Plan {
         path: path.to_path_buf(),
-        after: render(&root),
+        after,
         before,
     })
 }
@@ -210,7 +348,7 @@ pub fn plan_uninstall(path: &Path, before: Option<String>) -> Result<Plan> {
     }
     Ok(Plan {
         path: path.to_path_buf(),
-        after: render(&root),
+        after: render(&root, before.as_deref()),
         before,
     })
 }
@@ -244,10 +382,29 @@ fn parse(text: &Option<String>) -> Result<Map<String, Value>> {
     }
 }
 
-fn render(root: &Map<String, Value>) -> String {
-    let mut s = serde_json::to_string_pretty(root).expect("a JSON value renders");
-    s.push('\n');
+/// The settings as JSON, indented as `before` was (two spaces when it was not), with its
+/// keys in their order and its final newline kept or left out, so the diff stays small.
+fn render(root: &Map<String, Value>, before: Option<&str>) -> String {
+    let indent = before.and_then(indent_of).unwrap_or("  ");
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(
+        &mut buf,
+        serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes()),
+    );
+    serde::Serialize::serialize(root, &mut ser).expect("a JSON value renders");
+    let mut s = String::from_utf8(buf).expect("JSON is UTF-8");
+    if before.is_none_or(|b| b.trim().is_empty() || b.ends_with('\n')) {
+        s.push('\n');
+    }
     s
+}
+
+/// The whitespace before the first indented line, which is a top-level key's indent.
+fn indent_of(text: &str) -> Option<&str> {
+    text.lines().skip(1).find_map(|l| {
+        let rest = l.trim_start_matches([' ', '\t']);
+        (!rest.is_empty() && rest.len() < l.len()).then(|| &l[..l.len() - rest.len()])
+    })
 }
 
 /// A hook entry Scry wrote: a `scry` executable run with `hook run claude`.
@@ -457,8 +614,11 @@ mod tests {
         .unwrap();
         fs::write(dir.join(".hidden.json"), r#"{"disableAllHooks": true}"#).unwrap();
         fs::write(dir.join("notes.txt"), r#"{"disableAllHooks": true}"#).unwrap();
-        let places = [file.clone(), dir.clone(), tmp.path().join("missing.json")];
-        let found = managed_blockers(&places).unwrap();
+        let sources = ManagedSources {
+            preferences: vec![tmp.path().join("no.plist")],
+            files: vec![file.clone(), dir.clone(), tmp.path().join("missing.json")],
+        };
+        let found = managed_blockers(&sources).unwrap();
         assert_eq!(
             found,
             [Blocker {
@@ -468,8 +628,181 @@ mod tests {
         );
         fs::write(&file, "{").unwrap();
         assert!(
-            managed_blockers(&places).is_err(),
+            managed_blockers(&sources).is_err(),
             "unreadable means unknown"
+        );
+    }
+
+    #[test]
+    fn a_later_managed_file_overrides_an_earlier_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("managed-settings.json");
+        let dir = tmp.path().join("managed-settings.d");
+        fs::create_dir(&dir).unwrap();
+        fs::write(&file, r#"{"allowManagedHooksOnly": true}"#).unwrap();
+        fs::write(
+            dir.join("20-team.json"),
+            r#"{"allowManagedHooksOnly": false}"#,
+        )
+        .unwrap();
+        let sources = ManagedSources {
+            preferences: Vec::new(),
+            files: vec![file.clone(), dir.clone()],
+        };
+        assert_eq!(managed_blockers(&sources).unwrap(), []);
+        fs::write(
+            dir.join("30-lock.json"),
+            r#"{"allowManagedHooksOnly": true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            managed_blockers(&sources).unwrap(),
+            [Blocker {
+                file: dir.join("30-lock.json"),
+                key: "allowManagedHooksOnly"
+            }]
+        );
+    }
+
+    fn plist(dir: &Path, body: &str) -> PathBuf {
+        let p = dir.join(format!("{PREFERENCES_DOMAIN}.plist"));
+        fs::write(
+            &p,
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>{body}</dict></plist>
+"#
+            ),
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn mdm_preferences_are_read_and_win_over_the_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("managed-settings.json");
+        fs::write(&file, r#"{"disableAllHooks": true}"#).unwrap();
+        let locked = plist(tmp.path(), "<key>allowManagedHooksOnly</key><true/>");
+        let sources = ManagedSources {
+            preferences: vec![locked.clone()],
+            files: vec![file.clone()],
+        };
+        assert_eq!(
+            managed_blockers(&sources).unwrap(),
+            [Blocker {
+                file: locked.clone(),
+                key: "allowManagedHooksOnly"
+            }],
+            "the MDM source delivers keys, so the files are not read"
+        );
+        // An MDM profile that sets other keys still wins whole, so the file's lock is off.
+        plist(tmp.path(), "<key>model</key><string>opus</string>");
+        assert_eq!(managed_blockers(&sources).unwrap(), []);
+        // Unless a source asks for the sources to merge: then any lock holds.
+        plist(
+            tmp.path(),
+            "<key>managedSourcesBehavior</key><string>merge</string>",
+        );
+        assert_eq!(
+            managed_blockers(&sources).unwrap(),
+            [Blocker {
+                file: file.clone(),
+                key: "disableAllHooks"
+            }]
+        );
+    }
+
+    #[test]
+    fn exec_form_needs_a_recent_claude_code() {
+        assert!(check_exec_form("2.1.322 (Claude Code)").is_ok());
+        assert!(check_exec_form("2.1.139 (Claude Code)").is_ok());
+        assert!(check_exec_form("3.0.0").is_ok());
+        let old = check_exec_form("2.1.138 (Claude Code)").unwrap_err();
+        assert!(old.contains("2.1.139 or newer"), "{old}");
+        assert!(check_exec_form("").is_err());
+        assert!(check_exec_form("command not found").is_err());
+    }
+
+    #[test]
+    fn apply_writes_through_a_symlinked_settings_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles/claude");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join("settings.json");
+        fs::write(&target, existing()).unwrap();
+        let link = tmp.path().join(".claude/settings.json");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../dotfiles/claude/settings.json", &link).unwrap();
+        let plan = plan_install(&link, Some(existing()), Path::new(SCRY)).unwrap();
+        let backup = plan.apply(9).unwrap().unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), plan.after);
+        assert_eq!(
+            backup.parent(),
+            link.parent(),
+            "the backup sits by the link"
+        );
+        assert_eq!(fs::read_to_string(&backup).unwrap(), existing());
+        assert_eq!(
+            fs::read_dir(&dotfiles).unwrap().count(),
+            1,
+            "no temp file left"
+        );
+    }
+
+    #[test]
+    fn a_change_saved_while_applying_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(&path, existing()).unwrap();
+        let plan = plan_install(&path, Some(existing()), Path::new(SCRY)).unwrap();
+        let theirs = existing().replace("opus", "sonnet");
+        let err = plan
+            .apply_then(10, || fs::write(&path, &theirs).unwrap())
+            .unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
+        let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1, "no backup or temp file left: {left:?}");
+    }
+
+    #[test]
+    fn install_keeps_the_files_indent_and_final_newline() {
+        let p = Path::new("/x/settings.json");
+        let four = "{\n    \"model\": \"opus\",\n    \"permissions\": {\n        \"allow\": [\n            \"Bash(ls:*)\"\n        ]\n    }\n}";
+        let plan = plan_install(p, Some(four.into()), Path::new(SCRY)).unwrap();
+        assert!(!plan.after.ends_with('\n'), "none before, none after");
+        assert!(
+            plan.after
+                .contains("\n    \"hooks\": {\n        \"SessionStart\"")
+        );
+        assert!(
+            !plan.diff().lines().any(|l| l.starts_with('-')),
+            "only added lines:\n{}",
+            plan.diff()
+        );
+        let back = plan_uninstall(p, Some(plan.after.clone())).unwrap();
+        assert_eq!(back.after, four);
+        let tabs = "{\n\t\"model\": \"opus\"\n}\n";
+        let plan = plan_install(p, Some(tabs.into()), Path::new(SCRY)).unwrap();
+        assert!(
+            plan.after
+                .contains("\n\t\"hooks\": {\n\t\t\"SessionStart\"")
+        );
+        // Installed already, in any layout: nothing to write.
+        let squeezed: Value = serde_json::from_str(&plan.after).unwrap();
+        let compact = serde_json::to_string(&squeezed).unwrap();
+        assert!(
+            !plan_install(p, Some(compact), Path::new(SCRY))
+                .unwrap()
+                .changes()
         );
     }
 

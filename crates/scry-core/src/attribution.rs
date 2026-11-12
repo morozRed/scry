@@ -47,6 +47,10 @@ impl Known {
             };
             match self.sessions.iter_mut().find(|s| s.key == key) {
                 Some(s) => {
+                    if matches!(e.kind, EventKind::Start { .. }) && s.reopened_by(e.at_ms) {
+                        s.ended_at_ms = None;
+                        s.end_reason = None;
+                    }
                     s.cwd = s.cwd.take().or(e.cwd.clone());
                     s.started_at_ms = s.started_at_ms.or(started_at_ms);
                     s.ended_at_ms = s.ended_at_ms.or(ended_at_ms);
@@ -95,6 +99,9 @@ pub struct Policy {
     pub keep: Vec<String>,
     /// Scry's own pid. Its tree is never a leftover.
     pub scry: Option<i32>,
+    /// Why the config, and so the keep list, could not be read. While it is set no process
+    /// is a leftover: an empty keep list would select what the user asked to keep.
+    pub config_error: Option<String>,
 }
 
 impl Default for Policy {
@@ -103,6 +110,7 @@ impl Default for Policy {
             grace: DEFAULT_GRACE,
             keep: Vec::new(),
             scry: Some(std::process::id() as i32),
+            config_error: None,
         }
     }
 }
@@ -120,6 +128,12 @@ pub enum AgentState {
     Gone {
         pid: i32,
         start_us: Option<i64>,
+    },
+    /// A process that may be the agent still runs, but the catalog does not name it as one:
+    /// its executable could not be read, or the binary was renamed. It is not gone.
+    Unrecognised {
+        pid: i32,
+        start_us: i64,
     },
     /// No agent process is known for the session, so Scry cannot tell whether it ended.
     Unknown,
@@ -222,7 +236,25 @@ pub enum Spare {
         pid: i32,
     },
     AgentUnknown,
+    /// Its agent process may still run, but the catalog does not recognise it.
+    AgentUnrecognised {
+        pid: i32,
+    },
     NeverReap {
+        what: Infra,
+    },
+    /// A live process above it is on the never-reap list, such as a `tmux` server or an
+    /// editor: that process holds it, so a stamp it inherited says nothing about whether
+    /// it was abandoned.
+    UnderNeverReap {
+        pid: i32,
+        what: Infra,
+    },
+    /// A live multiplexer or app with the same stamp started before it. A job it started
+    /// and that then detached (a daemon from a `tmux` pane) carries the stamp too, so the
+    /// stamp does not show the session started it.
+    StampCarried {
+        pid: i32,
         what: Infra,
     },
     Tty {
@@ -239,6 +271,10 @@ pub enum Spare {
     Kept {
         entry: String,
     },
+    /// The config could not be read, so the keep list is unknown.
+    ConfigUnread {
+        error: String,
+    },
 }
 
 impl Spare {
@@ -253,7 +289,18 @@ impl Spare {
                 "Scry has not seen its agent process, so it cannot tell whether the session ended."
                     .into()
             }
+            Spare::AgentUnrecognised { pid } => format!(
+                "Process {pid}, which may be its agent, still runs, though Scry does not recognise it as one."
+            ),
             Spare::NeverReap { what } => format!("It is never reaped: {}.", what.why()),
+            Spare::UnderNeverReap { pid, what } => format!(
+                "It runs under process {pid}, which is never reaped: {}.",
+                what.why()
+            ),
+            Spare::StampCarried { pid, what } => format!(
+                "Process {pid} carries the same stamp and started first ({}), so the stamp may have come through it.",
+                what.why()
+            ),
             Spare::Tty { tty } => format!("It still has a terminal ({tty})."),
             Spare::TtyDescendant { pid, tty } => {
                 format!("Its child {pid} still has a terminal ({tty}).")
@@ -264,6 +311,9 @@ impl Spare {
                 crate::view::human_age(*grace_s)
             ),
             Spare::Kept { entry } => format!("It is on your keep list as `{entry}`."),
+            Spare::ConfigUnread { error } => format!(
+                "Your config could not be read, so Scry selects no leftovers until it is fixed: {error}"
+            ),
         }
     }
 }
@@ -279,6 +329,9 @@ pub struct Lineage {
 struct Ctx<'a> {
     by_pid: HashMap<i32, &'a Process>,
     hosts: HashMap<i32, Agent>,
+    /// Live multiplexers and apps with a stamp. Each hands its environment to every job it
+    /// starts, long after the session that stamped it.
+    carriers: Vec<(&'a Process, Infra)>,
 }
 
 impl<'a> Ctx<'a> {
@@ -288,7 +341,33 @@ impl<'a> Ctx<'a> {
             .own_processes()
             .filter_map(|p| Some((p.id.pid, p.role.and_then(Role::hosts)?)))
             .collect();
-        Ctx { by_pid, hosts }
+        let carriers = snap
+            .own_processes()
+            .filter(|p| !p.stamps.is_empty())
+            .filter_map(|p| match p.role.and_then(Role::never_reap)? {
+                what @ (Infra::Multiplexer | Infra::AppHelper) => Some((p, what)),
+                _ => None,
+            })
+            .collect();
+        Ctx {
+            by_pid,
+            hosts,
+            carriers,
+        }
+    }
+
+    /// A live carrier with `session`'s stamp that started before `p`, so `p`'s copy of the
+    /// stamp may have come through it rather than from the session.
+    fn carrier_of(&self, p: &Process, session: &SessionKey) -> Option<(i32, Infra)> {
+        self.carriers
+            .iter()
+            .filter(|(q, _)| q.id.pid != p.id.pid && q.id.start_us <= p.id.start_us)
+            .find(|(q, _)| {
+                q.stamps.sessions().iter().any(|&(agent, id, _)| {
+                    agent == session.agent && session.id == SessionId::Known(id.to_string())
+                })
+            })
+            .map(|(q, what)| (q.id.pid, *what))
     }
 
     /// The nearest agent process above `p`, through live parents.
@@ -301,6 +380,22 @@ impl<'a> Ctx<'a> {
             let q = self.by_pid.get(&pid)?;
             if self.hosts.contains_key(&pid) {
                 return Some(q);
+            }
+            pid = q.ppid;
+        }
+        None
+    }
+
+    /// The nearest live process above `p` on the never-reap list.
+    fn never_reap_above(&self, p: &Process) -> Option<(i32, Infra)> {
+        let mut pid = p.ppid;
+        for _ in 0..64 {
+            if pid <= 1 {
+                return None;
+            }
+            let q = self.by_pid.get(&pid)?;
+            if let Some(what) = q.role.and_then(Role::never_reap) {
+                return Some((pid, what));
             }
             pid = q.ppid;
         }
@@ -386,39 +481,67 @@ impl Lineage {
             link(&m.session, m.proc.pid, Some(m.proc.start_us));
         }
 
-        // Owners.
-        let recorded: HashMap<ProcId, &SessionProcess> = known
+        // Owners, and every session that claims each process. A process can be recorded under
+        // several sessions (one agent process hosts them in turn), and none of those
+        // records replaces another.
+        let mut recorded: HashMap<ProcId, Vec<&SessionProcess>> = HashMap::new();
+        for m in known
             .processes
             .iter()
             .filter(|m| m.part == Part::Child && m.evidence.exact())
-            .map(|m| (m.proc, m))
-            .collect();
+        {
+            recorded.entry(m.proc).or_default().push(m);
+        }
+        for list in recorded.values_mut() {
+            list.sort_by_key(|m| (m.first_seen_ms, m.session.clone()));
+        }
         let mut owners: BTreeMap<i32, (SessionKey, How)> = BTreeMap::new();
+        let mut claims: HashMap<i32, Vec<SessionKey>> = HashMap::new();
         for p in snap.own_processes() {
             if cx.hosts.contains_key(&p.id.pid) {
                 continue;
             }
             let host = cx.host_above(p);
-            let owner = if let Some((agent, sid, key)) = p.stamps.session() {
-                let session = SessionKey {
-                    agent,
-                    id: SessionId::Known(sid.to_string()),
-                };
+            // A stamp from a session that ended before the process started was inherited
+            // through something that outlived the session, so it names the wrong one.
+            let stamps: Vec<(SessionKey, &'static str)> = p
+                .stamps
+                .sessions()
+                .into_iter()
+                .map(|(agent, sid, key)| {
+                    let session = SessionKey {
+                        agent,
+                        id: SessionId::Known(sid.to_string()),
+                    };
+                    (session, key)
+                })
+                .filter(|(session, _)| !ended_before(known, session, p.id.start_us))
+                .collect();
+            for (session, _) in stamps.iter().filter(|(s, _)| s.agent == Agent::ClaudeCode) {
                 if let Some(cp) = p.stamps.claude_pid {
+                    // The holder of the pid may be the agent only if it started first.
                     match cx.by_pid.get(&cp) {
-                        Some(a) if cx.hosts.contains_key(&cp) && a.id.start_us <= p.id.start_us => {
-                            link(&session, cp, Some(a.id.start_us))
+                        Some(a) if a.id.start_us <= p.id.start_us => {
+                            link(session, cp, Some(a.id.start_us))
                         }
-                        _ => link(&session, cp, None),
+                        _ => link(session, cp, None),
                     }
                 }
-                if let Some(h) = host.filter(|h| cx.hosts[&h.id.pid] == agent) {
-                    link(&session, h.id.pid, Some(h.id.start_us));
+            }
+            // A live agent above wins over a stamp of another agent's: Claude Code starting
+            // Codex passes its stamp on to Codex's workers.
+            let stamp = match host {
+                Some(h) => stamps.iter().find(|(s, _)| s.agent == cx.hosts[&h.id.pid]),
+                None => stamps.first(),
+            };
+            let owner = if let Some((session, key)) = stamp {
+                if let Some(h) = host {
+                    link(session, h.id.pid, Some(h.id.start_us));
                 }
-                Some((session, How::Stamp { key }))
+                Some((session.clone(), How::Stamp { key }))
             } else if let Some(h) = host {
                 Some((current[&h.id.pid].clone(), How::Tree { agent: h.id.pid }))
-            } else if let Some(m) = recorded.get(&p.id) {
+            } else if let Some(m) = recorded.get(&p.id).and_then(|l| l.first()) {
                 Some((
                     m.session.clone(),
                     How::Recorded {
@@ -430,6 +553,18 @@ impl Lineage {
                 guess(p, known).map(|k| (k, How::Guess))
             };
             if let Some(o) = owner {
+                let mut c = vec![o.0.clone()];
+                c.extend(stamps.iter().map(|(s, _)| s.clone()));
+                c.extend(
+                    recorded
+                        .get(&p.id)
+                        .into_iter()
+                        .flatten()
+                        .map(|m| m.session.clone()),
+                );
+                let mut seen = HashSet::new();
+                c.retain(|k| seen.insert(k.clone()));
+                claims.insert(p.id.pid, c);
                 owners.insert(p.id.pid, o);
             }
         }
@@ -438,17 +573,22 @@ impl Lineage {
             let Some(list) = agents.get(key) else {
                 return AgentState::Unknown;
             };
-            for &(pid, start) in list {
-                if let Some(p) = cx.by_pid.get(&pid)
-                    && cx.hosts.contains_key(&pid)
-                    // No start means the live holder of the pid was checked and is not it.
-                    && start == Some(p.id.start_us)
-                {
-                    return AgentState::Live {
-                        pid,
-                        start_us: p.id.start_us,
-                    };
-                }
+            // No start means the live holder of the pid was checked and is not it.
+            let running = |&&(pid, start): &&(i32, Option<i64>)| {
+                cx.by_pid
+                    .get(&pid)
+                    .is_some_and(|p| start == Some(p.id.start_us))
+            };
+            if let Some(&(pid, Some(start_us))) = list
+                .iter()
+                .filter(running)
+                .find(|(pid, _)| cx.hosts.contains_key(pid))
+            {
+                return AgentState::Live { pid, start_us };
+            }
+            // Still running though the catalog does not name it: not proof it exited.
+            if let Some(&(pid, Some(start_us))) = list.iter().find(running) {
+                return AgentState::Unrecognised { pid, start_us };
             }
             let &(pid, start_us) = list.last().expect("a listed session has an agent");
             AgentState::Gone { pid, start_us }
@@ -496,7 +636,15 @@ impl Lineage {
                 continue;
             }
             let owner = owners.get(&p.id.pid);
-            let agent = owner.map(|(k, _)| sessions[index[k]].agent);
+            // A leftover only when every session that claims it has lost its agent.
+            let agent = claims.get(&p.id.pid).map(|keys| {
+                let states: Vec<AgentState> = keys.iter().map(&state).collect();
+                let live = states.iter().find(|a| matches!(a, AgentState::Live { .. }));
+                let unsure = states
+                    .iter()
+                    .find(|a| !matches!(a, AgentState::Gone { .. }));
+                *live.or(unsure).unwrap_or(&states[0])
+            });
             let v = judge(p, owner, agent, &cx, &children, policy, now_us);
             verdicts.insert(p.id.pid, v);
         }
@@ -573,6 +721,16 @@ impl Lineage {
     }
 }
 
+/// Whether the store or a hook says `session` ended before a process started at `start_us`.
+fn ended_before(known: &Known, session: &SessionKey, start_us: i64) -> bool {
+    known
+        .sessions
+        .iter()
+        .find(|s| s.key == *session)
+        .and_then(|s| s.ended_at_ms)
+        .is_some_and(|end| start_us / 1000 > end)
+}
+
 /// The newest session whose time window holds the process's start and whose directory
 /// holds its working directory. A session started in the home directory or `/` guesses
 /// nothing, since everything is inside it.
@@ -618,10 +776,21 @@ fn judge(
     let agent_pid = match agent {
         Some(AgentState::Gone { pid, .. }) => pid,
         Some(AgentState::Live { pid, .. }) => return spared(Spare::AgentLive { pid }),
+        Some(AgentState::Unrecognised { pid, .. }) => {
+            return spared(Spare::AgentUnrecognised { pid });
+        }
         _ => return spared(Spare::AgentUnknown),
     };
     if let Some(what) = p.role.and_then(Role::never_reap) {
         return spared(Spare::NeverReap { what });
+    }
+    if let Some((pid, what)) = cx.never_reap_above(p) {
+        return spared(Spare::UnderNeverReap { pid, what });
+    }
+    if let How::Stamp { .. } = how
+        && let Some((pid, what)) = cx.carrier_of(p, session)
+    {
+        return spared(Spare::StampCarried { pid, what });
     }
     if let Some(tty) = &p.tty {
         return spared(Spare::Tty { tty: tty.clone() });
@@ -638,6 +807,11 @@ fn judge(
     }
     if let Some(entry) = kept(p, &policy.keep) {
         return spared(Spare::Kept { entry });
+    }
+    if let Some(error) = &policy.config_error {
+        return spared(Spare::ConfigUnread {
+            error: error.clone(),
+        });
     }
     Verdict::Leftover {
         session: session.clone(),

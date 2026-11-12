@@ -14,7 +14,7 @@ use crate::attribution::{HISTORY, Known, Lineage, Policy};
 use crate::daemon_log;
 use crate::engine::{Engine, Labels};
 use crate::paths::Paths;
-use crate::session::{Part, SessionProcess};
+use crate::session::{EventKind, Part, SessionProcess};
 use crate::spool;
 use crate::store::Store;
 use crate::sys::kqueue::{ProcWatch, Stopper, Wake};
@@ -60,6 +60,9 @@ impl Recorder {
                     }
                     let mut k = Known::default();
                     k.apply(std::slice::from_ref(e));
+                    if matches!(e.kind, EventKind::Start { .. }) {
+                        s.reopen_session(&e.key(), e.at_ms)?;
+                    }
                     for session in &k.sessions {
                         s.upsert_session(session)?;
                     }
@@ -161,10 +164,16 @@ mod tests {
     use crate::model::Agent;
     use crate::session::{EventKind, SessionEvent};
 
+    /// A minute ago, so a pass's pruning of old sessions keeps these.
+    fn t0() -> i64 {
+        static T0: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *T0.get_or_init(|| now_ms() - 60_000)
+    }
+
     fn event(id: &str, kind: EventKind) -> SessionEvent {
         SessionEvent {
             id: id.into(),
-            at_ms: 1_000,
+            at_ms: t0(),
             agent: Agent::ClaudeCode,
             session_id: "s1".into(),
             kind,
@@ -198,26 +207,64 @@ mod tests {
         });
         let first = rec.pass(&store, &paths).unwrap();
         assert_eq!(
-            first.events, 1,
-            "the settled file only; the live one is set aside"
+            first.events, 2,
+            "e1 once, though it is in both files, and e2"
         );
-        // Make the set-aside file old enough to read.
-        for e in std::fs::read_dir(paths.spool()).unwrap().flatten() {
-            std::fs::rename(e.path(), paths.spool().join("taken-1.jsonl")).unwrap();
-        }
-        let second = rec.pass(&store, &paths).unwrap();
-        assert_eq!(second.events, 1, "e1 was taken already; e2 is new");
         assert_eq!(rec.pass(&store, &paths).unwrap().events, 0);
 
         // The pass also records whatever agents run on this machine; s1 is the hook's.
         let sessions = store.sessions(0).unwrap();
         let s = sessions.iter().find(|s| s.key.id.short() == "s1").unwrap();
         assert_eq!(s.source, crate::session::Source::Hook);
-        assert_eq!(s.started_at_ms, Some(1_000));
-        assert_eq!(s.ended_at_ms, Some(1_000));
+        assert_eq!(s.started_at_ms, Some(t0()));
+        assert_eq!(s.ended_at_ms, Some(t0()));
         assert_eq!(s.end_reason.as_deref(), Some("other"));
         assert_eq!(s.cwd.as_deref(), Some("/Users/dev/sources/acme"));
         assert!(std::fs::read_dir(paths.spool()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_later_session_start_reopens_an_ended_session_in_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().into(), Some(tmp.path().join("scry")));
+        paths.ensure_state().unwrap();
+        let store = Store::open(&paths.db()).unwrap();
+        let mut rec = Recorder::new(Policy {
+            scry: None,
+            ..Policy::default()
+        });
+        let mut take = |events: &[SessionEvent]| {
+            for e in events {
+                spool::append(&paths.spool(), e).unwrap();
+            }
+            rec.pass(&store, &paths).unwrap();
+        };
+        let mut start = event("e1", EventKind::Start { source: None });
+        let mut end = event(
+            "e2",
+            EventKind::End {
+                reason: Some("prompt_input_exit".into()),
+            },
+        );
+        end.at_ms = t0() + 1_000;
+        take(&[start.clone(), end]);
+        let s1 = |store: &Store| {
+            store
+                .sessions(0)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.key.id.short() == "s1")
+                .unwrap()
+        };
+        assert_eq!(s1(&store).ended_at_ms, Some(t0() + 1_000));
+        start.id = "e3".into();
+        start.at_ms = t0() + 2_000;
+        start.kind = EventKind::Start {
+            source: Some("resume".into()),
+        };
+        take(&[start]);
+        let s = s1(&store);
+        assert_eq!((s.ended_at_ms, s.end_reason), (None, None), "resumed");
     }
 
     #[test]

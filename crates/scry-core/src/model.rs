@@ -105,16 +105,24 @@ impl Stamps {
 
     /// The agent and session id a stamp names, strongest first.
     pub fn session(&self) -> Option<(Agent, &str, &'static str)> {
-        if let Some(id) = &self.scry_session {
-            return Some((Agent::ClaudeCode, id, "SCRY_SESSION"));
-        }
-        if let Some(id) = &self.claude_code_session_id {
-            return Some((Agent::ClaudeCode, id, "CLAUDE_CODE_SESSION_ID"));
-        }
-        if let Some(id) = &self.codex_session_id {
-            return Some((Agent::Codex, id, "CODEX_SESSION_ID"));
-        }
-        None
+        self.sessions().into_iter().next()
+    }
+
+    /// Every agent and session id the stamps name, strongest first. A process started by
+    /// one agent inside another's session carries both.
+    pub fn sessions(&self) -> Vec<(Agent, &str, &'static str)> {
+        [
+            (Agent::ClaudeCode, &self.scry_session, "SCRY_SESSION"),
+            (
+                Agent::ClaudeCode,
+                &self.claude_code_session_id,
+                "CLAUDE_CODE_SESSION_ID",
+            ),
+            (Agent::Codex, &self.codex_session_id, "CODEX_SESSION_ID"),
+        ]
+        .into_iter()
+        .filter_map(|(agent, id, key)| Some((agent, id.as_deref()?, key)))
+        .collect()
     }
 }
 

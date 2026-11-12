@@ -246,6 +246,17 @@ impl Store {
         Ok(())
     }
 
+    /// A SessionStart at `at_ms` for a session that ended at or before it, as `resume` sends:
+    /// the session is open again.
+    pub fn reopen_session(&self, key: &SessionKey, at_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session SET ended_at_ms = NULL, end_reason = NULL
+             WHERE agent = ?1 AND session_id = ?2 AND ended_at_ms <= ?3",
+            params![key.agent.short(), key.id.encode(), at_ms],
+        )?;
+        Ok(())
+    }
+
     /// Sessions that are open, or ended at or after `since_ms`.
     pub fn sessions(&self, since_ms: i64) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(

@@ -88,6 +88,9 @@ pub fn stop_target(rows: &[AgentRow], index: usize) -> Option<Target> {
     })
 }
 
+/// What the leftover rule cannot see, said beside every leftover.
+pub const PERSISTENT: &str = "Scry cannot tell abandoned work from a job meant to outlive its session, such as one started with nohup or as a launchd job. Add it to `keep` in the config to spare it.";
+
 /// What `scry leftovers` lists: one process the leftover rule selects, with why.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Leftover {
@@ -107,6 +110,8 @@ pub struct Leftover {
     #[serde(default)]
     pub ports: Vec<u16>,
     pub cwd: Option<String>,
+    /// [`PERSISTENT`].
+    pub caveat: String,
 }
 
 /// Every process the leftover rule selects, oldest first.
@@ -132,6 +137,7 @@ pub fn leftovers(snap: &Snapshot, lineage: &Lineage, home: Option<&Home>) -> Vec
                 ram: p.footprint,
                 ports: ports.get(&p.id.pid).cloned().unwrap_or_default(),
                 cwd: p.cwd.as_deref().map(|c| shown(home, c)),
+                caveat: PERSISTENT.into(),
             }),
             Verdict::Spared { .. } => None,
         })
@@ -278,6 +284,9 @@ fn session_row(
         (0, AgentState::Gone { pid, .. }) => format!(
             "This {title} session{in_dir} ended: agent process {pid} is gone. None of its processes is a leftover yet; each row says why."
         ),
+        (0, AgentState::Unrecognised { pid, .. }) => format!(
+            "Process {pid}, which may be this {title} session's agent{in_dir}, still runs, though Scry does not recognise it as one. Until it exits, nothing here is a leftover."
+        ),
         (0, AgentState::Unknown) => format!(
             "Scry has not seen the agent process of this {title} session{in_dir}, so it cannot tell whether the session ended.{}",
             if s.key.agent == Agent::ClaudeCode {
@@ -306,6 +315,9 @@ fn session_row(
     match s.agent {
         AgentState::Live { pid, .. } => evidence.push(format!("Agent process {pid} is running")),
         AgentState::Gone { pid, .. } => evidence.push(format!("Agent process {pid} is gone")),
+        AgentState::Unrecognised { pid, .. } => evidence.push(format!(
+            "Process {pid} may be the agent: it runs, but the catalog does not name it"
+        )),
         AgentState::Unknown => evidence.push("No agent process seen".into()),
     }
     let mut facts = vec![fact("session", s.key.id.short())];
@@ -399,7 +411,10 @@ fn member_row(
             title: command,
             facts,
             sentence,
-            evidence: vec![m.how.sentence()],
+            evidence: match verdict {
+                Some(Verdict::Leftover { .. }) => vec![m.how.sentence(), PERSISTENT.into()],
+                _ => vec![m.how.sentence()],
+            },
         },
     }
 }

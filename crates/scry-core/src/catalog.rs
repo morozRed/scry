@@ -37,6 +37,12 @@ pub enum Infra {
     /// A `tmux`, `screen` or `zellij` server. One first started inside an agent's shell
     /// carries that agent's stamp into every later pane.
     Multiplexer,
+    /// `gpg-agent`, `keyboxd`, `scdaemon`, `dirmngr` or `ssh-agent`. The first `git commit
+    /// -S` or `ssh` of a session starts one, and every later session uses it.
+    KeyAgent,
+    /// An `ssh` control master (`-M`, `ControlMaster`, or a `[mux]` title), which other `ssh`
+    /// connections share.
+    SshMaster,
 }
 
 impl Infra {
@@ -48,6 +54,8 @@ impl Infra {
             Infra::CodexAppServer => "it is the Codex app-server",
             Infra::AppHelper => "it runs inside an application bundle, which manages it",
             Infra::Multiplexer => "it is a terminal multiplexer server",
+            Infra::KeyAgent => "it is a key agent that every later session shares",
+            Infra::SshMaster => "it is an ssh control master that other connections share",
         }
     }
 
@@ -121,6 +129,36 @@ impl Exe<'_> {
         self.path.contains("/Python.framework/") && self.file.starts_with("Python")
     }
 
+    /// `-M`, alone or in a cluster such as `-fNM`, or `-o ControlMaster=…` other than `no`.
+    /// A master that daemonised itself retitles to `ssh: <socket> [mux]`.
+    fn ssh_master(&self) -> bool {
+        let mut args = self.argv.iter().skip(1).map(String::as_str);
+        let mut option = false;
+        let master = |o: &str| {
+            let o = o.to_ascii_lowercase();
+            o.strip_prefix("controlmaster")
+                .is_some_and(|v| !matches!(v.trim_start_matches([' ', '=']), "no"))
+        };
+        let retitled = self.argv.first().is_some_and(|a| a.ends_with("[mux]"));
+        retitled
+            || args.any(|a| {
+                if std::mem::take(&mut option) {
+                    return master(a);
+                }
+                match a.strip_prefix('-') {
+                    Some(rest) if !rest.starts_with('-') => match rest.strip_prefix('o') {
+                        Some("") => {
+                            option = true;
+                            false
+                        }
+                        Some(o) => master(o),
+                        None => rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('M'),
+                    },
+                    _ => false,
+                }
+            })
+    }
+
     fn codex(&self) -> bool {
         self.file == "codex"
             || self.file.starts_with("codex-aarch64-")
@@ -129,7 +167,9 @@ impl Exe<'_> {
 }
 
 use Agent::{ClaudeCode, Codex, Gemini, OpenCode};
-use Infra::{AppHelper, ClaudeDaemon, ClaudePtyHost, CodexAppServer, Multiplexer};
+use Infra::{
+    AppHelper, ClaudeDaemon, ClaudePtyHost, CodexAppServer, KeyAgent, Multiplexer, SshMaster,
+};
 
 /// The table, in match order.
 pub static RULES: &[Rule] = &[
@@ -225,6 +265,21 @@ pub static RULES: &[Rule] = &[
         name: "tmux, screen or zellij",
         role: Role::NeverReap(Multiplexer),
         test: |x| matches!(x.file, "tmux" | "screen" | "zellij"),
+    },
+    Rule {
+        name: "gpg-agent, keyboxd, scdaemon, dirmngr or ssh-agent",
+        role: Role::NeverReap(KeyAgent),
+        test: |x| {
+            matches!(
+                x.file,
+                "gpg-agent" | "keyboxd" | "scdaemon" | "dirmngr" | "ssh-agent"
+            )
+        },
+    },
+    Rule {
+        name: "an ssh control master",
+        role: Role::NeverReap(SshMaster),
+        test: |x| x.file == "ssh" && x.ssh_master(),
     },
     Rule {
         name: "a helper inside *.app/Contents/",

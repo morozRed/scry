@@ -27,6 +27,7 @@ fn policy(grace: Duration) -> Policy {
         grace,
         keep: Vec::new(),
         scry: None,
+        config_error: None,
     }
 }
 

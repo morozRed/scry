@@ -503,6 +503,31 @@ impl Overview {
         }
     }
 
+    /// Puts a broken config first: until it is fixed, no process is a leftover, so an empty
+    /// list would be a false all-clear.
+    pub fn config_unread(&mut self, error: &str) {
+        self.attention.insert(
+            0,
+            Attention {
+                id: "a-config".into(),
+                state: State::NotRead,
+                title: "Your config could not be read, so no leftovers are selected".into(),
+                context: None,
+                size: None,
+                tab: Tab::Agents,
+                row: None,
+                detail: Detail {
+                    title: "Config unreadable".into(),
+                    facts: Vec::new(),
+                    sentence: format!(
+                        "Scry selects no leftovers until the config is fixed, since the keep list in it is unknown: {error}"
+                    ),
+                    evidence: vec!["Run `scry doctor` for the line to fix.".into()],
+                },
+            },
+        );
+    }
+
     /// "Checked 412 of your processes …, 6 agent sessions and 14 listening ports …."
     pub fn checked_line(&self) -> Option<String> {
         match self.checked.as_slice() {

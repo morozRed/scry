@@ -10,9 +10,20 @@ fn scry(home: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_scry"));
     c.env("HOME", home)
         .env("SCRY_HOME", home.join("scry"))
+        .env("SCRY_CLAUDE", fake_claude(home, "2.1.322 (Claude Code)"))
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CLAUDE_ENV_FILE");
     c
+}
+
+/// A `claude` that only answers `--version`, so no test depends on the one installed.
+fn fake_claude(home: &Path, version: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = home.join(format!("bin-{}/claude", version.split(' ').next().unwrap()));
+    std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    std::fs::write(&bin, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
 }
 
 fn text(out: &Output) -> String {
@@ -188,6 +199,83 @@ fn install_creates_settings_when_there_are_none() {
         .unwrap();
     assert!(out.status.success());
     assert_eq!(std::fs::read_to_string(&settings).unwrap().trim(), "{}");
+}
+
+#[test]
+fn an_old_claude_code_without_exec_form_hooks_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let settings = tmp.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, EXISTING).unwrap();
+    for version in ["2.1.100 (Claude Code)", "not a version"] {
+        let out = scry(tmp.path())
+            .env("SCRY_CLAUDE", fake_claude(tmp.path(), version))
+            .args(["hook", "install", "claude"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{version}");
+        assert!(text(&out).contains("2.1.139 or newer"), "{}", text(&out));
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), EXISTING);
+    }
+    let missing = scry(tmp.path())
+        .env("SCRY_CLAUDE", tmp.path().join("no-such-claude"))
+        .args(["hook", "install", "claude"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    // Taking hooks out needs no particular version.
+    let out = scry(tmp.path())
+        .env(
+            "SCRY_CLAUDE",
+            fake_claude(tmp.path(), "2.1.100 (Claude Code)"),
+        )
+        .args(["hook", "uninstall", "claude"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn a_symlinked_settings_file_stays_a_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let target = home.join("dotfiles/settings.json");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, EXISTING).unwrap();
+    let link = home.join(".claude/settings.json");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = scry(home)
+        .args(["hook", "install", "claude"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let after = std::fs::read_to_string(&target).unwrap();
+    assert_eq!(
+        value(&after)["hooks"]["SessionEnd"][0]["hooks"][0]["args"][3],
+        "SessionEnd"
+    );
+    let out = scry(home)
+        .args(["hook", "uninstall", "claude"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        value(&std::fs::read_to_string(&target).unwrap()),
+        value(EXISTING)
+    );
 }
 
 #[test]

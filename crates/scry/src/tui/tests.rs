@@ -939,7 +939,9 @@ fn a_first_run_explains_what_agents_and_overview_will_show() {
     );
     press(&mut a, "3");
     let text = screen(&render(&a, 80, 24));
-    assert!(text.contains("No agent sessions are running."), "{text}");
+    // No sessions is not an all-clear, so the mark is the neutral one.
+    assert!(text.contains("○  No agent sessions are running."), "{text}");
+    assert!(!text.contains('✓'), "{text}");
     assert!(
         text.contains("Claude Code, Codex, OpenCode and Gemini CLI"),
         "{text}"

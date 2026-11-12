@@ -196,5 +196,65 @@
     "exe": "/System/Library/PrivateFrameworks/ScreenTimeCore.framework/Versions/A/ScreenTimeAgent",
     "argv": ["/System/Library/PrivateFrameworks/ScreenTimeCore.framework/Versions/A/ScreenTimeAgent"],
     "rule": null
+  },
+  {
+    "style": "gpg-agent from Homebrew, started by a signed commit",
+    "exe": "/opt/homebrew/Cellar/gnupg/2.4.8/bin/gpg-agent",
+    "argv": ["gpg-agent", "--homedir", "/Users/dev/.gnupg", "--use-standard-socket", "--daemon"],
+    "rule": "gpg-agent, keyboxd, scdaemon, dirmngr or ssh-agent"
+  },
+  {
+    "style": "keyboxd from Homebrew",
+    "exe": "/opt/homebrew/Cellar/gnupg/2.4.8/libexec/keyboxd",
+    "argv": ["keyboxd", "--homedir", "/Users/dev/.gnupg", "--daemon"],
+    "rule": "gpg-agent, keyboxd, scdaemon, dirmngr or ssh-agent"
+  },
+  {
+    "style": "scdaemon from GPG Suite",
+    "exe": "/usr/local/MacGPG2/libexec/scdaemon",
+    "argv": ["scdaemon", "--multi-server"],
+    "rule": "gpg-agent, keyboxd, scdaemon, dirmngr or ssh-agent"
+  },
+  {
+    "style": "dirmngr from Homebrew",
+    "exe": "/opt/homebrew/Cellar/gnupg/2.4.8/bin/dirmngr",
+    "argv": ["dirmngr", "--daemon", "--homedir", "/Users/dev/.gnupg"],
+    "rule": "gpg-agent, keyboxd, scdaemon, dirmngr or ssh-agent"
+  },
+  {
+    "style": "ssh-agent started by hand",
+    "exe": "/usr/bin/ssh-agent",
+    "argv": ["ssh-agent", "-s"],
+    "rule": "gpg-agent, keyboxd, scdaemon, dirmngr or ssh-agent"
+  },
+  {
+    "style": "an ssh control master started with -fNM",
+    "exe": "/usr/bin/ssh",
+    "argv": ["ssh", "-fNM", "-S", "/Users/dev/.ssh/cm-build", "build.example.com"],
+    "rule": "an ssh control master"
+  },
+  {
+    "style": "an ssh control master started with -o ControlMaster=auto",
+    "exe": "/usr/bin/ssh",
+    "argv": ["ssh", "-o", "ControlMaster=auto", "-o", "ControlPersist=600", "build.example.com"],
+    "rule": "an ssh control master"
+  },
+  {
+    "style": "an ssh control master that daemonised and retitled itself",
+    "exe": "/usr/bin/ssh",
+    "argv": ["ssh: /Users/dev/.ssh/cm-build [mux]"],
+    "rule": "an ssh control master"
+  },
+  {
+    "style": "a plain ssh connection",
+    "exe": "/usr/bin/ssh",
+    "argv": ["ssh", "-p", "2222", "build.example.com", "make"],
+    "rule": null
+  },
+  {
+    "style": "ssh told not to be a master",
+    "exe": "/usr/bin/ssh",
+    "argv": ["ssh", "-oControlMaster=no", "build.example.com"],
+    "rule": null
   }
 ]

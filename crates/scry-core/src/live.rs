@@ -44,27 +44,36 @@ pub struct Collector {
 }
 
 impl Collector {
+    /// A config that cannot be read leaves the keep list unknown, so the policy then
+    /// selects no leftovers; [`Collector::config_error`] says why.
     pub fn new(labels: Labels) -> Collector {
         let paths = Paths::from_env().ok();
-        let keep = paths
-            .as_ref()
-            .and_then(|p| Some((Config::load(p).ok()?.0, p)))
-            .map(|(c, p)| {
+        let (keep, config_error) = match paths.as_ref().map(|p| (Config::load(p), p)) {
+            Some((Ok((c, _)), p)) => (
                 c.keep
                     .iter()
                     .map(|k| p.expand(&PathBuf::from(k)).display().to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .collect(),
+                None,
+            ),
+            Some((Err(e), _)) => (Vec::new(), Some(e.to_string())),
+            None => (Vec::new(), None),
+        };
         Collector {
             engine: Engine::labelling(labels),
             paths,
             policy: Policy {
                 keep,
+                config_error,
                 ..Policy::default()
             },
             home: Home::from_env(),
         }
+    }
+
+    /// Why the config could not be read. While it is broken no process is a leftover.
+    pub fn config_error(&self) -> Option<&str> {
+        self.policy.config_error.as_deref()
     }
 
     pub fn read(&mut self) -> Result<Reading> {
@@ -80,7 +89,11 @@ impl Collector {
 
     pub fn board(&mut self) -> Result<Board> {
         let r = self.read()?;
-        Ok(Board::build(&r.snap, &r.lineage, self.home.as_ref()))
+        let mut board = Board::build(&r.snap, &r.lineage, self.home.as_ref());
+        if let Some(e) = self.config_error() {
+            board.overview.config_unread(e);
+        }
+        Ok(board)
     }
 
     pub fn home(&self) -> Option<&Home> {
