@@ -159,7 +159,10 @@ pub fn spawn(paths: Paths) -> Result<(Stopper, std::thread::JoinHandle<()>)> {
     let stopper = watch.stopper();
     let handle = std::thread::Builder::new()
         .name("recorder".into())
-        .spawn(move || run(paths, watch))?;
+        .spawn(move || {
+            crate::sys::yield_to_the_user();
+            run(paths, watch)
+        })?;
     Ok((stopper, handle))
 }
 

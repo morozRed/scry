@@ -27,7 +27,8 @@ anything still needs them. Scry answers that, shows its evidence for each answer
 you clean up after a confirmation that lists exactly what will happen.
 
 > **Status:** version 0.1, the first public release. Scry runs on macOS 14 or later on
-> Apple Silicon. See the [changelog](CHANGELOG.md) and the [roadmap](docs/roadmap.md).
+> Apple Silicon, and Linux support is next on the [roadmap](docs/roadmap.md#linux). See the
+> [changelog](CHANGELOG.md).
 
 ## Install
 
@@ -59,6 +60,7 @@ Optional, for full history (both are explained below):
 ```sh
 scry daemon install          # record disk history and agent process trees in the background
 scry hook install claude     # tell Scry exactly when Claude Code sessions start and end
+scry setup                   # teach your coding agents to use Scry's CLI
 ```
 
 To try Scry without touching your real setup, set `SCRY_HOME` to an empty folder. The
@@ -195,6 +197,22 @@ Agents use Scry through the CLI; there is no MCP server. An agent can run
 `scry why 3000 --json` before it starts a dev server, or `scry leftovers --json` at the end
 of a session. Actions take `--yes` instead of a prompt, and refusals come back as JSON too.
 
+`scry setup` teaches an agent all of this. It installs a skill, a `SKILL.md` that tells the
+agent when to reach for Scry, which command answers which question, and the rules: look
+before acting, act only after you agree, never touch a process tied by a guess. Claude Code,
+Codex, OpenCode and Gemini CLI read the same skill, each from its own folder.
+
+```sh
+scry setup                      # pick agents from a list; enter takes every agent found
+scry setup claude codex         # or name them: claude, codex, opencode, gemini
+scry setup --all --dry-run      # what it would write for every agent found
+scry setup --remove --all       # take Scry's skill out again
+scry setup --print              # read the skill first
+```
+
+A skill named `scry` that Scry did not write is left alone, and `--remove` removes only
+Scry's own. A new session of the agent loads the skill.
+
 `scry stop` and `scry reap` exit `0` when the processes stopped, `1` when nothing was
 signalled and `2` when one is still running. `scry clean` exits `0` when done and `1` when
 it was refused or stopped partway. Every command exits `64` when its arguments are wrong.
@@ -284,7 +302,9 @@ scry daemon uninstall   # stop it and remove the LaunchAgent; the data stays
 ```
 
 It samples free space every 10 minutes, takes hook events, and watches running agents so it
-can record their process trees as they change. Everything else works without it.
+can record their process trees as they change. Everything else works without it. It uses
+about 16 MB of memory, and its scans run at macOS's utility priority, so your own work
+comes first; see [Performance](#performance).
 
 `install` writes `~/Library/LaunchAgents/com.morozred.scry.daemon.plist`. macOS then shows
 a "Background Items Added" notice, and Scry appears under System Settings > General > Login
@@ -377,9 +397,25 @@ working directory), cached folder sizes, the audit log, and the daemon's log. No
 leaves this folder. `scry snapshot` writes your home folder as `~` and replaces your account
 name, so you can attach it to a bug report after reading it through.
 
+## Performance
+
+Measured on an M-series MacBook with about 1,100 processes, release build:
+
+| What | CPU | Memory |
+|---|---|---|
+| `scry` open, idle on any view (a reading every 5 s) | under 1% of one core | about 20 MB |
+| Opening Disk, while it measures folder sizes | about half a core for 15 to 20 s, then idle | up to 75 MB, back to about 30 MB |
+| The background recorder, while an agent runs commands | about 1% of one core | about 16 MB |
+| The background recorder, with no agent working | one scan every 30 s | about 16 MB |
+
+A full scan of the process table and sockets takes about 25 ms; `scry bench scan` measures
+it on your Mac. The folder walks and the recorder run at macOS's utility priority, so they
+give way to what you are doing.
+
 ## Requirements
 
-- macOS 14 or later on Apple Silicon
+- macOS 14 or later on Apple Silicon. Linux is planned: see the
+  [roadmap](docs/roadmap.md#linux)
 - To build: Rust 1.89 or later and the Xcode Command Line Tools
 - Optional: `git` on your `PATH` for the Worktrees view (the Command Line Tools include it)
 

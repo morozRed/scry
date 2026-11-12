@@ -398,3 +398,27 @@ mod tests {
         assert!(parse_kinfo(&[0u8; KINFO_PROC_SIZE + 1]).is_err());
     }
 }
+
+/// `QOS_CLASS_UTILITY` from <sys/qos.h>: work the user sees progress of but does not wait on.
+const QOS_CLASS_UTILITY: u32 = 0x11;
+
+unsafe extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+}
+
+/// Runs the calling thread as utility work, so macOS favours what the user is doing and can
+/// keep it on the efficiency cores. For readers and walks off the UI thread. Says whether
+/// the class was set.
+pub fn yield_to_the_user() -> bool {
+    // SAFETY: only changes the calling thread's scheduling class.
+    unsafe { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) == 0 }
+}
+
+#[cfg(test)]
+mod qos_tests {
+    #[test]
+    fn a_thread_can_give_way_to_the_user() {
+        let set = std::thread::spawn(super::yield_to_the_user).join().unwrap();
+        assert!(set);
+    }
+}

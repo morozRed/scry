@@ -17,8 +17,6 @@ pub const HEIGHT: u16 = 7;
 const GAP: u16 = 5;
 /// From this width a fourth gauge shows what agent sessions started.
 const FOURTH_FROM: u16 = 110;
-/// The graph scales to its own peak, but never makes a quiet 3% look like a spike.
-const SPARK_FLOOR: u8 = 20;
 const FORECAST_WARN_DAYS: f64 = 30.0;
 
 /// Digits three rows tall, from half blocks.
@@ -159,11 +157,13 @@ fn gauge_list<'a>(theme: &Theme, board: &Board, fourth: bool) -> Vec<Gauge<'a>> 
             }
             _ => Graph::None,
         };
-        if caption.is_empty()
-            && let Some(s) = space
-        {
+        if caption.is_empty() {
             caption = vec![Span::styled(
-                format!("of {} on {}", disk_bytes(s.total), s.volume),
+                match space {
+                    Some(s) => format!("of {} on {}", disk_bytes(s.total), s.volume),
+                    // The volume's size and forecast come with the disk reading.
+                    None => "4 Disk for the forecast".into(),
+                },
                 theme.muted,
             )];
         }
@@ -241,7 +241,8 @@ fn draw(buf: &mut ratatui::buffer::Buffer, r: Rect, theme: &Theme, g: &Gauge) {
     let gy = r.y + 4;
     match &g.graph {
         Graph::Spark(vals, style) if !vals.is_empty() && r.width > 0 => {
-            let top = vals.iter().copied().max().unwrap_or(0).max(SPARK_FLOOR) as f64;
+            // A fixed scale: two rows are all cores busy, so a quiet machine looks quiet.
+            let top = 100.0;
             let n = vals.len();
             for c in 0..r.width {
                 let v = vals[(c as usize * n) / r.width as usize] as f64;

@@ -25,6 +25,7 @@ pub mod reap;
 pub mod recorder;
 pub mod session;
 pub mod size;
+pub mod skill;
 pub mod spool;
 pub mod store;
 pub mod sys;
