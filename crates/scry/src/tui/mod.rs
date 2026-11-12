@@ -36,7 +36,7 @@ use scry_core::engine::Labels;
 use scry_core::live::Collector;
 use scry_core::model::ProcId;
 use scry_core::paths::Paths;
-use scry_core::reap::{self, LiveJudge, ReapTarget, Report, StopJudge};
+use scry_core::reap::{self, LiveJudge, ReapTarget, Report, StopJudge, StoreAudit};
 use scry_core::view::{Board, Load, Tab, Tone, WorktreeList};
 use scry_core::worktree::{self, ScanOptions};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
@@ -219,9 +219,8 @@ fn read_processes(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, every: O
 /// waits up to 3 s per process. The same checks as `scry stop` and `scry reap` run here,
 /// with the TUI as the actor in the audit rows.
 fn carry_out(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<Request>, rescan: &mpsc::Sender<()>) {
-    let mut collector = Collector::new(Labels::All);
     while let Ok(req) = asks.recv() {
-        let result = act(&mut collector, &req);
+        let result = act(&req);
         if tx.send(Update::Acted(Box::new((req, result)))).is_err() {
             return;
         }
@@ -230,13 +229,21 @@ fn carry_out(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<Request>, rescan: 
     }
 }
 
-fn act(collector: &mut Collector, req: &Request) -> std::result::Result<Report, String> {
-    let paths = collector
-        .paths()
-        .cloned()
-        .ok_or("Scry cannot tell the home directory, so nothing was sent.")?;
-    reap::allowed(&paths).map_err(|r| r.to_string())?;
-    let store = reap::audit_store(&paths).map_err(|r| r.to_string())?;
+/// One confirmed request. A reap's targets, and a SIGKILL after a reap, pass the leftover
+/// rule read afresh before each signal; a stop's pass `scry stop`'s checks. Each signal has
+/// its audit row first, and nothing is sent when the store cannot take it.
+fn act(req: &Request) -> std::result::Result<Report, String> {
+    let paths = Paths::from_env()
+        .map_err(|_| "Scry cannot tell the home directory, so nothing was sent.")?;
+    let refused = |r: scry_core::control::Refusal| format!("Nothing was sent: {}", r.brief());
+    reap::allowed(&paths).map_err(refused)?;
+    let action = match (req.kind, req.origin) {
+        (SheetKind::Kill, SheetKind::Reap) => "reap, SIGKILL",
+        (SheetKind::Kill, _) => "stop, SIGKILL",
+        (SheetKind::Reap, _) => "reap",
+        _ => "stop",
+    };
+    let mut audit = StoreAudit::open(&paths, "tui", action).map_err(refused)?;
     let targets: Vec<ReapTarget> = req
         .targets
         .iter()
@@ -248,37 +255,38 @@ fn act(collector: &mut Collector, req: &Request) -> std::result::Result<Report, 
             },
             command: t.command.clone(),
             session: t.session.clone().unwrap_or_default(),
+            session_id: t
+                .session_id
+                .clone()
+                .filter(|_| req.origin == SheetKind::Reap),
             evidence: t.evidence,
             ram: t.frees,
         })
         .collect();
-    let action = match (req.kind, req.origin) {
-        (SheetKind::Kill, SheetKind::Reap) => "reap, SIGKILL",
-        (SheetKind::Kill, _) => "stop, SIGKILL",
-        (SheetKind::Reap, _) => "reap",
-        _ => "stop",
-    };
-    let mut audit = |d: &reap::Done| {
-        let row = reap::audit_row("tui", action, d.target.id, &d.target.command, &d.result());
-        let _ = store.append_audit(&row);
-    };
     let reaping = req.origin == SheetKind::Reap;
+    let each = &mut |_: &reap::Done| {};
     Ok(match (req.kind, reaping) {
-        (SheetKind::Kill, true) => reap::kill_all(&targets, &mut LiveJudge(collector), &mut audit),
-        (SheetKind::Kill, false) => reap::kill_all(&targets, &mut StopJudge(collector), &mut audit),
+        (SheetKind::Kill, true) => {
+            reap::kill_all(&targets, &mut LiveJudge::new(paths), &mut audit, each)
+        }
+        (SheetKind::Kill, false) => {
+            reap::kill_all(&targets, &mut StopJudge::new(paths), &mut audit, each)
+        }
         (_, true) => reap::run(
             &targets,
             false,
             TERM_GRACE,
-            &mut LiveJudge(collector),
+            &mut LiveJudge::new(paths),
             &mut audit,
+            each,
         ),
         (_, false) => reap::run(
             &targets,
             false,
             TERM_GRACE,
-            &mut StopJudge(collector),
+            &mut StopJudge::new(paths),
             &mut audit,
+            each,
         ),
     })
 }
@@ -405,6 +413,11 @@ fn event_loop(
             match app.on_key(key) {
                 Action::Quit => return Ok(()),
                 Action::Suspend => suspend(terminal)?,
+                Action::Reread => {
+                    if let Some(w) = workers {
+                        let _ = w.now.send(());
+                    }
+                }
                 Action::Rescan => match workers {
                     Some(w) => {
                         app.fresh.asked = true;

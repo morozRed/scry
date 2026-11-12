@@ -115,7 +115,12 @@ pub fn run(paths: Paths, mut watch: ProcWatch) {
         }
     };
     let keep = crate::config::Config::load(&paths)
-        .map(|(c, _)| c.keep)
+        .map(|(c, _)| {
+            c.keep
+                .iter()
+                .map(|k| crate::keep::expand(k, &paths))
+                .collect()
+        })
         .unwrap_or_default();
     let mut rec = Recorder::new(Policy {
         keep,

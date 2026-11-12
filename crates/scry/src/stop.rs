@@ -9,6 +9,7 @@ use scry_core::engine::{Engine, Labels};
 use scry_core::label::printable;
 use scry_core::paths::Paths;
 use scry_core::reap;
+use scry_core::reap::{StopJudge, StoreAudit};
 use serde_json::{Value, json};
 
 /// Stop one of your processes by pid or by the port it holds. Sends SIGTERM and waits 3 s.
@@ -69,22 +70,27 @@ pub fn run(a: StopArgs) -> Result<()> {
             );
         }
     }
-    let store = match reap::audit_store(&paths) {
+    let action = if a.kill { "stop --kill" } else { "stop" };
+    let mut audit = match StoreAudit::open(&paths, "cli", action) {
         Ok(s) => s,
         Err(r) => refuse(a.json, Some(&t), json!(r), &r.to_string()),
     };
-    let result = control::stop(&t, a.kill, TERM_GRACE);
-    let said = match &result {
-        Ok(o) => reap::outcome_words(o),
-        Err(r) => format!("not signalled: {r}"),
-    };
-    let action = if a.kill { "stop --kill" } else { "stop" };
-    if let Err(e) = store.append_audit(&reap::audit_row("cli", action, t.id, &t.process, &said)) {
-        eprintln!("The audit row was not written: {e:#}");
+    // The judge reads the config and the process again before each signal, so an answer
+    // that took minutes, or a `destructive = false` saved meanwhile, is seen.
+    let done = reap::stop_one(
+        &t,
+        a.kill,
+        TERM_GRACE,
+        &mut StopJudge::new(paths.clone()),
+        &mut audit,
+    );
+    if let Some(e) = &done.unaudited {
+        eprintln!("The outcome was sent but its audit row was not written: {e}");
     }
-    let outcome = match result {
-        Ok(o) => o,
-        Err(r) => refuse(a.json, Some(&t), json!(r), &r.to_string()),
+    let outcome = match (done.outcome, done.refusal) {
+        (Some(o), _) => o,
+        (None, Some(r)) => refuse(a.json, Some(&t), json!(r), &r.to_string()),
+        (None, None) => unreachable!("a stop either acts or says why not"),
     };
     if a.json {
         let out = json!({ "target": t, "outcome": outcome });

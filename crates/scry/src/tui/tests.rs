@@ -64,6 +64,8 @@ fn with_leftovers(n: usize) -> Board {
         pid,
         start_us: None,
         keep: None,
+        ancestors: 0,
+        session_id: None,
         ram: Some(48 << 20),
         ports: vec![],
         age_s: 5 * 3600,
@@ -1034,6 +1036,7 @@ fn report(done: &[(i32, bool)]) -> scry_core::reap::Report {
                     id: scry_core::ProcId { pid, start_us: 1 },
                     command: "x".into(),
                     session: "claude 4f2c".into(),
+                    session_id: None,
                     evidence: Some(Evidence::Stamp),
                     ram: None,
                 },
@@ -1046,6 +1049,7 @@ fn report(done: &[(i32, bool)]) -> scry_core::reap::Report {
                     Outcome::StillRunning { after_ms: 3000 }
                 }),
                 refusal: None,
+                unaudited: None,
             })
             .collect(),
     }
@@ -1131,12 +1135,127 @@ fn a_refused_reap_says_why_in_the_footer() {
     let Action::Act(req) = a.on_key(key(KeyCode::Enter)) else {
         panic!("enter should act");
     };
-    let why =
-        "Stopping is turned off by `destructive = false` in ~/.config/scry/config.toml line 2.";
-    a.acted(&req, Err(why.into()));
+    // As the worker words it: short enough for the footer at 80 columns.
+    let refusal = scry_core::control::Refusal::Disabled {
+        config: "~/.config/scry/config.toml".into(),
+        line: Some(2),
+    };
+    let why = format!("Nothing was sent: {}", refusal.brief());
+    assert_eq!(
+        why,
+        "Nothing was sent: `destructive = false` in config.toml line 2."
+    );
+    a.acted(&req, Err(why.clone()));
     assert_eq!(a.toast.as_ref().unwrap().text, why);
     assert_eq!(a.toast.as_ref().unwrap().tone, Tone::Danger);
     assert_eq!(a.mode, Mode::Normal);
+    let footer = lines(&render(&a, 80, 24)).pop().unwrap();
+    assert!(footer.contains(&why), "{footer}");
+
+    // A target refused at its own check says why once, and fits too.
+    let mut report = report(&[(48213, false)]);
+    report.done[0].outcome = None;
+    report.done[0].refusal = Some(scry_core::control::Refusal::NotLeftover {
+        pid: 48213,
+        why: "It is on your keep list as `~/sources/acme/node_modules/next/dist/bin/next`.".into(),
+    });
+    a.acted(&req, Ok(report));
+    let text = &a.toast.as_ref().unwrap().text;
+    assert_eq!(
+        text,
+        "Stopped 0, 1 not signalled: pid 48213 is no longer a leftover."
+    );
+    let footer = lines(&render(&a, 80, 24)).pop().unwrap();
+    assert!(footer.contains(text.as_str()), "{footer}");
+}
+
+#[test]
+fn the_sigkill_sheet_shows_each_age_as_of_now() {
+    let mut a = live();
+    press(&mut a, "3X");
+    let Action::Act(mut req) = a.on_key(key(KeyCode::Enter)) else {
+        panic!("enter should act");
+    };
+    // Listed an hour ago as 2 minutes old: three hours old by now.
+    let now_us = scry_core::sys::now_ms() * 1000;
+    req.targets[0].start_us = Some(now_us - 3 * 3600 * 1_000_000);
+    req.targets[0].age_s = 120;
+    a.acted(&req, Ok(report(&[(req.targets[0].pid, false)])));
+    let Mode::Sheet(sheet) = &a.mode else {
+        panic!("SIGKILL should be offered");
+    };
+    assert_eq!(sheet.targets[0].age_s / 60, 180);
+    let text = screen(&render(&a, 80, 24));
+    assert!(text.contains(" 3h "), "{text}");
+}
+
+#[test]
+fn the_keep_sheet_shows_the_whole_diff_wrapped_and_scrolls_when_it_cannot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = scry_core::paths::Paths::new(tmp.path().into(), Some(tmp.path().join("scry")));
+    std::fs::create_dir_all(tmp.path().join("scry")).unwrap();
+    let long = format!(
+        "~/sources/{}/node_modules/next/dist/bin/next",
+        "a".repeat(90)
+    );
+    let mut board = keepable();
+    if let Load::Ready(rows) = &mut board.agents {
+        for r in rows.iter_mut().filter(|r| r.depth > 0) {
+            r.keep = Some(scry_core::keep::KeepAs::Entry(long.clone()));
+        }
+    }
+    std::fs::write(&paths.config, "keep = [\"postgres\"]\n").unwrap();
+    let mut a = App::new(board.clone(), Source::Live, mono());
+    a.paths = Some(paths.clone());
+    press(&mut a, "3jjK");
+    let text = screen(&render(&a, 80, 24));
+    // Every character of the new line is on screen, across as many rows as it takes.
+    let shown: String = text
+        .lines()
+        .filter(|l| l.contains("+ ") || l.trim_start().starts_with("aaa") || l.contains("/next"))
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join("");
+    let want = format!("keep = [\"postgres\", \"{long}\"]");
+    assert!(
+        shown.replace(' ', "").contains(&want.replace(' ', "")),
+        "{text}"
+    );
+    assert!(!text.contains("more"), "{text}");
+
+    // A list of 40 entries, one per line, does not fit: the sheet scrolls through it.
+    let many: String = (0..40).map(|i| format!("  \"p{i}\",\n")).collect();
+    std::fs::write(&paths.config, format!("keep = [\n{many}]\n")).unwrap();
+    let mut a = App::new(board, Source::Live, mono());
+    a.paths = Some(paths);
+    press(&mut a, "3jjK");
+    let text = screen(&render(&a, 80, 24));
+    assert!(text.contains("more   j k scroll"), "{text}");
+    assert!(text.contains("- keep = ["), "{text}");
+    press(&mut a, "G");
+    let text = screen(&render(&a, 80, 24));
+    assert!(text.contains("above"), "{text}");
+    assert!(text.contains("aaaa"), "the new entry is reached: {text}");
+}
+
+#[test]
+fn k_says_why_a_process_has_no_entry_in_one_line() {
+    let mut board = keepable();
+    if let Load::Ready(rows) = &mut board.agents {
+        for r in rows.iter_mut().filter(|r| r.depth > 0) {
+            r.keep = Some(scry_core::keep::KeepAs::Refused("runs code".into()));
+        }
+    }
+    let mut a = App::new(board, Source::Live, mono());
+    press(&mut a, "3jjK");
+    assert_eq!(a.mode, Mode::Normal);
+    let text = &a.toast.as_ref().unwrap().text;
+    assert_eq!(
+        text,
+        "No entry keeps only `next dev`. Add one to keep by hand."
+    );
+    let footer = lines(&render(&a, 80, 24)).pop().unwrap();
+    assert!(footer.contains(text.as_str()), "{footer}");
 }
 
 #[test]
@@ -1160,7 +1279,7 @@ fn keepable() -> Board {
         unreachable!();
     };
     for r in rows.iter_mut().filter(|r| r.depth > 0) {
-        r.keep = Some(r.label.clone());
+        r.keep = Some(scry_core::keep::KeepAs::Entry(r.label.clone()));
     }
     board
 }
@@ -1193,17 +1312,32 @@ fn k_shows_the_change_and_writes_only_the_keep_list() {
         "not yet"
     );
 
-    assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Rescan);
+    // A quiet reading follows, so "Refreshed." never replaces what was kept.
+    assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Reread);
     assert_eq!(
         std::fs::read_to_string(&paths.config).unwrap(),
         config.replace(r#"["postgres"]"#, r#"["postgres", "next dev"]"#)
     );
-    assert!(
-        a.toast
-            .as_ref()
-            .unwrap()
-            .text
-            .starts_with("Kept `next dev`")
+    super::finish_scan(&mut a, None);
+    assert_eq!(
+        a.toast.as_ref().unwrap().text,
+        "Kept `next dev`: added to ~/scry/config.toml line 2."
+    );
+    // The edit was audited, before and after, though nothing was signalled.
+    let rows = scry_core::store::Store::open(&paths.db())
+        .unwrap()
+        .audit_rows()
+        .unwrap();
+    let said: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|r| (r.actor.as_str(), r.action.as_str(), r.result.as_str()))
+        .collect();
+    assert_eq!(
+        said,
+        [
+            ("tui", "keep", "adding at line 2"),
+            ("tui", "keep", "added at line 2")
+        ]
     );
     // The next reading spares it; asking again says so.
     let (c, _) = scry_core::config::Config::load(&paths).unwrap();
@@ -1254,4 +1388,42 @@ fn reap_sheet_after_confirm_offers_sigkill() {
         ])),
     );
     insta::assert_snapshot!(render(&a, 120, 40));
+}
+
+#[test]
+fn an_open_sigkill_sheet_keeps_its_targets_and_origin_whatever_finishes_meanwhile() {
+    let mut a = live();
+    press(&mut a, "3X");
+    let Action::Act(reap) = a.on_key(key(KeyCode::Enter)) else {
+        panic!("enter should act");
+    };
+    // A outlives SIGTERM while the help card is open, so its SIGKILL sheet waits for X.
+    press(&mut a, "?");
+    a.acted(&reap, Ok(report(&[(48213, false)])));
+    assert_eq!(a.mode, Mode::Help);
+    press(&mut a, "\x1b");
+    // B is stopped from its own row meanwhile.
+    press(&mut a, "gjx");
+    let Action::Act(stop) = a.on_key(key(KeyCode::Enter)) else {
+        panic!("enter should stop");
+    };
+    assert_ne!(stop.targets[0].pid, 48213);
+    // While it runs, X opens A's SIGKILL sheet; B's outcome arrives and leaves it be.
+    press(&mut a, "X");
+    let Mode::Sheet(open) = a.mode.clone() else {
+        panic!("X should offer SIGKILL, got {:?}", a.mode);
+    };
+    assert_eq!(open.kind, SheetKind::Kill);
+    a.acted(&stop, Ok(report(&[(stop.targets[0].pid, true)])));
+    assert_eq!(a.mode, Mode::Sheet(open), "the open sheet is unchanged");
+    let Action::Act(kill) = a.on_key(key(KeyCode::Enter)) else {
+        panic!("enter should send SIGKILL");
+    };
+    assert_eq!(
+        (kill.kind, kill.origin),
+        (SheetKind::Kill, SheetKind::Reap),
+        "A is checked as a leftover, keep list included, before SIGKILL"
+    );
+    let pids: Vec<i32> = kill.targets.iter().map(|t| t.pid).collect();
+    assert_eq!(pids, [48213]);
 }

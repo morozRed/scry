@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use super::{Detail, Evidence, Fact, State, Target, human_age, human_bytes};
 use crate::attribution::{AgentState, Lineage, Member, SessionView, Spare, Verdict};
 use crate::home::Home;
+use crate::keep::KeepAs;
 use crate::model::{Agent, Process, Snapshot};
 use crate::session::{SessionKey, Source};
 
@@ -30,10 +31,23 @@ pub struct AgentRow {
     pub age_s: u64,
     pub evidence: Option<Evidence>,
     pub state: Option<State>,
-    /// The keep-list entry `K` would add for a process row; see [`crate::keep`].
+    /// The keep-list entry `K` would add for a process row, or why it adds none; see
+    /// [`crate::keep`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep: Option<String>,
+    pub keep: Option<KeepAs>,
+    /// For a process row, how many live parents it has up to launchd. Children are reaped
+    /// before their parents by it, since `depth` stops growing where the tree is drawn.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ancestors: u16,
+    /// The full id of the session the row is under, which the check before each signal
+    /// confirms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub detail: Detail,
+}
+
+fn is_zero(n: &u16) -> bool {
+    *n == 0
 }
 
 impl AgentRow {
@@ -46,9 +60,10 @@ impl AgentRow {
 }
 
 /// What `X` would reap: leftovers tied by `stamp` or `tree`, never a `guess`, children
-/// before their parents so nothing is re-parented to launchd mid-way.
+/// before their parents by the real process tree, so nothing is re-parented to launchd
+/// mid-way.
 pub fn reap_targets(rows: &[AgentRow]) -> Vec<Target> {
-    let mut picked: Vec<(u8, usize, Target)> = Vec::new();
+    let mut picked: Vec<((u16, u8), usize, Target)> = Vec::new();
     let mut session: Option<String> = None;
     for (i, row) in rows.iter().enumerate() {
         if row.depth == 0 {
@@ -57,13 +72,14 @@ pub fn reap_targets(rows: &[AgentRow]) -> Vec<Target> {
         let exact = matches!(row.evidence, Some(Evidence::Stamp | Evidence::Tree));
         if let (Some(State::Leftover), true, Some(pid)) = (row.state, exact, row.pid) {
             picked.push((
-                row.depth,
+                (row.ancestors, row.depth),
                 i,
                 Target {
                     pid,
                     start_us: row.start_us,
                     command: row.label.clone(),
                     session: session.clone(),
+                    session_id: row.session_id.clone(),
                     evidence: row.evidence,
                     age_s: row.age_s,
                     frees: row.ram,
@@ -91,6 +107,7 @@ pub fn stop_target(rows: &[AgentRow], index: usize) -> Option<Target> {
         start_us: row.start_us,
         command: row.label.clone(),
         session,
+        session_id: row.session_id.clone(),
         evidence: row.evidence,
         age_s: row.age_s,
         frees: row.ram,
@@ -108,8 +125,10 @@ pub struct Leftover {
     pub start_us: i64,
     pub command: String,
     pub agent: Agent,
-    /// The session's id, or `pid N` when Scry never learned it.
+    /// The start of the session's id, or `pid N` when Scry never learned it.
     pub session: String,
+    /// The session's full id, as the store keeps it.
+    pub session_id: String,
     pub evidence: Evidence,
     /// The evidence, in a sentence.
     pub how: String,
@@ -140,6 +159,7 @@ pub fn leftovers(snap: &Snapshot, lineage: &Lineage, home: Option<&Home>) -> Vec
                 command: label(snap, p),
                 agent: session.agent,
                 session: session.id.short(),
+                session_id: session.id.encode(),
                 evidence: how.evidence(),
                 how: how.sentence(),
                 agent_pid: *agent_pid,
@@ -345,6 +365,8 @@ fn session_row(
         pid: agent.map(|a| a.id.pid),
         start_us: agent.map(|a| a.id.start_us),
         keep: None,
+        ancestors: 0,
+        session_id: Some(s.key.id.encode()),
         ram: (ram > 0).then_some(ram),
         ports: held,
         age_s: age(snap, started_us(snap, s)),
@@ -421,6 +443,8 @@ fn member_row(
         evidence: Some(m.how.evidence()),
         state,
         keep: Some(crate::keep::entry_for(p, home.map(Home::path).as_deref())),
+        ancestors: ancestors(snap, p),
+        session_id: Some(s.key.id.encode()),
         detail: Detail {
             title: command,
             facts,
@@ -450,6 +474,20 @@ fn started_us(snap: &Snapshot, s: &SessionView) -> i64 {
         .map(|m| m.proc.start_us)
         .min()
         .unwrap_or(snap.taken_at_ms * 1000)
+}
+
+/// Live parents above `p` up to launchd, at most 64.
+fn ancestors(snap: &Snapshot, p: &Process) -> u16 {
+    let mut n = 0;
+    let mut at = p;
+    while n < 64
+        && at.ppid > 1
+        && let Some(parent) = snap.process(at.ppid)
+    {
+        n += 1;
+        at = parent;
+    }
+    n
 }
 
 fn age(snap: &Snapshot, start_us: i64) -> u64 {
@@ -512,6 +550,8 @@ mod tests {
             pid: Some(id.len() as i32 * 100 + depth as i32),
             start_us: None,
             keep: None,
+            ancestors: 0,
+            session_id: None,
             ram: Some(1),
             ports: vec![],
             age_s: 60,
@@ -578,6 +618,7 @@ mod tests {
                 worker: false,
                 tty: None,
                 role: None,
+                script: None,
             }
         }
 
@@ -609,6 +650,33 @@ mod tests {
                 }],
                 ..Snapshot::default()
             }
+        }
+
+        #[test]
+        fn x_reaps_a_deep_chain_children_first_past_the_drawn_depth() {
+            // 2000 → 2001 → … → 2011, twelve deep, all stamped by a session whose agent is gone.
+            let mut s = snap();
+            for i in 0..12 {
+                let mut q = p(2000 + i, if i == 0 { 1 } else { 1999 + i }, "node", 3600);
+                q.id.start_us += i as i64;
+                q.stamps.claude_code_session_id = Some("7a7a7a7a-deep".into());
+                q.stamps.claude_pid = Some(801);
+                s.processes.push(q);
+            }
+            let policy = Policy {
+                scry: None,
+                ..Policy::default()
+            };
+            let lineage = Lineage::build(&s, &Known::default(), &policy);
+            let board = Board::build(&s, &lineage, None);
+            let rows = board.agents.ready().unwrap();
+            let order: Vec<i32> = super::super::reap_targets(rows)
+                .iter()
+                .map(|t| t.pid)
+                .filter(|&pid| pid >= 2000)
+                .collect();
+            let deepest_first: Vec<i32> = (2000..2012).rev().collect();
+            assert_eq!(order, deepest_first);
         }
 
         #[test]

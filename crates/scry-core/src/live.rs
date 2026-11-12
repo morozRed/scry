@@ -2,8 +2,6 @@
 //! and the lineage built from both. Clients only read: the daemon alone writes sessions and
 //! ancestry, and without it the spool is applied in memory.
 
-use std::path::PathBuf;
-
 use anyhow::Result;
 use serde::Serialize;
 
@@ -47,7 +45,11 @@ impl Collector {
     /// A config that cannot be read leaves the keep list unknown, so the policy then
     /// selects no leftovers; [`Collector::config_error`] says why.
     pub fn new(labels: Labels) -> Collector {
-        let paths = Paths::from_env().ok();
+        Collector::with_paths(labels, Paths::from_env().ok())
+    }
+
+    /// A collector for the config and store at `paths`.
+    pub fn with_paths(labels: Labels, paths: Option<Paths>) -> Collector {
         Collector {
             engine: Engine::labelling(labels),
             policy: policy(paths.as_ref()),
@@ -137,11 +139,7 @@ impl Collector {
 fn policy(paths: Option<&Paths>) -> Policy {
     match paths.map(|p| (Config::load(p), p)) {
         Some((Ok((c, _)), p)) => Policy {
-            keep: c
-                .keep
-                .iter()
-                .map(|k| p.expand(&PathBuf::from(k)).display().to_string())
-                .collect(),
+            keep: c.keep.iter().map(|k| crate::keep::expand(k, p)).collect(),
             grace: c.leftover_grace,
             ..Policy::default()
         },

@@ -27,6 +27,7 @@ fn proc(pid: i32, ppid: i32, name: &str) -> Process {
         worker: false,
         tty: None,
         role: None,
+        script: None,
     }
 }
 

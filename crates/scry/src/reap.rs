@@ -6,18 +6,20 @@ use anyhow::Result;
 use clap::Args;
 use scry_core::control::{Refusal, TERM_GRACE};
 use scry_core::engine::Labels;
-use scry_core::keep;
+use scry_core::keep::{self, KeepAs};
 use scry_core::label::printable;
 use scry_core::live::Collector;
 use scry_core::paths::Paths;
-use scry_core::reap::{self, LiveJudge, ReapTarget, Report};
+use scry_core::reap::{self, LiveJudge, ReapTarget, Report, StoreAudit};
 use scry_core::view::agents::{Leftover, PERSISTENT};
 use serde_json::{Value, json};
 
 /// Stop the processes `scry leftovers` lists, children first. Each is checked again right
-/// before its signal: still a leftover, and still the same process. Sends SIGTERM and waits
-/// up to 3 s for each. Exits 0 when they stopped or there was nothing to reap, 1 when
-/// nothing was signalled, 2 when one is still running, and 64 when the arguments are wrong.
+/// before its signal, with the config and the machine read afresh: stopping still allowed,
+/// still a leftover of the same session, still the same process. Each signal is written to
+/// the audit table before it is sent. Sends SIGTERM and waits up to 3 s for each. Exits 0
+/// when they stopped or there was nothing to reap, 1 when nothing was signalled, 2 when one
+/// is still running, and 64 when the arguments are wrong.
 #[derive(Args)]
 pub struct ReapArgs {
     /// List what would be reaped and signal nothing.
@@ -29,7 +31,8 @@ pub struct ReapArgs {
     /// Send SIGKILL to any still running after SIGTERM, after the same checks.
     #[arg(long)]
     kill: bool,
-    /// Only this session's leftovers: its id, or the start of it.
+    /// Only this session's leftovers: its full id, or the start of one no other session's
+    /// id starts with.
     #[arg(long)]
     session: Option<String>,
     /// Print JSON instead of text, refusals included.
@@ -38,7 +41,8 @@ pub struct ReapArgs {
 }
 
 pub fn run(a: ReapArgs) -> Result<()> {
-    let mut collector = Collector::new(Labels::All);
+    let paths = Paths::from_env()?;
+    let mut collector = Collector::with_paths(Labels::All, Some(paths.clone()));
     // Without the keep list the rule would select what the user asked to keep.
     if let Some(e) = collector.policy().config_error.clone() {
         refuse(
@@ -52,8 +56,24 @@ pub fn run(a: ReapArgs) -> Result<()> {
     }
     let r = collector.read()?;
     let home = collector.home().cloned();
-    let list = reap::plan(&r.snap, &r.lineage, home.as_ref(), a.session.as_deref());
-    let paths = Paths::from_env()?;
+    let list = match reap::plan(&r.snap, &r.lineage, home.as_ref(), a.session.as_deref()) {
+        Ok(list) => list,
+        // Nothing to reap, as for a session that left nothing; it says which.
+        Err(r @ Refusal::NoSession { .. }) => {
+            if a.json {
+                print_json(&json!({
+                    "dry_run": a.dry_run,
+                    "targets": [],
+                    "report": Report::default(),
+                    "message": r.to_string(),
+                }));
+            } else {
+                println!("{r} Nothing to reap.");
+            }
+            return Ok(());
+        }
+        Err(r) => refuse(a.json, &[], json!(r), &r.to_string()),
+    };
     let allowed = reap::allowed(&paths);
 
     if list.is_empty() {
@@ -115,23 +135,21 @@ pub fn run(a: ReapArgs) -> Result<()> {
             );
         }
     }
-    let store = match reap::audit_store(&paths) {
+    let action = if a.kill { "reap --kill" } else { "reap" };
+    let mut audit = match StoreAudit::open(&paths, "cli", action) {
         Ok(s) => s,
         Err(r) => refuse(a.json, &list, json!(r), &r.to_string()),
     };
     let targets: Vec<ReapTarget> = list.iter().map(ReapTarget::from).collect();
-    let action = if a.kill { "reap --kill" } else { "reap" };
-    let mut unaudited = Vec::new();
+    // The judge reads the config again before each signal, so an answer that took minutes,
+    // or a `destructive = false` saved meanwhile, is seen.
     let report = reap::run(
         &targets,
         a.kill,
         TERM_GRACE,
-        &mut LiveJudge(&mut collector),
+        &mut LiveJudge::new(paths.clone()),
+        &mut audit,
         &mut |d| {
-            let row = reap::audit_row("cli", action, d.target.id, &d.target.command, &d.result());
-            if let Err(e) = store.append_audit(&row) {
-                unaudited.push(format!("pid {}: {e:#}", d.target.id.pid));
-            }
             if !a.json {
                 println!(
                     "pid {} `{}`: {}",
@@ -142,6 +160,17 @@ pub fn run(a: ReapArgs) -> Result<()> {
             }
         },
     );
+    let unaudited: Vec<String> = report
+        .unaudited()
+        .iter()
+        .map(|d| {
+            format!(
+                "pid {}: {}",
+                d.target.id.pid,
+                d.unaudited.as_deref().unwrap_or_default()
+            )
+        })
+        .collect();
     if a.json {
         print_json(&json!({
             "dry_run": false,
@@ -156,7 +185,7 @@ pub fn run(a: ReapArgs) -> Result<()> {
             println!("Run `scry reap --kill` to send SIGKILL to those still running.");
         }
         for u in &unaudited {
-            eprintln!("The audit row was not written for {u}");
+            eprintln!("The outcome was sent but its audit row was not written for {u}");
         }
     }
     std::process::exit(report.exit_code());
@@ -177,8 +206,11 @@ fn print_json(v: &Value) {
 }
 
 /// Add a process to the keep list in the config, so no rule selects it again. A program is
-/// kept by its executable's path; a script or command run by an interpreter or shell (node,
-/// python, bash, …) by its command label. Prints the change.
+/// kept by its executable's path; a script run by an interpreter or shell (node, python,
+/// bash, …) by the script's real path, with the working directory when the script lives
+/// outside it. Code that is not a file, such as `python3 -c`, has no entry that would keep
+/// only it, so nothing is written. Allowed under `destructive = false`, and audited. Prints
+/// the change.
 #[derive(Args)]
 pub struct KeepArgs {
     /// The pid of the process to keep.
@@ -205,10 +237,23 @@ pub fn keep(a: KeepArgs) -> Result<()> {
         }
         std::process::exit(1);
     };
-    let entry = keep::entry_for(p, Some(&paths.user_home));
+    let entry = match keep::entry_for(p, Some(&paths.user_home)) {
+        KeepAs::Entry(e) => e,
+        KeepAs::Refused(why) => {
+            if a.json {
+                print_json(&json!({
+                    "refusal": { "refused": "no_stable_entry" },
+                    "message": why,
+                }));
+            } else {
+                eprintln!("{}", printable(&why));
+            }
+            std::process::exit(1);
+        }
+    };
     let edit = keep::plan(&paths, &entry)?;
     if !a.dry_run {
-        keep::apply(&edit)?;
+        keep::apply_audited(&edit, &paths, "cli")?;
     }
     if a.json {
         print_json(&json!({ "dry_run": a.dry_run, "edit": edit, "diff": edit.diff() }));

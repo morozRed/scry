@@ -273,7 +273,7 @@ impl Plan {
 }
 
 /// The file a chain of symlinks ends at, which may not exist yet.
-fn resolve(path: &Path) -> PathBuf {
+pub(crate) fn resolve(path: &Path) -> PathBuf {
     let mut p = path.to_path_buf();
     for _ in 0..40 {
         match fs::read_link(&p) {

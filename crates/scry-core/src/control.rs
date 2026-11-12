@@ -1,7 +1,21 @@
-//! Stopping a process. Every caller, human or agent, goes through the same checks: the
-//! viewer's own processes only, never the system's, and the identity `(pid, start_time)` is
-//! read again right before each signal, after every other check, so a reused pid is never
-//! signalled.
+//! Stopping a process. Every caller, human or agent, goes through the same steps before
+//! each signal, SIGKILL included, in this order:
+//!
+//! 1. a [`Gate`] reads the machine and the config again: stopping is still allowed, the
+//!    process is still the viewer's own and not the system's, and, for a reap, still a
+//!    leftover of the session it was listed under;
+//! 2. the gate writes an audit row saying what is about to be sent, and nothing is sent
+//!    when it cannot;
+//! 3. a kqueue watch is put on the pid, then the identity `(pid, start_time)` is read
+//!    again, then the watch is asked, without waiting, whether that process has exited;
+//! 4. the signal.
+//!
+//! The watch belongs to the process, not the number, so a process that exits after step 3
+//! begins is caught even when its pid is handed to another before the identity is read.
+//! What remains is the few microseconds between the last question to the watch and
+//! `kill(2)`: the process would have to exit and macOS hand its pid to a new process in
+//! that time, which takes the pid counter going all the way round. No call on macOS
+//! signals a process by anything but its pid, so that window cannot be closed.
 
 use std::fmt;
 use std::str::FromStr;
@@ -113,52 +127,94 @@ pub enum Refusal {
     Unaudited {
         error: String,
     },
+    /// `--session` named the start of more than one session's id.
+    AmbiguousSession {
+        session: String,
+        ids: Vec<String>,
+    },
+    /// `--session` named no session Scry knows.
+    NoSession {
+        session: String,
+    },
 }
 
-impl fmt::Display for Refusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Refusal {
+    /// Why, in a sentence, without saying that nothing was signalled.
+    pub fn reason(&self) -> String {
         match self {
-            Refusal::NotFound { target } => write!(f, "Nothing found for {target}."),
-            Refusal::NotYours { pid, owner } => write!(
-                f,
-                "pid {pid} is owned by {owner}. Scry stops only your own processes."
-            ),
-            Refusal::Protected { pid, reason } => write!(f, "pid {pid} is protected: {reason}."),
-            Refusal::Ambiguous { port, pids } => write!(
-                f,
+            Refusal::NotFound { target } => format!("Nothing found for {target}."),
+            Refusal::NotYours { pid, owner } => {
+                format!("pid {pid} is owned by {owner}. Scry stops only your own processes.")
+            }
+            Refusal::Protected { pid, reason } => format!("pid {pid} is protected: {reason}."),
+            Refusal::Ambiguous { port, pids } => format!(
                 ":{port} is held by several processes ({}). Stop one by pid.",
                 pids.iter()
                     .map(|p| p.to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Refusal::Changed { pid } => write!(
-                f,
-                "pid {pid} is no longer the process that was chosen. Nothing was signalled."
-            ),
-            Refusal::NotHolding { pid, port } => write!(
-                f,
-                "pid {pid} no longer has {port} open. Nothing was signalled."
-            ),
-            Refusal::SignalFailed { pid, error } => {
-                write!(f, "Signalling pid {pid} failed: {error}.")
+            Refusal::Changed { pid } => {
+                format!("pid {pid} is no longer the process that was chosen.")
             }
-            Refusal::NotLeftover { pid, why } => write!(
-                f,
-                "pid {pid} is no longer a leftover: {} Nothing was signalled.",
-                why.trim_end_matches('.').to_string() + "."
+            Refusal::NotHolding { pid, port } => format!("pid {pid} no longer has {port} open."),
+            Refusal::SignalFailed { pid, error } => {
+                format!("Signalling pid {pid} failed: {error}.")
+            }
+            Refusal::NotLeftover { pid, why } => format!(
+                "pid {pid} is no longer a leftover: {}.",
+                why.trim_end_matches('.')
             ),
             Refusal::Disabled { config, line } => {
                 let at = line.map(|l| format!(" line {l}")).unwrap_or_default();
-                write!(
-                    f,
+                format!(
                     "Stopping is turned off by `destructive = false` in {config}{at}. Set it to true to allow stop and reap."
                 )
+            }
+            Refusal::Unaudited { error } => {
+                format!("The audit row could not be written: {error}")
+            }
+            Refusal::AmbiguousSession { session, ids } => format!(
+                "`{session}` starts more than one session's id: {}. Give more of it.",
+                ids.join(", ")
+            ),
+            Refusal::NoSession { session } => {
+                format!("No session Scry knows has an id that is or starts with `{session}`.")
+            }
+        }
+    }
+
+    /// The reason short enough for one footer line at 80 columns.
+    pub fn brief(&self) -> String {
+        match self {
+            Refusal::NotYours { pid, .. } => format!("pid {pid} is not yours."),
+            Refusal::Protected { pid, .. } => format!("pid {pid} is protected."),
+            Refusal::NotHolding { pid, .. } => format!("pid {pid} closed its port."),
+            Refusal::SignalFailed { pid, .. } => format!("signalling pid {pid} failed."),
+            Refusal::NotLeftover { pid, .. } => format!("pid {pid} is no longer a leftover."),
+            Refusal::Disabled { config, line } => {
+                let name = config.rsplit('/').next().unwrap_or(config);
+                let name = name.split(' ').next().unwrap_or(name);
+                let at = line.map(|l| format!(" line {l}")).unwrap_or_default();
+                format!("`destructive = false` in {name}{at}.")
+            }
+            Refusal::Unaudited { .. } => "the audit row could not be written.".into(),
+            other => other.reason(),
+        }
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Refusal::Changed { .. } | Refusal::NotHolding { .. } | Refusal::NotLeftover { .. } => {
+                write!(f, "{} Nothing was signalled.", self.reason())
             }
             Refusal::Unaudited { error } => write!(
                 f,
                 "The audit row could not be written, so nothing was signalled: {error}"
             ),
+            other => f.write_str(&other.reason()),
         }
     }
 }
@@ -209,7 +265,9 @@ pub fn system_prefix(exe: &str) -> Option<&'static str> {
     SYSTEM_PREFIXES.iter().copied().find(|s| exe.starts_with(s))
 }
 
-fn guard(p: &Process, snap: &Snapshot) -> Result<(), Refusal> {
+/// Refuses what Scry never stops, whatever chose it: pids below 100, launchd, macOS's own
+/// executables, other users' processes and this process.
+pub fn guard(p: &Process, snap: &Snapshot) -> Result<(), Refusal> {
     let pid = p.id.pid;
     let protected = |reason: &str| {
         Err(Refusal::Protected {
@@ -257,12 +315,36 @@ pub enum Outcome {
     KillRefused { after_ms: u64, why: String },
 }
 
+/// What must hold right before each signal besides the identity, and the audit row that
+/// comes before it. Every stop and reap passes one; see the module's steps.
+pub trait Gate {
+    /// Everything but the identity, read again: allowed, the viewer's own and not the
+    /// system's, and for a reap still a leftover.
+    fn check(&mut self, id: ProcId) -> Result<(), Refusal>;
+    /// Records that `signal` is about to go to `id`. An error refuses the signal.
+    fn intend(&mut self, id: ProcId, signal: &str) -> Result<(), Refusal>;
+}
+
 /// What stopping needs from the system. Tests stand in for it to show the order of the
 /// checks and signals.
 pub(crate) trait Host {
     fn liveness(&self, pid: i32) -> Option<Liveness>;
     fn holds_port(&self, pid: i32, proto: Proto, port: u16) -> Option<bool>;
+    /// Starts watching the process that holds `pid` for its exit.
+    fn watch(&self, pid: i32) -> std::io::Result<Box<dyn Watch>>;
     fn signal(&self, pid: i32, sig: libc::c_int) -> std::io::Result<()>;
+}
+
+/// A watch from [`Host::watch`].
+pub(crate) trait Watch {
+    /// Whether the process exited since the watch began. An error counts as an exit.
+    fn exited(&self) -> bool;
+}
+
+impl Watch for sys::kqueue::ExitWatch {
+    fn exited(&self) -> bool {
+        sys::kqueue::ExitWatch::exited(self).unwrap_or(true)
+    }
 }
 
 pub(crate) struct Live;
@@ -276,6 +358,10 @@ impl Host for Live {
         sys::sockets::pid_holds_port(pid, proto, port)
     }
 
+    fn watch(&self, pid: i32) -> std::io::Result<Box<dyn Watch>> {
+        Ok(Box::new(sys::kqueue::ExitWatch::new(pid)?))
+    }
+
     fn signal(&self, pid: i32, sig: libc::c_int) -> std::io::Result<()> {
         if unsafe { libc::kill(pid, sig) } == 0 {
             Ok(())
@@ -286,28 +372,22 @@ impl Host for Live {
 }
 
 /// SIGTERM, then up to `grace` for the process to exit. With `kill`, a process still alive
-/// after that gets SIGKILL, after its identity is checked once more.
-pub fn stop(t: &StopTarget, kill: bool, grace: Duration) -> Result<Outcome, Refusal> {
-    stop_on(&Live, t, kill, grace)
-}
-
-fn stop_on(
-    host: &impl Host,
+/// after that gets SIGKILL. `gate` comes before each signal.
+pub fn stop(
     t: &StopTarget,
     kill: bool,
     grace: Duration,
+    gate: &mut dyn Gate,
 ) -> Result<Outcome, Refusal> {
-    stop_checked(host, t, kill, grace, &mut || Ok(()))
+    stop_on(&Live, t, kill, grace, gate)
 }
 
-/// [`stop`], with `recheck` run before each signal, ahead of the identity check: `reap`
-/// checks there that the process is still a leftover.
-pub(crate) fn stop_checked(
+pub(crate) fn stop_on(
     host: &impl Host,
     t: &StopTarget,
     kill: bool,
     grace: Duration,
-    recheck: &mut dyn FnMut() -> Result<(), Refusal>,
+    gate: &mut dyn Gate,
 ) -> Result<Outcome, Refusal> {
     let started = Instant::now();
     let elapsed = || started.elapsed().as_millis() as u64;
@@ -319,11 +399,11 @@ pub(crate) fn stop_checked(
             port: port_label(proto, port),
         });
     }
-    recheck()?;
-    // The port check reads the pid's open files, and the pid can be reused meanwhile, so the
-    // identity is read after it, right before the signal.
-    check_identity(t.id, host.liveness(t.id.pid))?;
-    signal(host, t.id, libc::SIGTERM)?;
+    gate.check(t.id)?;
+    gate.intend(t.id, "SIGTERM")?;
+    // The port check and the gate read the pid's files, and the pid can be reused
+    // meanwhile, so the identity is read after them, right before the signal.
+    signal_exact(host, t.id, libc::SIGTERM)?;
     let term_worked = || {
         Ok(Outcome::Exited {
             signal: "SIGTERM".into(),
@@ -338,21 +418,18 @@ pub(crate) fn stop_checked(
             after_ms: elapsed(),
         });
     }
-    match recheck() {
+    match gate.check(t.id).and_then(|()| gate.intend(t.id, "SIGKILL")) {
         Err(Refusal::Changed { .. }) => return term_worked(),
         Err(r) => {
             return Ok(Outcome::KillRefused {
                 after_ms: elapsed(),
-                why: r.to_string(),
+                why: r.reason(),
             });
         }
         Ok(()) => {}
     }
     // Gone between the wait and now, or as SIGKILL was sent: SIGTERM ended it.
-    if check_identity(t.id, host.liveness(t.id.pid)).is_err() {
-        return term_worked();
-    }
-    match signal(host, t.id, libc::SIGKILL) {
+    match signal_exact(host, t.id, libc::SIGKILL) {
         Err(Refusal::Changed { .. }) => return term_worked(),
         other => other?,
     }
@@ -367,24 +444,21 @@ pub(crate) fn stop_checked(
     }
 }
 
-/// SIGKILL alone, for a process that outlived SIGTERM and a second confirmation: `recheck`,
-/// then the identity, right before the signal.
-pub fn kill(
-    t: &StopTarget,
-    recheck: &mut dyn FnMut() -> Result<(), Refusal>,
-) -> Result<Outcome, Refusal> {
-    kill_on(&Live, t, recheck)
+/// SIGKILL alone, for a process that outlived SIGTERM and a second confirmation, after
+/// `gate`.
+pub fn kill(t: &StopTarget, gate: &mut dyn Gate) -> Result<Outcome, Refusal> {
+    kill_on(&Live, t, gate)
 }
 
 pub(crate) fn kill_on(
     host: &impl Host,
     t: &StopTarget,
-    recheck: &mut dyn FnMut() -> Result<(), Refusal>,
+    gate: &mut dyn Gate,
 ) -> Result<Outcome, Refusal> {
     let started = Instant::now();
-    recheck()?;
-    check_identity(t.id, host.liveness(t.id.pid))?;
-    signal(host, t.id, libc::SIGKILL)?;
+    gate.check(t.id)?;
+    gate.intend(t.id, "SIGKILL")?;
+    signal_exact(host, t.id, libc::SIGKILL)?;
     let after_ms = started.elapsed().as_millis() as u64;
     if wait_gone(host, t.id, KILL_GRACE) {
         Ok(Outcome::Exited {
@@ -396,7 +470,19 @@ pub(crate) fn kill_on(
     }
 }
 
-fn signal(host: &impl Host, id: ProcId, sig: libc::c_int) -> Result<(), Refusal> {
+/// Steps 3 and 4: the watch, the identity, the watch again, then the signal.
+fn signal_exact(host: &impl Host, id: ProcId, sig: libc::c_int) -> Result<(), Refusal> {
+    let watch = host.watch(id.pid).map_err(|e| match e.raw_os_error() {
+        Some(libc::ESRCH) => Refusal::Changed { pid: id.pid },
+        _ => Refusal::SignalFailed {
+            pid: id.pid,
+            error: format!("cannot watch it: {e}"),
+        },
+    })?;
+    check_identity(id, host.liveness(id.pid))?;
+    if watch.exited() {
+        return Err(Refusal::Changed { pid: id.pid });
+    }
     match host.signal(id.pid, sig) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Err(Refusal::Changed { pid: id.pid }),
@@ -533,6 +619,8 @@ mod tests {
         reused_as: Option<i64>,
         /// The process exits on its own once `liveness` has been asked this many times.
         exits_after: Cell<Option<usize>>,
+        /// The watch reports an exit that came after the identity was read.
+        exits_after_identity: bool,
         ignores_term: bool,
         log: RefCell<Vec<&'static str>>,
     }
@@ -543,6 +631,14 @@ mod tests {
                 self.exited.set(true);
             }
             self.exited.get()
+        }
+    }
+
+    struct FakeWatch(bool);
+
+    impl Watch for FakeWatch {
+        fn exited(&self) -> bool {
+            self.0
         }
     }
 
@@ -567,6 +663,14 @@ mod tests {
             Some(true)
         }
 
+        fn watch(&self, _pid: i32) -> std::io::Result<Box<dyn Watch>> {
+            self.log.borrow_mut().push("watch");
+            if self.gone() {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(Box::new(FakeWatch(self.exits_after_identity)))
+        }
+
         fn signal(&self, _pid: i32, sig: libc::c_int) -> std::io::Result<()> {
             let kill = sig == libc::SIGKILL;
             self.log
@@ -578,6 +682,37 @@ mod tests {
             if kill || !self.ignores_term {
                 self.exited.set(true);
             }
+            Ok(())
+        }
+    }
+
+    /// A gate that allows everything and logs, in the host's log, each time it is asked.
+    struct Logged<'a>(&'a RefCell<Vec<&'static str>>);
+
+    impl Gate for Logged<'_> {
+        fn check(&mut self, _: ProcId) -> Result<(), Refusal> {
+            self.0.borrow_mut().push("check");
+            Ok(())
+        }
+
+        fn intend(&mut self, _: ProcId, signal: &str) -> Result<(), Refusal> {
+            self.0.borrow_mut().push(match signal {
+                "SIGKILL" => "intend SIGKILL",
+                _ => "intend SIGTERM",
+            });
+            Ok(())
+        }
+    }
+
+    /// The gate of a stop that nothing else constrains, for the live tests below.
+    struct Open;
+
+    impl Gate for Open {
+        fn check(&mut self, _: ProcId) -> Result<(), Refusal> {
+            Ok(())
+        }
+
+        fn intend(&mut self, _: ProcId, _: &str) -> Result<(), Refusal> {
             Ok(())
         }
     }
@@ -594,6 +729,10 @@ mod tests {
         }
     }
 
+    fn stop_fake(host: &Fake, t: &StopTarget, kill: bool) -> Result<Outcome, Refusal> {
+        stop_on(host, t, kill, Duration::ZERO, &mut Logged(&host.log))
+    }
+
     #[test]
     fn a_pid_reused_during_the_port_check_is_not_signalled() {
         let host = Fake {
@@ -601,19 +740,22 @@ mod tests {
             ..Fake::default()
         };
         assert_eq!(
-            stop_on(&host, &fake_target(true), true, Duration::ZERO),
+            stop_fake(&host, &fake_target(true), true),
             Err(Refusal::Changed { pid: 500 })
         );
-        assert_eq!(*host.log.borrow(), ["holds_port", "liveness"]);
+        assert_eq!(
+            *host.log.borrow(),
+            ["holds_port", "check", "intend SIGTERM", "watch", "liveness"]
+        );
     }
 
     #[test]
-    fn each_signal_comes_right_after_an_identity_check() {
+    fn each_signal_comes_after_the_gate_the_audit_the_watch_and_the_identity() {
         let host = Fake {
             ignores_term: true,
             ..Fake::default()
         };
-        let out = stop_on(&host, &fake_target(true), true, Duration::ZERO).unwrap();
+        let out = stop_fake(&host, &fake_target(true), true).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGKILL"),
             "{out:?}"
@@ -622,14 +764,69 @@ mod tests {
             *host.log.borrow(),
             [
                 "holds_port",
+                "check",
+                "intend SIGTERM",
+                "watch",
                 "liveness",
                 "SIGTERM",
                 "liveness",
+                "check",
+                "intend SIGKILL",
+                "watch",
                 "liveness",
                 "SIGKILL",
                 "liveness"
             ]
         );
+    }
+
+    #[test]
+    fn a_process_that_exits_after_its_identity_is_read_is_not_signalled() {
+        let host = Fake {
+            exits_after_identity: true,
+            ..Fake::default()
+        };
+        assert_eq!(
+            stop_fake(&host, &fake_target(false), false),
+            Err(Refusal::Changed { pid: 500 })
+        );
+        assert_eq!(
+            *host.log.borrow(),
+            ["check", "intend SIGTERM", "watch", "liveness"]
+        );
+    }
+
+    #[test]
+    fn a_gate_that_refuses_or_cannot_audit_sends_nothing() {
+        struct No(Refusal, bool);
+        impl Gate for No {
+            fn check(&mut self, _: ProcId) -> Result<(), Refusal> {
+                if self.1 { Err(self.0.clone()) } else { Ok(()) }
+            }
+            fn intend(&mut self, _: ProcId, _: &str) -> Result<(), Refusal> {
+                Err(self.0.clone())
+            }
+        }
+        for refusal in [
+            Refusal::Disabled {
+                config: "~/.config/scry/config.toml".into(),
+                line: Some(3),
+            },
+            Refusal::Unaudited {
+                error: "disk full".into(),
+            },
+        ] {
+            for at_check in [true, false] {
+                let host = Fake::default();
+                let mut gate = No(refusal.clone(), at_check);
+                let got = stop_on(&host, &fake_target(false), true, Duration::ZERO, &mut gate);
+                assert_eq!(got, Err(refusal.clone()));
+                assert!(host.log.borrow().is_empty(), "{:?}", host.log.borrow());
+                let got = kill_on(&host, &fake_target(false), &mut gate);
+                assert_eq!(got, Err(refusal.clone()));
+                assert!(host.log.borrow().is_empty());
+            }
+        }
     }
 
     #[test]
@@ -640,7 +837,7 @@ mod tests {
             exits_after: Cell::new(Some(2)),
             ..Fake::default()
         };
-        let out = stop_on(&host, &fake_target(false), true, Duration::ZERO).unwrap();
+        let out = stop_fake(&host, &fake_target(false), true).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGTERM"),
             "{out:?}"
@@ -653,7 +850,7 @@ mod tests {
             exits_after: Cell::new(Some(3)),
             ..Fake::default()
         };
-        let out = stop_on(&host, &fake_target(false), true, Duration::ZERO).unwrap();
+        let out = stop_fake(&host, &fake_target(false), true).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGTERM"),
             "{out:?}"
@@ -694,7 +891,7 @@ mod tests {
         let (mut child, mut t) = spawn(false);
         t.id.start_us += 1;
         assert_eq!(
-            stop(&t, true, Duration::from_millis(200)),
+            stop(&t, true, Duration::from_millis(200), &mut Open),
             Err(Refusal::Changed { pid: t.id.pid })
         );
         assert!(child.try_wait().unwrap().is_none(), "still running");
@@ -705,7 +902,7 @@ mod tests {
     #[test]
     fn sigterm_stops_a_process_and_reports_it() {
         let (mut child, t) = spawn(false);
-        let out = stop(&t, false, TERM_GRACE).unwrap();
+        let out = stop(&t, false, TERM_GRACE, &mut Open).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGTERM"),
             "{out:?}"
@@ -717,10 +914,10 @@ mod tests {
     #[test]
     fn sigkill_comes_only_with_kill() {
         let (mut child, t) = spawn(true);
-        let out = stop(&t, false, Duration::from_millis(300)).unwrap();
+        let out = stop(&t, false, Duration::from_millis(300), &mut Open).unwrap();
         assert!(matches!(out, Outcome::StillRunning { .. }), "{out:?}");
         assert!(child.try_wait().unwrap().is_none());
-        let out = stop(&t, true, Duration::from_millis(300)).unwrap();
+        let out = stop(&t, true, Duration::from_millis(300), &mut Open).unwrap();
         assert!(
             matches!(out, Outcome::Exited { ref signal, .. } if signal == "SIGKILL"),
             "{out:?}"
@@ -733,7 +930,7 @@ mod tests {
         let (mut child, mut t) = spawn(false);
         t.port = Some((Proto::Tcp, 1));
         assert_eq!(
-            stop(&t, false, TERM_GRACE),
+            stop(&t, false, TERM_GRACE, &mut Open),
             Err(Refusal::NotHolding {
                 pid: t.id.pid,
                 port: ":1".into()

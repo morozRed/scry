@@ -13,6 +13,7 @@ use scry::tui::theme::{Colors, Look, Rgb, SHIPPED, Theme};
 use scry::tui::ui;
 use scry_core::ProcId;
 use scry_core::control::Outcome;
+use scry_core::keep::KeepAs;
 use scry_core::reap::{Done, ReapTarget, Report};
 use scry_core::view::agents::AgentRow;
 use scry_core::view::{Board, Detail, Evidence, Load, State};
@@ -204,6 +205,8 @@ fn with_leftovers(design: &Board, n: usize) -> Board {
         pid,
         start_us: None,
         keep: None,
+        ancestors: 0,
+        session_id: None,
         ram: Some(48 << 20),
         ports: vec![],
         age_s: 5 * 3600,
@@ -232,12 +235,16 @@ fn with_leftovers(design: &Board, n: usize) -> Board {
     board
 }
 
-/// The design board with the keep entry a live reading gives each process row.
+/// The design board with the keep entry a live reading gives each process row: the real
+/// path of the script node runs.
 fn keepable(design: &Board) -> Board {
     let mut board = design.clone();
     if let Load::Ready(rows) = &mut board.agents {
         for r in rows.iter_mut().filter(|r| r.depth > 0) {
-            r.keep = Some(r.label.clone());
+            let tool = r.label.split(' ').next().unwrap_or("node");
+            r.keep = Some(KeepAs::Entry(format!(
+                "~/sources/acme/node_modules/{tool}/dist/bin/{tool}"
+            )));
         }
     }
     board
@@ -262,6 +269,7 @@ fn confirmed(app: &mut App) {
                 },
                 command: t.command.clone(),
                 session: t.session.clone().unwrap_or_default(),
+                session_id: None,
                 evidence: t.evidence,
                 ram: t.frees,
             },
@@ -274,6 +282,7 @@ fn confirmed(app: &mut App) {
                 }
             }),
             refusal: None,
+            unaudited: None,
         })
         .collect();
     let req = Request {

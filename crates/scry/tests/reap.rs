@@ -43,6 +43,20 @@ struct Fixture {
 impl Fixture {
     /// The agent has exited and both of its processes have gone to launchd.
     fn new(config: &str) -> Fixture {
+        // Unique among the tests running at once in this binary, which a clock reading is
+        // not, and across runs.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let session = format!(
+            "{:02x}{:06x}-4b5a-4968-8776-a5b4c3d2e1f0",
+            n & 0xff,
+            std::process::id() & 0xff_ffff
+        );
+        Fixture::with_session(config, &session)
+    }
+
+    fn with_session(config: &str, session: &str) -> Fixture {
+        let session = session.to_string();
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("scry");
         std::fs::create_dir_all(&home).unwrap();
@@ -51,15 +65,6 @@ impl Fixture {
         std::fs::create_dir_all(&dir).unwrap();
         let agent_exe = dir.join("9.9.9");
         std::fs::copy(std::env::current_exe().unwrap(), &agent_exe).unwrap();
-        // Unique among the tests running at once in this binary, which a clock reading is
-        // not, and across runs: `--session` matches the first 8 characters.
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let session = format!(
-            "{:02x}{:06x}-4b5a-4968-8776-a5b4c3d2e1f0",
-            n & 0xff,
-            std::process::id() & 0xff_ffff
-        );
 
         let mut agent = Command::new(&agent_exe);
         agent
@@ -209,22 +214,22 @@ fn reaping_the_m2_fixture_kills_its_tree_children_first_and_nothing_else() {
     }
     assert!(alive(f.bystander.id() as i32), "the bystander still runs");
 
-    // Each accepted action is audited, in order.
+    // Each signal is audited before it is sent, and its outcome after, in order.
     let audit = f.audit();
-    assert_eq!(audit.len(), 2, "{audit:?}");
-    assert!(
-        audit[0].1.starts_with(&format!("pid {g} started ")),
-        "{audit:?}"
-    );
-    assert!(
-        audit[1].1.starts_with(&format!("pid {c} started ")),
-        "{audit:?}"
-    );
-    assert!(
-        audit
-            .iter()
-            .all(|a| a.0 == "reap" && a.2.starts_with("exited after SIGTERM"))
-    );
+    assert_eq!(audit.len(), 4, "{audit:?}");
+    for (row, pid, said) in [
+        (&audit[0], g, "sending SIGTERM"),
+        (&audit[1], g, "exited after SIGTERM"),
+        (&audit[2], c, "sending SIGTERM"),
+        (&audit[3], c, "exited after SIGTERM"),
+    ] {
+        assert_eq!(row.0, "reap", "{audit:?}");
+        assert!(
+            row.1.starts_with(&format!("pid {pid} started ")),
+            "{audit:?}"
+        );
+        assert!(row.2.starts_with(said), "{audit:?}");
+    }
 
     // Nothing left to reap.
     let (code, v) = f.json(&["reap", "--yes", "--json", "--session", &f.session]);
@@ -259,6 +264,40 @@ fn destructive_false_refuses_and_names_its_line() {
     );
     assert!(alive(f.child) && alive(f.grandchild));
     assert!(f.audit().is_empty());
+
+    // Keeping only spares, so it is allowed, and it is audited before and after.
+    let (code, v) = f.json(&["keep", &f.child.to_string(), "--json"]);
+    assert_eq!(code, Some(0), "{v:#}");
+    let audit = f.audit();
+    let said: Vec<(&str, &str)> = audit.iter().map(|a| (a.0.as_str(), a.2.as_str())).collect();
+    assert_eq!(
+        said,
+        [("keep", "adding at line 4"), ("keep", "added at line 4")],
+        "{audit:?}"
+    );
+}
+
+#[test]
+fn nothing_is_signalled_when_the_audit_table_cannot_be_written() {
+    let f = Fixture::new(ON);
+    // A directory where the store would be: it cannot be opened, so no row can be written.
+    std::fs::create_dir_all(f.home.join("state/scry.db")).unwrap();
+    let (code, v) = f.json(&["reap", "--yes", "--json", "--session", &f.session]);
+    assert_eq!(code, Some(1), "{v:#}");
+    assert_eq!(v["refusal"]["refused"], "unaudited", "{v:#}");
+    let (code, v) = f.json(&["stop", &f.child.to_string(), "--yes", "--json"]);
+    assert_eq!(code, Some(1), "{v:#}");
+    assert_eq!(v["refusal"]["refused"], "unaudited", "{v:#}");
+    let out = f.scry(&["keep", &f.child.to_string()]);
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{said}");
+    assert!(said.contains("audit row could not be written"), "{said}");
+    assert!(alive(f.child) && alive(f.grandchild));
+    assert_eq!(
+        std::fs::read_to_string(f.home.join("config.toml")).unwrap(),
+        ON,
+        "the keep list is not written either"
+    );
 }
 
 #[test]
@@ -295,6 +334,55 @@ fn a_kept_process_is_not_listed_again() {
     let (code, v) = f.json(&["keep", &child, "--json"]);
     assert_eq!(code, Some(0));
     assert_eq!(v["edit"]["already"], true);
+}
+
+#[test]
+fn session_takes_a_full_id_exactly_and_a_prefix_only_when_one_session_has_it() {
+    // Two sessions whose ids share their first 8 characters, and more.
+    let shared = format!(
+        "{:08x}",
+        0xe000_0000u32 | (std::process::id() & 0x0fff_ffff)
+    );
+    let a = Fixture::with_session(ON, &format!("{shared}-aaaa-4968-8776-a5b4c3d2e1f0"));
+    let b = Fixture::with_session(ON, &format!("{shared}-bbbb-4968-8776-a5b4c3d2e1f0"));
+    let dry = |session: &str| a.json(&["reap", "--dry-run", "--json", "--session", session]);
+
+    let (code, v) = dry(&a.session);
+    assert_eq!(code, Some(0), "{v:#}");
+    let (ac, ag) = (a.child as i64, a.grandchild as i64);
+    assert_eq!(pids(&v["targets"]), [ag, ac], "only a's: {v:#}");
+    let (code, v) = dry(&format!("{shared}-bbbb"));
+    assert_eq!(code, Some(0), "{v:#}");
+    assert_eq!(
+        pids(&v["targets"]),
+        [b.grandchild as i64, b.child as i64],
+        "{v:#}"
+    );
+
+    // A prefix both share, or an id neither has, selects nothing.
+    for session in [shared.clone(), format!("{shared}-")] {
+        let (code, v) = dry(&session);
+        assert_eq!(code, Some(1), "{session}: {v:#}");
+        assert_eq!(v["refusal"]["refused"], "ambiguous_session", "{v:#}");
+        let listed = v["message"].as_str().unwrap();
+        assert!(
+            listed.contains(&a.session) && listed.contains(&b.session),
+            "{listed}"
+        );
+    }
+    let (code, v) = dry(&format!("{}-0000", a.session));
+    assert_eq!(code, Some(0), "{v:#}");
+    assert_eq!(v["targets"], Value::Array(vec![]), "{v:#}");
+    assert!(
+        v["message"].as_str().unwrap().starts_with("No session"),
+        "{v:#}"
+    );
+    let (code, v) = a.json(&["reap", "--yes", "--json", "--session", &shared]);
+    assert_eq!(code, Some(1), "{v:#}");
+    for f in [&a, &b] {
+        assert!(alive(f.child) && alive(f.grandchild));
+    }
+    assert!(a.audit().is_empty());
 }
 
 /// The fixture agent's body, run only inside the copied binary: like Claude Code, it hands

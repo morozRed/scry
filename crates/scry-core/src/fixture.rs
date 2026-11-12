@@ -76,6 +76,7 @@ mod tests {
                 worker: false,
                 tty: None,
                 role: None,
+                script: None,
             }],
             ..Snapshot::default()
         }

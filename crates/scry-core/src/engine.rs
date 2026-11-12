@@ -15,7 +15,7 @@ use crate::label::{self, CommandLabel, Facts, LiveFiles};
 use crate::model::{ProcId, Project, Proto, Snapshot, Stamps};
 use crate::sys::procinfo::ArgsReader;
 use crate::sys::pulse::PulseSampler;
-use crate::{project, sys};
+use crate::{keep, project, sys};
 
 /// Which of the viewer's processes get a command label. Building one can look up each
 /// argument as a file, and every CLI command builds a fresh engine, so a command labels only
@@ -41,6 +41,9 @@ struct Args {
     stamps: Stamps,
     worker: bool,
     role: Option<Role>,
+    /// For an interpreter, the real path of its script, resolved against the working
+    /// directory it had when the arguments were read.
+    script: Option<String>,
     /// The label and the listening ports it was built with. It is built again when they change.
     label: Option<(Vec<u16>, CommandLabel)>,
 }
@@ -114,10 +117,22 @@ impl Engine {
                         .as_deref()
                         .and_then(|exe| catalog::classify(exe, &read.argv))
                         .map(|r| r.role);
+                    let script = p
+                        .exe
+                        .as_deref()
+                        .filter(|exe| keep::is_runner(exe))
+                        .and_then(|_| {
+                            keep::script_of(
+                                &read.argv,
+                                p.cwd.as_deref().map(Path::new),
+                                &self.files,
+                            )
+                        });
                     self.args.insert(
                         p.id,
                         Args {
                             role,
+                            script,
                             exe: p.exe.clone(),
                             worker: label::multiprocessing_worker(&read.argv),
                             argv: read.argv,
@@ -143,6 +158,7 @@ impl Engine {
                 p.stamps = a.stamps.clone();
                 p.worker = a.worker;
                 p.role = a.role;
+                p.script = a.script.clone();
             }
             if let Some(cwd) = &p.cwd {
                 p.project = roots

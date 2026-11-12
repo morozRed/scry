@@ -642,9 +642,23 @@ impl LiveFiles {
         self.seen.get_mut().clear();
     }
 
+    /// The path of the file `path` names after every symlink and `..` in it, when it is an
+    /// existing file on a local volume.
+    pub fn real_file(&self, path: &Path) -> Option<PathBuf> {
+        match self.resolve(path, true)? {
+            (Kind::File, real) => Some(real),
+            _ => None,
+        }
+    }
+
     /// What `path` is after its symlinks, or only those before its last component when
     /// `follow` is false. `None` when it is missing or reaches a volume that is not local.
     fn kind(&self, path: &Path, follow: bool) -> Option<Kind> {
+        self.resolve(path, follow).map(|(kind, _)| kind)
+    }
+
+    /// [`LiveFiles::kind`], with the path it reached.
+    fn resolve(&self, path: &Path, follow: bool) -> Option<(Kind, PathBuf)> {
         if !path.is_absolute() {
             return None;
         }
@@ -674,14 +688,14 @@ impl LiveFiles {
                     }
                     push_components(&mut todo, &target);
                 }
-                Seen::Link(_) => return Some(Kind::Other),
+                Seen::Link(_) => return Some((Kind::Other, next)),
                 Seen::Is(k) => {
                     real = next;
                     kind = k;
                 }
             }
         }
-        Some(kind)
+        Some((kind, real))
     }
 
     /// What one component is, looked up once. `path`'s parent holds no symlinks.

@@ -283,12 +283,15 @@ pub struct Target {
     pub start_us: Option<i64>,
     pub command: String,
     pub session: Option<String>,
+    /// The full id of the session it was listed under; see [`agents::AgentRow`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub evidence: Option<Evidence>,
     pub age_s: u64,
     pub frees: Option<u64>,
-    /// The keep-list entry that would spare it; see [`crate::keep`].
+    /// The keep-list entry that would spare it, or why there is none; see [`crate::keep`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keep: Option<String>,
+    pub keep: Option<crate::keep::KeepAs>,
 }
 
 /// The header strip. Each metric is `None` while it warms up.
