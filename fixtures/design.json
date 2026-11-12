@@ -213,8 +213,8 @@
         "project": "notes",
         "project_kind": "git",
         "session": {
-          "agent": "claude_code",
-          "id": "c41d0b9a-5e2f-4a7b-8d16-3f9e0c2a7b58",
+          "agent": "opencode",
+          "id": "ses_0c3n5a9e2f7b4d1c8a6e3f0b2d",
           "key": "SCRY_SESSION"
         },
         "age_secs": 720,

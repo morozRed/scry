@@ -9,6 +9,7 @@ use crate::config::{Config, DEFAULT_SAMPLE_INTERVAL_SECS, Source};
 use crate::daemon::{Status, StoreStatus};
 use crate::launch_agent::{Launchd, Spec, stable_program};
 use crate::paths::Paths;
+use crate::protected::{Protected, Resolved};
 use crate::sys;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -145,13 +146,20 @@ fn check_scan() -> Check {
     }
 }
 
+/// Each code root is resolved through [`Protected`] first: a root in Desktop, Documents or
+/// Downloads is reported unchecked, since even a `stat` inside one makes macOS ask.
 fn check_config(paths: &Paths, config: &Config, source: &Source) -> Check {
-    let missing: Vec<String> = config
-        .code_roots
-        .iter()
-        .filter(|r| !r.is_dir())
-        .map(|r| paths.tilde(r))
-        .collect();
+    let guard = Protected::new(&paths.user_home);
+    let mut missing = Vec::new();
+    let mut shown = Vec::new();
+    for r in &config.code_roots {
+        let name = paths.tilde(r);
+        match guard.resolve(r) {
+            Resolved::Inside(_) => shown.push(format!("{name} (not checked: protected folder)")),
+            Resolved::Outside(p) if p.is_dir() => shown.push(name),
+            Resolved::Outside(_) | Resolved::Unresolvable => missing.push(name),
+        }
+    }
     let origin = match source {
         Source::Defaults => "no config file, using defaults".to_string(),
         Source::File(p) => paths.tilde(p),
@@ -166,11 +174,10 @@ fn check_config(paths: &Paths, config: &Config, source: &Source) -> Check {
             ),
         );
     }
-    let roots: Vec<String> = config.code_roots.iter().map(|r| paths.tilde(r)).collect();
-    let roots = if roots.is_empty() {
+    let roots = if shown.is_empty() {
         "no code roots".to_string()
     } else {
-        format!("code roots {}", roots.join(", "))
+        format!("code roots {}", shown.join(", "))
     };
     ok("config", format!("{origin}; {roots}"))
 }
@@ -473,6 +480,7 @@ mod tests {
     use crate::daemon::Runtime;
     use crate::launch_agent::{LABEL, PlistContents};
     use crate::model::DiskSample;
+    use std::fs;
 
     fn runtime(pid: i32, interval_secs: u64, up_secs: i64) -> Runtime {
         Runtime {
@@ -703,5 +711,40 @@ mod tests {
         assert_eq!(human_duration(Duration::from_secs(600)), "10 min");
         assert_eq!(human_duration(Duration::from_secs(3 * 3600)), "3 h");
         assert_eq!(human_duration(Duration::from_secs(3 * 86_400)), "3 d");
+    }
+
+    #[test]
+    fn a_code_root_in_a_protected_folder_is_not_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(home.join("Documents")).unwrap();
+        fs::create_dir_all(home.join("code")).unwrap();
+        std::os::unix::fs::symlink(home.join("Documents"), home.join("docs")).unwrap();
+        let paths = Paths::new(home.clone(), Some(home.join("scry")));
+        let origin = home.join("scry/config.toml");
+        let check = |roots: &str| {
+            let text = format!("code_roots = [{roots}]\n");
+            let config = Config::parse(&text, &paths, &origin).unwrap();
+            check_config(&paths, &config, &Source::Defaults)
+        };
+        // Nothing inside Documents exists, so a stat there would say it is missing.
+        let c = check(r#""~/code", "~/Documents/app", "~/docs/web""#);
+        assert_eq!(c.level, Level::Ok, "{c:?}");
+        assert!(
+            c.detail
+                .contains("~/Documents/app (not checked: protected folder)")
+                && c.detail
+                    .contains("~/docs/web (not checked: protected folder)")
+                && c.detail.contains("~/code,"),
+            "{}",
+            c.detail
+        );
+        let c = check(r#""~/gone", "~/Documents/app""#);
+        assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.detail.contains("code root ~/gone does not exist"),
+            "{}",
+            c.detail
+        );
     }
 }

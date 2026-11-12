@@ -1173,3 +1173,151 @@ fn moving_back_names_both_paths_when_it_cannot() {
     assert!(e.contains("something else now stands"), "{e}");
     assert!(from.exists() && to.exists());
 }
+
+/// Xcode's DerivedData holding what SwiftPM clones: a mirror of an upstream repository and a
+/// checkout of it at a detached HEAD, as Xcode leaves them. Returns the DerivedData folder
+/// and the checkout.
+fn derived_data(h: &Home) -> (PathBuf, PathBuf) {
+    let up = h.home.join("up/pkg");
+    new_repo(&h.home, &up);
+    let dd = h.home.join("Library/Developer/Xcode/DerivedData");
+    let packages = dd.join("App-abc/SourcePackages");
+    let mirror = packages.join("repositories/pkg-1a2b");
+    let checkout = packages.join("checkouts/pkg");
+    let s = |p: &Path| p.to_str().unwrap().to_string();
+    git(
+        &h.home,
+        &[
+            "clone",
+            "-q",
+            "--mirror",
+            &s(&h.home.join("pkg.git")),
+            &s(&mirror),
+        ],
+    );
+    git(&h.home, &["clone", "-q", &s(&mirror), &s(&checkout)]);
+    git(&checkout, &["checkout", "-q", "--detach", "HEAD"]);
+    write(&dd.join("App-abc/Build/Products/app.o"), "built\n");
+    (dd, checkout)
+}
+
+fn delete_derived_data(h: &Home, dd: &Path) -> Result<Done, Refusal> {
+    let it = item(&h.home, "xcode-derived-data");
+    assert_eq!(it.path, dd);
+    assert!(
+        matches!(allows(&it, true), Allows::Delete { .. }),
+        "{:?}",
+        allows(&it, true)
+    );
+    let p = plan(&it, true).unwrap();
+    execute(&p, p.word.as_deref(), &ctx(h))
+}
+
+#[test]
+fn a_cache_whose_only_repositories_are_clean_tool_clones_is_cleaned_up() {
+    let h = home();
+    let (dd, _) = derived_data(&h);
+    let done = delete_derived_data(&h, &dd);
+    assert!(done.is_ok(), "{done:?}");
+    assert!(!dd.exists());
+    assert!(
+        h.home.join("pkg.git/HEAD").exists(),
+        "the upstream is untouched"
+    );
+}
+
+#[test]
+fn a_tool_clone_holding_local_work_still_blocks_its_cache() {
+    type Change = fn(&Path);
+    let changes: [(&str, Change, &str); 4] = [
+        (
+            "an edit",
+            |c| write(&c.join("README"), "mine\n"),
+            "local changes",
+        ),
+        (
+            "an untracked file",
+            |c| write(&c.join("notes.txt"), "x\n"),
+            "local changes",
+        ),
+        (
+            "a local commit",
+            |c| {
+                write(&c.join("fix.txt"), "fix\n");
+                git(c, &["add", "."]);
+                git(c, &["commit", "-qm", "fix"]);
+            },
+            "commits that no remote-tracking branch holds",
+        ),
+        (
+            "a stash",
+            |c| {
+                write(&c.join("README"), "stashed\n");
+                git(c, &["stash", "-q"]);
+            },
+            "has a stash",
+        ),
+    ];
+    for (what, change, said) in changes {
+        let h = home();
+        let (dd, checkout) = derived_data(&h);
+        change(&checkout);
+        let r = delete_derived_data(&h, &dd);
+        assert!(
+            matches!(&r, Err(Refusal::Holds { what: w, .. })
+                if w.contains("checkouts/pkg") && w.contains(said)),
+            "{what}: {r:?}"
+        );
+        assert!(checkout.join(".git/HEAD").exists(), "{what}: kept");
+    }
+}
+
+#[test]
+fn a_repository_outside_the_tool_clone_table_still_blocks_its_cache() {
+    // A clone where SwiftPM keeps none, and a bare repository that mirrors nothing.
+    for at in [
+        "App-abc/Build/vendored",
+        "App-abc/SourcePackages/repositories/own",
+    ] {
+        let h = home();
+        let (dd, _) = derived_data(&h);
+        let repo = dd.join(at);
+        if at.ends_with("own") {
+            git(&h.home, &["init", "-q", "--bare", repo.to_str().unwrap()]);
+            let p = plan(&item(&h.home, "xcode-derived-data"), true).unwrap();
+            let r = execute(&p, p.word.as_deref(), &ctx(&h));
+            assert!(
+                matches!(&r, Err(Refusal::Holds { what, .. }) if what.contains("not a mirror")),
+                "{at}: {r:?}"
+            );
+        } else {
+            new_repo(&h.home, &repo);
+            let it = item(&h.home, "xcode-derived-data");
+            assert!(
+                matches!(&allows(&it, true), Allows::Never { why } if why.contains("vendored")),
+                "{at}: {:?}",
+                allows(&it, true)
+            );
+        }
+        assert!(dd.exists(), "{at}");
+    }
+}
+
+#[test]
+fn yarns_git_dependency_clones_are_regenerable_until_they_hold_work() {
+    for dirty in [false, true] {
+        let h = home();
+        let cache = h.home.join("Library/Caches/Yarn");
+        let dep = cache.join("v6/npm-pkg-1.0.0-abc-integrity/node_modules/pkg");
+        new_repo(&h.home, &dep);
+        let plain = "v6/npm-left-pad-1.3.0-abc-integrity/node_modules/left-pad/index.js";
+        write(&cache.join(plain), "x\n");
+        if dirty {
+            write(&dep.join("README"), "patched\n");
+        }
+        let p = plan(&item(&h.home, "yarn-cache"), true).unwrap();
+        let r = execute(&p, p.word.as_deref(), &ctx(&h));
+        assert_eq!(r.is_ok(), !dirty, "dirty {dirty}: {r:?}");
+        assert_eq!(cache.exists(), dirty);
+    }
+}

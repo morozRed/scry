@@ -108,31 +108,52 @@ impl Blocker {
 /// The keys that stop user hooks from running.
 const BLOCKING: [&str; 2] = ["allowManagedHooksOnly", "disableAllHooks"];
 
+/// Keys that steer how managed sources are read and set no policy, so a source holding only
+/// these delivers nothing.
+const CONTROL: [&str; 2] = ["managedSourcesBehavior", "wslInheritsWindowsSettings"];
+
+/// The files of one managed source, in the order their values apply.
+type Source = [(PathBuf, Value)];
+
+/// Whether a source sets any key besides the control keys.
+fn delivers(source: &Source) -> bool {
+    source.iter().any(|(_, v)| {
+        v.as_object().is_some_and(|m| {
+            m.iter()
+                .any(|(k, v)| !CONTROL.contains(&k.as_str()) && !v.is_null())
+        })
+    })
+}
+
 /// Reads the managed settings for the keys that would stop a user hook, as Claude Code
-/// applies them: the first source that sets any key wins whole (MDM preferences before the
-/// files), unless one sets `managedSourcesBehavior` to `merge`, when any source's `true`
-/// holds. Within a source, later files replace earlier values. A file that cannot be read
-/// is an error, since it could hold either key.
+/// selects among its managed sources. They rank MDM preferences first, then the files;
+/// server-managed settings rank above both, and Scry cannot read them. By default the
+/// highest-ranked source that delivers a policy key (any key but the control keys) applies
+/// alone, so an MDM profile holding only control keys leaves the files in force.
+/// `managedSourcesBehavior` is read only from the highest-ranked source that sets it or a
+/// policy key, so a lower source cannot opt itself into merging; under `merge` every source
+/// that delivers applies, and a lock any of them sets holds. Within a source, later files
+/// replace earlier values. A file that cannot be read is an error, since it could hold
+/// either key.
 pub fn managed_blockers(sources: &ManagedSources) -> Result<Vec<Blocker>> {
     let mut prefs = Vec::new();
     for p in sources.preferences.iter().filter(|p| p.is_file()) {
         prefs.push((p.clone(), read_plist(p)?));
     }
     let files = read_managed_files(&sources.files)?;
-    let merge = prefs
+    let ranked: [&Source; 2] = [&prefs, &files];
+    let behavior = ranked
         .iter()
-        .chain(&files)
-        .any(|(_, v)| v.get("managedSourcesBehavior") == Some(&json!("merge")));
-    let delivers = |list: &[(PathBuf, Value)]| {
-        list.iter()
-            .any(|(_, v)| v.as_object().is_some_and(|m| !m.is_empty()))
-    };
-    let chosen: Vec<&[(PathBuf, Value)]> = if merge {
-        vec![&prefs, &files]
-    } else if delivers(&prefs) {
-        vec![&prefs]
+        .find(|s| delivers(s) || s.iter().any(|(_, v)| v.get(CONTROL[0]).is_some()))
+        .and_then(|s| s.iter().rev().find_map(|(_, v)| v.get(CONTROL[0])));
+    let chosen: Vec<&Source> = if behavior == Some(&json!("merge")) {
+        ranked.into_iter().filter(|s| delivers(s)).collect()
     } else {
-        vec![&files]
+        ranked
+            .into_iter()
+            .find(|s| delivers(s))
+            .into_iter()
+            .collect()
     };
     let mut out = Vec::new();
     for key in BLOCKING {
@@ -224,13 +245,20 @@ impl Plan {
     /// new text to a temporary file and renames it over, keeping the old file's mode. A
     /// symlinked `settings.json` is written through to its target, so the link stays.
     /// Returns the backup's path, `None` when there was no file to back up.
+    ///
+    /// A save made meanwhile is never overwritten knowingly: the file is read through a
+    /// descriptor and compared with the plan's text last, and right before the rename the
+    /// path and that descriptor must still show the same inode, size, mtime and ctime. A new
+    /// file is linked in place, which fails if one appeared. What is left is the moment
+    /// between that last look and the rename itself, a few system calls long, and a write
+    /// that keeps the size and lands within the same nanosecond timestamps.
     pub fn apply(&self, now_ms: i64) -> Result<Option<PathBuf>> {
-        self.apply_then(now_ms, || {})
+        self.apply_then(now_ms, |_| {})
     }
 
-    /// [`Plan::apply`], running `meanwhile` after the new text is written and before the
-    /// file is compared and replaced, so a test can change the file in between.
-    fn apply_then(&self, now_ms: i64, meanwhile: impl FnOnce()) -> Result<Option<PathBuf>> {
+    /// [`Plan::apply`], calling `meanwhile` once the new text is written and again once the
+    /// file has been compared, so a test can change the file at either point.
+    fn apply_then(&self, now_ms: i64, mut meanwhile: impl FnMut(Step)) -> Result<Option<PathBuf>> {
         if !self.changes() {
             return Ok(None);
         }
@@ -255,20 +283,96 @@ impl Plan {
             .map_or("settings.json".into(), |n| n.to_string_lossy());
         let tmp = target.with_file_name(format!(".{name}.scry-{now_ms}"));
         write_new(&tmp, &self.after, mode)?;
-        meanwhile();
-        // Compared last, so a save made while the files above were written is not lost.
-        if fs::read_to_string(&target).ok() != self.before {
+        meanwhile(Step::Written);
+        let refuse = || {
             let _ = fs::remove_file(&tmp);
             if let Some(b) = &backup {
                 let _ = fs::remove_file(b);
             }
-            bail!(
+            anyhow::anyhow!(
                 "{} changed while Scry was working; nothing was written. Run the command again",
                 self.path.display()
-            );
+            )
+        };
+        // Compared last, so a save made while the files above were written is not lost.
+        let open = match fs::File::open(&target) {
+            Ok(f) => Some(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                let _ = refuse();
+                return Err(e).with_context(|| format!("reading {}", target.display()));
+            }
+        };
+        let now = open.as_ref().and_then(|mut f| {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut f, &mut text)
+                .ok()
+                .map(|_| text)
+        });
+        if now != self.before {
+            return Err(refuse());
         }
-        fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))?;
+        let read = open.as_ref().map(|f| f.metadata().map(|m| Stamp::of(&m)));
+        meanwhile(Step::Compared);
+        match (open, read) {
+            (Some(f), Some(Ok(read))) => {
+                // The last look: the file read is still the one at the path, unchanged.
+                let held = f.metadata().map(|m| Stamp::of(&m)).ok();
+                let named = fs::metadata(&target).map(|m| Stamp::of(&m)).ok();
+                if held != Some(read) || named != Some(read) {
+                    return Err(refuse());
+                }
+                fs::rename(&tmp, &target)
+                    .with_context(|| format!("replacing {}", target.display()))?;
+            }
+            (None, _) => {
+                // A link fails where a file now stands, so one saved meanwhile is kept.
+                match fs::hard_link(&tmp, &target) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&tmp);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Err(refuse());
+                    }
+                    Err(e) => {
+                        let _ = refuse();
+                        return Err(e).with_context(|| format!("creating {}", target.display()));
+                    }
+                }
+            }
+            (Some(_), _) => return Err(refuse()),
+        }
         Ok(backup)
+    }
+}
+
+/// Where [`Plan::apply_then`] lets a test in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Written,
+    Compared,
+}
+
+/// A file's identity and its last change, as `stat` gives them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(m: &fs::Metadata) -> Stamp {
+        use std::os::unix::fs::MetadataExt;
+        Stamp {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.size(),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        }
     }
 }
 
@@ -715,6 +819,52 @@ mod tests {
     }
 
     #[test]
+    fn only_the_highest_source_with_a_policy_key_is_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("managed-settings.json");
+        fs::write(&file, r#"{"allowManagedHooksOnly": true}"#).unwrap();
+        let sources = ManagedSources {
+            preferences: vec![tmp.path().join(format!("{PREFERENCES_DOMAIN}.plist"))],
+            files: vec![file.clone()],
+        };
+        let locked = [Blocker {
+            file: file.clone(),
+            key: "allowManagedHooksOnly",
+        }];
+        // A profile with control keys alone delivers no policy, so the file applies.
+        plist(
+            tmp.path(),
+            "<key>wslInheritsWindowsSettings</key><true/>\
+             <key>managedSourcesBehavior</key><string>first-wins</string>",
+        );
+        assert_eq!(managed_blockers(&sources).unwrap(), locked);
+
+        // A profile with a policy key wins, and the file cannot opt itself into merging.
+        plist(tmp.path(), "<key>model</key><string>opus</string>");
+        fs::write(
+            &file,
+            r#"{"allowManagedHooksOnly": true, "managedSourcesBehavior": "merge"}"#,
+        )
+        .unwrap();
+        assert_eq!(managed_blockers(&sources).unwrap(), []);
+
+        // The highest source asking for a merge does merge, and the file's lock holds.
+        plist(
+            tmp.path(),
+            "<key>model</key><string>opus</string>\
+             <key>managedSourcesBehavior</key><string>merge</string>",
+        );
+        assert_eq!(managed_blockers(&sources).unwrap(), locked);
+
+        // With no profile at all, the file is the highest source and decides alone.
+        fs::remove_file(tmp.path().join(format!("{PREFERENCES_DOMAIN}.plist"))).unwrap();
+        assert_eq!(managed_blockers(&sources).unwrap(), locked);
+        // A file of control keys alone delivers nothing either.
+        fs::write(&file, r#"{"wslInheritsWindowsSettings": true}"#).unwrap();
+        assert_eq!(managed_blockers(&sources).unwrap(), []);
+    }
+
+    #[test]
     fn exec_form_needs_a_recent_claude_code() {
         assert!(check_exec_form("2.1.322 (Claude Code)").is_ok());
         assert!(check_exec_form("2.1.139 (Claude Code)").is_ok());
@@ -765,12 +915,80 @@ mod tests {
         let plan = plan_install(&path, Some(existing()), Path::new(SCRY)).unwrap();
         let theirs = existing().replace("opus", "sonnet");
         let err = plan
-            .apply_then(10, || fs::write(&path, &theirs).unwrap())
+            .apply_then(10, |step| {
+                if step == Step::Written {
+                    fs::write(&path, &theirs).unwrap()
+                }
+            })
             .unwrap_err();
         assert!(err.to_string().contains("changed"), "{err}");
         assert_eq!(fs::read_to_string(&path).unwrap(), theirs);
         let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
         assert_eq!(left.len(), 1, "no backup or temp file left: {left:?}");
+    }
+
+    #[test]
+    fn a_change_saved_after_the_compare_is_kept() {
+        let theirs = existing().replace("opus", "fast");
+        // Rewritten in place, same size; replaced by a rename of the same text; created
+        // where there was no file.
+        type Change<'a> = Box<dyn Fn(&Path) + 'a>;
+        let changes: [(&str, Change); 3] = [
+            (
+                "in place",
+                Box::new(|p: &Path| fs::write(p, &theirs).unwrap()),
+            ),
+            (
+                "renamed over",
+                Box::new(|p: &Path| {
+                    let other = p.with_file_name("editor-save");
+                    fs::write(&other, existing()).unwrap();
+                    fs::rename(&other, p).unwrap();
+                }),
+            ),
+            (
+                "created",
+                Box::new(|p: &Path| fs::write(p, &theirs).unwrap()),
+            ),
+        ];
+        for (how, change) in changes {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("settings.json");
+            let before = (how != "created").then(existing);
+            if let Some(text) = &before {
+                fs::write(&path, text).unwrap();
+            }
+            let plan = plan_install(&path, before, Path::new(SCRY)).unwrap();
+            let kept = {
+                let err = plan
+                    .apply_then(11, |step| {
+                        if step == Step::Compared {
+                            change(&path)
+                        }
+                    })
+                    .unwrap_err();
+                assert!(err.to_string().contains("changed"), "{how}: {err}");
+                fs::read_to_string(&path).unwrap()
+            };
+            assert_ne!(kept, plan.after, "{how}: overwritten");
+            let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
+            assert_eq!(
+                left.len(),
+                1,
+                "{how}: no backup or temp file left: {left:?}"
+            );
+        }
+        // Without a change, a new file is created.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        let plan = plan_install(&path, None, Path::new(SCRY)).unwrap();
+        assert_eq!(plan.apply(12).unwrap(), None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), plan.after);
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "no temp file left"
+        );
     }
 
     #[test]
