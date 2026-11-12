@@ -1,6 +1,7 @@
 mod daemon_cmd;
 mod doctor_cmd;
-mod tui;
+
+use scry::tui;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;

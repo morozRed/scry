@@ -1,0 +1,132 @@
+//! The detail pane: the selected row in one sentence, then the evidence. Below the list it
+//! packs facts onto the title line; beside it each fact gets a line.
+
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
+use scry_core::view::Detail;
+
+use unicode_width::UnicodeWidthStr;
+
+use super::{fill, pad, width, wrapped_lines};
+use crate::tui::theme::{Chrome, Theme};
+
+const EVIDENCE: &str = "evidence  ";
+
+fn block(theme: &Theme, beside: bool) -> Block<'static> {
+    match theme.chrome {
+        Chrome::Bands => Block::new().padding(Padding::new(2, 2, u16::from(beside), 0)),
+        Chrome::Rules => Block::new().padding(Padding::horizontal(1)),
+    }
+}
+
+/// Rows the pane needs to show `d` whole below a list `width` columns wide.
+pub fn height(theme: &Theme, d: &Detail, width: u16) -> u16 {
+    let room = block(theme, false).inner(Rect::new(0, 0, width, 1)).width;
+    let evidence: u16 = d
+        .evidence
+        .iter()
+        .map(|e| wrapped_lines(&format!("{EVIDENCE}{e}"), room))
+        .sum();
+    1 + wrapped_lines(&d.sentence, room) + evidence
+}
+
+pub fn detail(f: &mut Frame, area: Rect, theme: &Theme, d: &Detail, beside: bool) {
+    if theme.chrome == Chrome::Bands {
+        fill(f, area, theme.surface);
+    }
+    let block = block(theme, beside);
+    let lines = if beside {
+        tall(theme, d)
+    } else {
+        wide(theme, d, block.inner(area).width as usize)
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// Facts share the title line; the ones that do not fit are left for the wider layout.
+fn wide<'a>(theme: &Theme, d: &'a Detail, room: usize) -> Vec<Line<'a>> {
+    let mut head = vec![Span::styled(d.title.as_str(), theme.strong)];
+    for (i, fact) in d.facts.iter().enumerate() {
+        let sep = if i == 0 { "   " } else { "  ·  " };
+        let more = [
+            Span::styled(sep, theme.faint),
+            Span::styled(format!("{} ", fact.label), theme.muted),
+            Span::styled(fact.value.as_str(), theme.text),
+        ];
+        if width(&head) + width(&more) > room {
+            break;
+        }
+        head.extend(more);
+    }
+    let mut lines = vec![
+        Line::from(head),
+        Line::styled(d.sentence.as_str(), theme.text),
+    ];
+    for e in &d.evidence {
+        lines.push(Line::from(vec![
+            Span::styled(EVIDENCE, theme.muted),
+            Span::styled(e.as_str(), theme.text.add_modifier(Modifier::ITALIC)),
+        ]));
+    }
+    lines
+}
+
+fn tall<'a>(theme: &Theme, d: &'a Detail) -> Vec<Line<'a>> {
+    let mut lines = vec![Line::styled(d.title.as_str(), theme.strong), Line::raw("")];
+    let cols = d.facts.iter().map(|f| f.label.width()).max().unwrap_or(0) + 2;
+    for fact in &d.facts {
+        lines.push(Line::from(vec![
+            Span::styled(pad(&fact.label, cols), theme.muted),
+            Span::styled(fact.value.as_str(), theme.text),
+        ]));
+    }
+    if !d.facts.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::styled(d.sentence.as_str(), theme.text));
+    if !d.evidence.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Evidence", theme.heading));
+        for e in &d.evidence {
+            lines.push(Line::from(vec![
+                Span::styled("· ", theme.faint),
+                Span::styled(e.as_str(), theme.text.add_modifier(Modifier::ITALIC)),
+            ]));
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use scry_core::view::Fact;
+
+    use super::*;
+    use crate::tui::theme::{Colors, Look};
+
+    #[test]
+    fn labels_pad_to_the_widest_in_display_columns() {
+        let fact = |label: &str| Fact {
+            label: label.into(),
+            value: "v".into(),
+        };
+        let d = Detail {
+            title: "t".into(),
+            facts: vec![fact("pid"), fact("東京"), fact("cafe\u{301}")],
+            sentence: "s".into(),
+            evidence: vec![],
+        };
+        let lines = tall(&Theme::new(Look::Tinted, Colors::Mono), &d);
+        for line in &lines[2..5] {
+            assert_eq!(line.spans[0].content.width(), 6, "{line:?}");
+        }
+    }
+}

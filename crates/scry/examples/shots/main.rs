@@ -1,0 +1,226 @@
+//! Renders TUI frames from fixtures as SVG into docs/screens.
+//! `cargo run -p scry --example shots`; `scripts/shots.sh` also makes PNGs.
+
+mod svg;
+
+use std::path::{Path, PathBuf};
+
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use scry::tui::app::{App, Source};
+use scry::tui::theme::{Colors, Look, Rgb, SHIPPED, Theme};
+use scry::tui::ui;
+use scry_core::view::agents::AgentRow;
+use scry_core::view::{Board, Detail, Evidence, Load, State};
+use svg::{Palette, SOLARIZED_LIGHT, TERMINAL_BASIC, TOMORROW_NIGHT};
+
+const SIZES: [(u16, u16); 2] = [(80, 24), (120, 40)];
+const PALETTES: [&Palette; 2] = [&TERMINAL_BASIC, &TOMORROW_NIGHT];
+
+fn main() -> anyhow::Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let out = root.join("docs/screens");
+    std::fs::create_dir_all(out.join("compare"))?;
+    let design = Board::parse(&std::fs::read_to_string(root.join("fixtures/design.json"))?)?;
+    let long = with_leftovers(&design, 20);
+    let shots = Shots { out: &out };
+    let mut n = 0;
+
+    for (look, name) in [(Look::Native, "native"), (Look::Tinted, "tinted")] {
+        for pal in PALETTES {
+            let theme = || Theme::new(look, colors(look, pal));
+            for (w, h) in SIZES {
+                let file = format!("compare/{name}-{}-{w}x{h}", pal.name);
+                n += shots.take(&file, &design, theme(), "3jj", pal, (w, h))?;
+            }
+            let file = format!("compare/{name}-{}-sheet", pal.name);
+            n += shots.take(&file, &design, theme(), "3X", pal, (120, 40))?;
+        }
+    }
+
+    let views = [
+        ("overview", ""),
+        ("ports", "2jj"),
+        ("agents", "3jj"),
+        ("disk", "4"),
+        ("worktrees", "5"),
+    ];
+    for pal in PALETTES {
+        let theme = || Theme::new(SHIPPED, colors(SHIPPED, pal));
+        let p = pal.name;
+        for (view, keys) in views {
+            for size in SIZES {
+                let (w, h) = size;
+                n += shots.take(
+                    &format!("{view}-{p}-{w}x{h}"),
+                    &design,
+                    theme(),
+                    keys,
+                    pal,
+                    size,
+                )?;
+            }
+        }
+        for (name, board, keys, size) in [
+            ("agents-{p}-150x40", &design, "3jj", (150, 40)),
+            ("ports-{p}-150x40", &design, "2jj", (150, 40)),
+            ("sheet-{p}", &design, "3X", (120, 40)),
+            ("sheet-long-{p}", &long, "3X", (80, 24)),
+            ("sheet-long-end-{p}", &long, "3XG", (80, 24)),
+            ("sheet-long-{p}-150x40", &long, "3X", (150, 40)),
+            ("filter-{p}", &design, "3/vite", (80, 24)),
+            ("help-{p}", &design, "3?", (80, 24)),
+        ] {
+            let name = name.replace("{p}", p);
+            n += shots.take(&name, board, theme(), keys, pal, size)?;
+        }
+        let ansi = || Theme::new(SHIPPED, Colors::Ansi);
+        n += shots.take(&format!("ansi-{p}"), &design, ansi(), "3jj", pal, (80, 24))?;
+        n += shots.take(
+            &format!("ansi-{p}-150x40"),
+            &design,
+            ansi(),
+            "3jj",
+            pal,
+            (150, 40),
+        )?;
+        n += shots.take(
+            &format!("ansi-sheet-long-{p}"),
+            &long,
+            ansi(),
+            "3X",
+            pal,
+            (80, 24),
+        )?;
+        let mut states = design.clone();
+        for (state, load) in [
+            ("loading", Load::Loading),
+            (
+                "failed",
+                Load::Failed("sysctl net.inet.tcp.pcblist_n returned EPERM.".into()),
+            ),
+            ("empty", Load::Ready(Vec::new())),
+        ] {
+            states.ports = load;
+            let name = format!("state-{state}-{p}");
+            n += shots.take(&name, &states, theme(), "2", pal, (80, 24))?;
+        }
+    }
+    let sol = &SOLARIZED_LIGHT;
+    n += shots.take(
+        "agents-solarized-light-80x24",
+        &design,
+        Theme::new(SHIPPED, colors(SHIPPED, sol)),
+        "3jj",
+        sol,
+        (80, 24),
+    )?;
+    let mono = Theme::new(SHIPPED, Colors::Mono);
+    n += shots.take(
+        "no-color-dark",
+        &design,
+        mono,
+        "3jj",
+        &TOMORROW_NIGHT,
+        (80, 24),
+    )?;
+
+    println!("Wrote {n} screens to {}.", out.canonicalize()?.display());
+    Ok(())
+}
+
+/// The colours a terminal with this palette would report: truecolor for the tinted look,
+/// which reads the background, and the palette itself for the ANSI looks.
+fn colors(look: Look, pal: &Palette) -> Colors {
+    match look {
+        Look::Tinted => Colors::True {
+            bg: Rgb(pal.bg.0, pal.bg.1, pal.bg.2),
+            fg: Rgb(pal.fg.0, pal.fg.1, pal.fg.2),
+        },
+        _ => Colors::Ansi,
+    }
+}
+
+/// The design board with one more ended session that left `n` processes, for a reap
+/// sheet longer than the screen.
+fn with_leftovers(design: &Board, n: usize) -> Board {
+    let mut board = design.clone();
+    let Load::Ready(rows) = &mut board.agents else {
+        return board;
+    };
+    let row = |id: String, depth: u8, label: String, pid, state, evidence| AgentRow {
+        id,
+        depth,
+        label,
+        context: (depth == 0).then(|| "acme/batch".into()),
+        pid,
+        ram: Some(48 << 20),
+        ports: vec![],
+        age_s: 5 * 3600,
+        evidence,
+        state: Some(state),
+        detail: Detail::default(),
+    };
+    rows.push(row(
+        "s-batch".into(),
+        0,
+        "claude".into(),
+        None,
+        State::Ended,
+        None,
+    ));
+    for i in 0..n {
+        rows.push(row(
+            format!("w-{i}"),
+            1,
+            format!("node worker-{i:02}"),
+            Some(61000 + i as i32),
+            State::Leftover,
+            Some(Evidence::Stamp),
+        ));
+    }
+    board
+}
+
+struct Shots<'a> {
+    out: &'a Path,
+}
+
+impl Shots<'_> {
+    fn take(
+        &self,
+        name: &str,
+        board: &Board,
+        theme: Theme,
+        keys: &str,
+        pal: &Palette,
+        (w, h): (u16, u16),
+    ) -> anyhow::Result<usize> {
+        let mut app = App::new(
+            board.clone(),
+            Source::Fixture(PathBuf::from("design.json")),
+            theme,
+        );
+        let mut term = Terminal::new(TestBackend::new(w, h))?;
+        // Keys act on the columns last drawn, as in the real loop.
+        term.draw(|f| {
+            ui::draw(f, &app);
+        })?;
+        for c in keys.chars() {
+            let code = match c {
+                '\n' => KeyCode::Enter,
+                c => KeyCode::Char(c),
+            };
+            app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        term.draw(|f| {
+            ui::draw(f, &app);
+        })?;
+        std::fs::write(
+            self.out.join(format!("{name}.svg")),
+            svg::render(term.backend().buffer(), pal),
+        )?;
+        Ok(1)
+    }
+}

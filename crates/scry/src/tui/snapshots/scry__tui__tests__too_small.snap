@@ -1,6 +1,6 @@
 ---
-source: crates/scry/src/tui.rs
-expression: "render(&app(), 60, 10)"
+source: crates/scry/src/tui/tests.rs
+expression: "render(&typical(), 60, 10)"
 ---
 "Terminal too small. Scry needs 80×24, this one is 60×10.    "
 "                                                            "
