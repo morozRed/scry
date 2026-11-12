@@ -51,13 +51,14 @@ impl Fixture {
         std::fs::create_dir_all(&dir).unwrap();
         let agent_exe = dir.join("9.9.9");
         std::fs::copy(std::env::current_exe().unwrap(), &agent_exe).unwrap();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
+        // Unique among the tests running at once in this binary, which a clock reading is
+        // not, and across runs: `--session` matches the first 8 characters.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let session = format!(
-            "{:08x}-4b5a-4968-8776-a5b4c3d2e1f0",
-            nanos ^ std::process::id()
+            "{:02x}{:06x}-4b5a-4968-8776-a5b4c3d2e1f0",
+            n & 0xff,
+            std::process::id() & 0xff_ffff
         );
 
         let mut agent = Command::new(&agent_exe);
@@ -249,7 +250,7 @@ fn destructive_false_refuses_and_names_its_line() {
     assert_eq!(v["refusal"]["refused"], "disabled", "{v:#}");
     // The dry run still lists, and says it would be refused.
     let v = f.dry_run();
-    assert_eq!(pids(&v["targets"]).len(), 2);
+    assert_eq!(pids(&v["targets"]).len(), 2, "{v:#}");
     assert!(
         v["disabled"]
             .as_str()
