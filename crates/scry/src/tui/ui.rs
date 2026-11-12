@@ -52,10 +52,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
         Constraint::Length(1),
     ])
     .areas(area);
-    let source = app
-        .freshness(Instant::now())
-        .unwrap_or_else(|| app.source.label());
-    chrome::header(f, header, theme, &app.board, &source);
+    chrome::header(f, header, theme, &app.board, &app.activity(Instant::now()));
     let badges = Tab::ALL.map(|t| (views::view(t).badge)(&app.board));
     chrome::tabs(f, tabs, theme, app.tab, badges);
     if rules {

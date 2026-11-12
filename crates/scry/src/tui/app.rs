@@ -9,16 +9,21 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use scry_core::engine::Labels;
-use scry_core::view::{Board, Load, Tab, Target, Tone, human_age};
+use scry_core::view::{Board, Load, Tab, Target, Tone};
 
 use super::theme::Theme;
 use super::ui::MIN_W;
 use super::views::{self, Query, Row, Shown, Sort};
 
 const TOAST_FOR: Duration = Duration::from_secs(4);
-/// A scan shorter than this never shows "refreshing…", so a quick automatic refresh does not
-/// flicker in the header.
+/// A scan shorter than this never shows the spinner, so a quick automatic refresh changes
+/// nothing on screen.
 const SHOW_SCAN_AFTER: Duration = Duration::from_millis(300);
+/// A reading that takes longer than this also says what it is doing, beside the spinner.
+const SAY_SCAN_AFTER: Duration = Duration::from_secs(1);
+/// The header's spinner while a reading is in flight, drawn muted at 10 frames a second.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SPIN_FRAME: Duration = Duration::from_millis(100);
 const PAGE: isize = 10;
 
 pub enum Source {
@@ -112,17 +117,15 @@ pub struct ViewState {
     pub offset: Cell<usize>,
 }
 
-/// How fresh the live data is, for the header. A fixture never changes, so it has none.
+/// Which live readings are in flight, for the header. A fixture never changes, so it has none.
 #[derive(Debug, Default)]
 pub struct Fresh {
-    /// When the last process scan finished.
-    pub updated: Option<Instant>,
     /// When the process scan in progress started.
     pub scanning: Option<Instant>,
     /// `r` asked for the scan in progress: it shows at once and ends with a toast.
     pub asked: bool,
-    /// A worktree scan is running.
-    pub worktrees: bool,
+    /// When the worktree scan in progress started.
+    pub worktrees: Option<Instant>,
     /// When the last worktree scan, sizes included, finished.
     pub worktrees_at: Option<Instant>,
 }
@@ -262,44 +265,76 @@ impl App {
         });
     }
 
-    /// The header's word on the data: "updated 3s ago", "refreshing…", or what the worktree
-    /// scan is doing while its view is open. `None` for a fixture.
-    pub fn freshness(&self, now: Instant) -> Option<String> {
-        if !matches!(self.source, Source::Live) {
-            return None;
-        }
+    /// Whether a new board would put anything different on screen in this view: the header,
+    /// the tab badges or the rows. Sort keys are left out, since they hold exact numbers,
+    /// such as an age in seconds, under text that moves less often.
+    pub fn looks_the_same(&self, board: &Board) -> bool {
+        let header = |b: &Board| match &b.pulse {
+            Some(p) => (Some(p.clone()), None),
+            None => (None, Some(b.overview.counts_line())),
+        };
+        let badges = |b: &Board| Tab::ALL.map(|t| (views::view(t).badge)(b));
+        let rows = |b: &Board| (views::view(self.tab).rows)(b);
+        header(&self.board) == header(board)
+            && badges(&self.board) == badges(board)
+            && match (rows(&self.board), rows(board)) {
+                (Load::Ready(a), Load::Ready(b)) => {
+                    a.len() == b.len() && a.iter().zip(&b).all(|(a, b)| a.looks_like(b))
+                }
+                (a, b) => a == b,
+            }
+    }
+
+    /// The reading in flight that this view waits on: when it started, and what to call it
+    /// once it is slow.
+    fn reading(&self) -> Option<(Instant, &'static str)> {
         let f = &self.fresh;
-        if self.tab == Tab::Worktrees && f.worktrees {
+        if self.tab == Tab::Worktrees
+            && let Some(started) = f.worktrees
+        {
             let sizing = self.board.worktrees.ready().is_some_and(|w| w.sizing);
             let doing = if sizing {
                 "measuring sizes…"
             } else {
                 "reading worktrees…"
             };
-            return Some(doing.into());
+            return Some((started, doing));
         }
-        let shows = |started: Instant| f.asked || now.duration_since(started) >= SHOW_SCAN_AFTER;
-        if f.scanning.is_some_and(shows) {
-            return Some("refreshing…".into());
-        }
-        // The worktree view is as fresh as its own, slower reading.
-        let updated = match self.tab {
-            Tab::Worktrees => f.worktrees_at,
-            _ => f.updated,
-        };
-        Some(match updated {
-            None => "reading…".into(),
-            Some(t) => match now.duration_since(t).as_secs() {
-                0 => "updated just now".into(),
-                s => format!("updated {} ago", human_age(s)),
-            },
-        })
+        f.scanning.map(|started| (started, "refreshing…"))
     }
 
-    /// When `freshness` changes by itself with nothing arriving: a slow scan starts to show.
-    pub fn freshness_due(&self) -> Option<Instant> {
-        let f = &self.fresh;
-        f.scanning.filter(|_| !f.asked).map(|t| t + SHOW_SCAN_AFTER)
+    /// The header's right end: a fixture's name, or for live data a spinner while a reading
+    /// runs and nothing when idle. A quick automatic reading never shows; one that `r` asked
+    /// for shows at once, and one past a second says what it is doing.
+    pub fn activity(&self, now: Instant) -> String {
+        if !matches!(self.source, Source::Live) {
+            return self.source.label();
+        }
+        let Some((started, doing)) = self.reading() else {
+            return String::new();
+        };
+        let ran = now.saturating_duration_since(started);
+        if !self.fresh.asked && ran < SHOW_SCAN_AFTER {
+            return String::new();
+        }
+        let frame = SPINNER[(ran.as_millis() / SPIN_FRAME.as_millis()) as usize % SPINNER.len()];
+        if ran >= SAY_SCAN_AFTER {
+            format!("{frame} {doing}")
+        } else {
+            frame.to_string()
+        }
+    }
+
+    /// When `activity` changes by itself with nothing arriving: the spinner appears or
+    /// turns. `None` while nothing is read.
+    pub fn activity_due(&self, now: Instant) -> Option<Instant> {
+        let (started, _) = self.reading()?;
+        let ran = now.saturating_duration_since(started);
+        if !self.fresh.asked && ran < SHOW_SCAN_AFTER {
+            return Some(started + SHOW_SCAN_AFTER);
+        }
+        let frames = ran.as_millis() / SPIN_FRAME.as_millis() + 1;
+        Some(started + SPIN_FRAME * frames as u32)
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {

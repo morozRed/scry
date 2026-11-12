@@ -129,6 +129,19 @@ impl Row {
             _ => None,
         })
     }
+
+    /// The same on screen: text, nesting and detail, whatever the sort keys under the text.
+    pub fn looks_like(&self, other: &Row) -> bool {
+        self.id == other.id
+            && self.depth == other.depth
+            && self.detail == other.detail
+            && self.cells.len() == other.cells.len()
+            && self
+                .cells
+                .iter()
+                .zip(&other.cells)
+                .all(|(a, b)| a.text == b.text && a.context == b.context && a.kind == b.kind)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

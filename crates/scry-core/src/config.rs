@@ -9,7 +9,7 @@
 //! sample_interval_secs = 600               # disk sampling period
 //!
 //! [tui]
-//! refresh_secs = 2                         # 1 to 60; 0 refreshes only on `r`
+//! refresh_secs = 5                         # 1 to 60; 0 refreshes only on `r`
 //! ```
 
 use std::fmt;
@@ -21,7 +21,7 @@ use crate::paths::{Paths, fnv1a};
 
 pub const DEFAULT_CODE_ROOTS: [&str; 4] = ["~/sources", "~/code", "~/src", "~/Developer"];
 pub const DEFAULT_SAMPLE_INTERVAL_SECS: u64 = 600;
-pub const DEFAULT_REFRESH_SECS: u64 = 2;
+pub const DEFAULT_REFRESH_SECS: u64 = 5;
 pub const MAX_REFRESH_SECS: u64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,7 +212,7 @@ mod tests {
         assert!(!c.destructive);
         assert!(c.keep.is_empty());
         assert_eq!(c.daemon.sample_interval_secs, 600);
-        assert_eq!(c.tui.refresh_secs, 2);
+        assert_eq!(c.tui.refresh_secs, 5);
     }
 
     #[test]
@@ -220,9 +220,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = paths(tmp.path());
         let parse = |text: &str| Config::parse(text, &p, Path::new("/x/config.toml"));
-        assert_eq!(parse("").unwrap().tui.refresh_secs, 2);
-        assert_eq!(parse("[tui]\n").unwrap().tui.refresh_secs, 2);
-        for secs in [0, 1, 5, 60] {
+        assert_eq!(parse("").unwrap().tui.refresh_secs, 5);
+        assert_eq!(parse("[tui]\n").unwrap().tui.refresh_secs, 5);
+        for secs in [0, 1, 2, 60] {
             let c = parse(&format!("[tui]\nrefresh_secs = {secs}\n")).unwrap();
             assert_eq!(c.tui.refresh_secs, secs);
             assert_eq!(c.fingerprint, parse("").unwrap().fingerprint);

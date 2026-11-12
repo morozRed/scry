@@ -880,34 +880,99 @@ fn first_run_states_say_what_would_fill_each_view() {
     assert!(screen(&render(&a, 80, 24)).contains("No process on this Mac is accepting"));
 }
 
+/// The header row, wide enough for the design board's pulse and the spinner's words.
+fn header(a: &App) -> String {
+    lines(&render(a, 120, 40)).remove(0)
+}
+
 #[test]
-fn the_header_says_how_fresh_live_data_is() {
+fn the_idle_header_shows_no_clock() {
+    let a = App::new(design_board(), Source::Live, mono());
+    insta::assert_snapshot!("header_idle", header(&a));
+}
+
+#[test]
+fn the_header_spins_while_a_slow_refresh_runs() {
+    let mut a = App::new(design_board(), Source::Live, mono());
+    // 1.55 s in: frame 15 of the spinner, past the second after which it says what it does.
+    a.fresh.scanning = Instant::now().checked_sub(Duration::from_millis(1550));
+    insta::assert_snapshot!("header_refreshing", header(&a));
+}
+
+#[test]
+fn the_spinner_shows_only_while_a_scan_is_slow_or_asked_for() {
     let mut a = App::new(design_board(), Source::Live, mono());
     let now = Instant::now();
-    // Wide enough for the design board's pulse and the word on freshness.
-    let header = |a: &App| lines(&render(a, 120, 40)).remove(0);
-    assert!(header(&a).ends_with("reading… "), "{}", header(&a));
-    a.fresh.updated = Some(now);
-    assert!(header(&a).ends_with("updated just now "));
-    a.fresh.updated = now.checked_sub(Duration::from_secs(75));
-    assert!(header(&a).ends_with("updated 1m ago "), "{}", header(&a));
-    // A quick automatic scan never shows; one that `r` asked for shows at once.
+    assert_eq!(a.activity(now), "");
+    assert_eq!(a.activity_due(now), None, "idle wakes for nothing");
+    // A quick automatic scan never shows.
     a.fresh.scanning = Some(now);
-    assert_eq!(a.freshness(now).as_deref(), Some("updated 1m ago"));
-    let later = now + Duration::from_millis(400);
-    assert_eq!(a.freshness(later).as_deref(), Some("refreshing…"));
+    assert_eq!(a.activity(now + Duration::from_millis(250)), "");
+    assert_eq!(a.activity_due(now), Some(now + Duration::from_millis(300)));
+    // Past 300 ms a quiet spinner turns, 10 frames a second, without words.
+    assert_eq!(a.activity(now + Duration::from_millis(300)), "⠸");
+    assert_eq!(a.activity(now + Duration::from_millis(450)), "⠼");
+    assert_eq!(
+        a.activity_due(now + Duration::from_millis(450)),
+        Some(now + Duration::from_millis(500))
+    );
+    // Past a second it says what it is doing.
+    assert_eq!(
+        a.activity(now + Duration::from_millis(1000)),
+        "⠋ refreshing…"
+    );
+    // One that `r` asked for spins at once.
     a.fresh.asked = true;
-    assert!(header(&a).ends_with("refreshing… "));
+    assert_eq!(a.activity(now), "⠋");
     // The worktree view tells its own scan apart.
+    a.fresh = Default::default();
     press(&mut a, "5");
-    a.fresh.worktrees = true;
-    assert!(header(&a).ends_with("reading worktrees… "));
+    a.fresh.worktrees = Some(now);
+    let slow = now + Duration::from_secs(2);
+    assert_eq!(a.activity(slow), "⠋ reading worktrees…");
     if let Load::Ready(list) = &mut a.board.worktrees {
         list.sizing = true;
     }
-    assert!(header(&a).ends_with("measuring sizes… "));
+    assert_eq!(a.activity(slow), "⠋ measuring sizes…");
     // A fixture names itself instead.
     assert!(header(&design()).ends_with("fixture design.json "));
+}
+
+#[test]
+fn an_unchanged_refresh_changes_nothing_on_screen() {
+    let mut a = App::new(design_board(), Source::Live, tinted());
+    let mut motion = super::motion::Motion::new(a.theme.motion);
+    for tab in "123".chars() {
+        press(&mut a, &tab.to_string());
+        let before = render(&a, 120, 40).buffer().clone();
+        assert!(!super::receive(&mut a, &mut motion, super::Update::Started));
+        // A few seconds later: ages move under text that still reads the same.
+        let mut board = a.board.clone();
+        if let Load::Ready(rows) = &mut board.agents {
+            rows.iter_mut().for_each(|r| r.age_s += 5);
+        }
+        if let Load::Ready(rows) = &mut board.ports {
+            for p in rows.iter_mut() {
+                p.age_secs = p.age_secs.map(|s| s + 5);
+            }
+        }
+        assert_ne!(board, a.board, "the reading itself differs");
+        let drew = super::receive(&mut a, &mut motion, super::Update::Board(Box::new(board)));
+        assert!(!drew, "tab {tab}: an unchanged reading asks for no frame");
+        assert!(!motion.running(), "tab {tab}: and makes nothing glow");
+        assert_eq!(a.activity(Instant::now()), "");
+        assert_eq!(render(&a, 120, 40).buffer(), &before, "tab {tab}");
+    }
+    // An age whose text moves is a change.
+    let mut board = a.board.clone();
+    if let Load::Ready(rows) = &mut board.agents {
+        rows[0].age_s += 3 * 86_400;
+    }
+    assert!(super::receive(
+        &mut a,
+        &mut motion,
+        super::Update::Board(Box::new(board))
+    ));
 }
 
 #[test]

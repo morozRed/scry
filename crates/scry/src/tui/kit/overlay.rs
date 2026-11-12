@@ -194,7 +194,7 @@ const KEYS: [(&str, &str, &str); 14] = [
     ("", "s  S", "sort by the next column, reverse"),
     ("Act", "x", "stop the selected process"),
     ("", "X", "reap leftovers"),
-    ("", "r", "refresh now"),
+    ("", "r", "refresh now; auto every refresh_secs (5 s)"),
     ("App", "?", "this help"),
     ("", "ctrl-z", "suspend to the shell"),
     ("", "q", "quit"),
