@@ -380,25 +380,27 @@ fn strip_restless(v: &mut serde_json::Value) {
     }
 }
 
-/// `ended 41m ago, started 2h ago` → `ended ago, started ago`.
+/// `ended 41m ago, started 2h ago` → `ended ago, started ago`, and `4s old` → `old`.
 fn without_ages(s: &str) -> String {
-    if !s.contains(" ago") {
+    if !s.contains(" ago") && !s.contains(" old") {
         return s.to_string();
     }
     let words: Vec<&str> = s.split(' ').collect();
-    let age = |w: &str| {
-        w.len() >= 2
-            && w[..w.len() - 1].bytes().all(|b| b.is_ascii_digit())
-            && matches!(w.as_bytes()[w.len() - 1], b's' | b'm' | b'h' | b'd')
+    // By bytes: a word can be `…`, whose last byte is not a character of its own.
+    let age = |w: &str| match w.as_bytes() {
+        [digits @ .., unit] if !digits.is_empty() => {
+            digits.iter().all(u8::is_ascii_digit) && matches!(unit, b's' | b'm' | b'h' | b'd')
+        }
+        _ => false,
     };
     words
         .iter()
         .enumerate()
         .filter(|&(i, w)| {
             !(age(w)
-                && words
-                    .get(i + 1)
-                    .is_some_and(|n| n.trim_end_matches([',', '.', ';', ')']) == "ago"))
+                && words.get(i + 1).is_some_and(|n| {
+                    matches!(n.trim_end_matches([',', '.', ';', ')']), "ago" | "old")
+                }))
         })
         .map(|(_, w)| *w)
         .collect::<Vec<_>>()
@@ -511,5 +513,14 @@ mod tests {
             "It holds  and :3000. Together  3 ports, "
         );
         assert_eq!(without_sizes("v2 of acme 3000M5"), "v2 of acme 3000M5");
+        // A label's `…` beside an age, as live data has it.
+        assert_eq!(
+            without_ages("`python3 …` started 2h ago, in …"),
+            "`python3 …` started ago, in …"
+        );
+        assert_eq!(
+            without_ages("It is 4s old, under the 5m grace period."),
+            "It is old, under the 5m grace period."
+        );
     }
 }
