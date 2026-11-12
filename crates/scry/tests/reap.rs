@@ -355,6 +355,10 @@ fn fixture_child() {
         .unwrap();
     println!("grandchild {}", grandchild.id());
     std::io::stdout().flush().unwrap();
+    // The agent that reads this pipe exits, and libtest writes a "running for over 60
+    // seconds" line to stdout, which would end this process on a closed pipe.
+    let null = std::fs::File::create("/dev/null").unwrap();
+    unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&null), 1) };
     // Outlives its grandchild: reaped first, the grandchild must not end this one.
     std::thread::sleep(Duration::from_secs(600));
     let _ = grandchild.wait();
