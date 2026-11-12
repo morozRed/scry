@@ -49,10 +49,24 @@ impl FromStr for Target {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct StopTarget {
     pub id: ProcId,
-    /// The command label, or the process name when there is none.
+    /// The command label, or the process name when there is none. For a multiprocessing
+    /// worker, the label of the process it works for.
     pub process: String,
+    /// The pid of that process, when the target is a worker.
+    pub worker_of: Option<i32>,
     /// Set when the target was named by port. The pid must still hold it when signalled.
     pub port: Option<(Proto, u16)>,
+}
+
+impl StopTarget {
+    /// How a confirmation names the process: `` `next dev` `` or `` a worker of `uvicorn …` ``.
+    pub fn described(&self) -> String {
+        let label = crate::view::ports::clip(&self.process, 120);
+        match self.worker_of {
+            Some(_) => format!("a worker of `{label}`"),
+            None => format!("`{label}`"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -151,9 +165,11 @@ pub fn resolve(snap: &Snapshot, target: Target) -> Result<StopTarget, Refusal> {
         });
     };
     guard(p, snap)?;
+    let parent = snap.worker_parent(p);
     Ok(StopTarget {
         id: p.id,
-        process: p.label(),
+        process: parent.unwrap_or(p).label(),
+        worker_of: parent.map(|w| w.id.pid),
         port,
     })
 }
@@ -346,6 +362,23 @@ mod tests {
         assert_eq!(t.id.pid, 1320);
         assert_eq!(t.process, "next dev");
         assert_eq!(t.port, Some((Proto::Tcp, 3000)));
+        assert_eq!(t.described(), "`next dev`");
+    }
+
+    #[test]
+    fn a_worker_is_described_by_the_process_it_works_for() {
+        let mut snap = typical();
+        let mut worker = snap.process(1320).unwrap().clone();
+        worker.id.pid = 1330;
+        worker.ppid = 1320;
+        worker.worker = true;
+        snap.processes.push(worker);
+        for s in snap.sockets.iter_mut().filter(|s| s.local_port == 3000) {
+            s.pid = 1330;
+        }
+        let t = resolve(&snap, Target::Port(3000)).unwrap();
+        assert_eq!((t.id.pid, t.worker_of), (1330, Some(1320)));
+        assert_eq!(t.described(), "a worker of `next dev`");
     }
 
     #[test]
@@ -472,6 +505,7 @@ mod tests {
                 start_us: 0,
             },
             process: "server".into(),
+            worker_of: None,
             port: port.then_some((Proto::Tcp, 3000)),
         }
     }
@@ -565,6 +599,7 @@ mod tests {
                 start_us: live.start_us,
             },
             process: "sleep".into(),
+            worker_of: None,
             port: None,
         };
         (child, t)

@@ -167,6 +167,49 @@ mod tests {
     }
 
     #[test]
+    fn stamp_values_of_any_other_shape_are_dropped() {
+        let uuid = "7f3a9c2e-1b4d-4e8a-9c3f-2a6b8d0e1f47";
+        let long = "a".repeat(65);
+        let buf = procargs(
+            &["x"],
+            &[
+                "SCRY_SESSION=Authorization: Bearer hunter2",
+                &format!("CLAUDE_CODE_SESSION_ID={uuid}"),
+                &format!("CODEX_SESSION_ID={long}"),
+                "CLAUDE_PID=+1311",
+            ],
+        );
+        let got = parse_procargs2(&buf).unwrap().stamps;
+        assert_eq!(
+            got,
+            Stamps {
+                claude_code_session_id: Some(uuid.into()),
+                ..Stamps::default()
+            }
+        );
+        for bad in [
+            "SCRY_SESSION=",
+            "SCRY_SESSION=a b",
+            "SCRY_SESSION=x\u{1b}[2J",
+            "SCRY_SESSION=../../etc",
+            "CLAUDE_PID=-1",
+            "CLAUDE_PID=1 2",
+            "CLAUDE_PID=99999999999",
+        ] {
+            let got = parse_procargs2(&procargs(&["x"], &[bad])).unwrap().stamps;
+            assert_eq!(got, Stamps::default(), "{bad}");
+        }
+        let ok = parse_procargs2(&procargs(
+            &["x"],
+            &["SCRY_SESSION=dev_1-A", "CLAUDE_PID=42"],
+        ))
+        .unwrap()
+        .stamps;
+        assert_eq!(ok.scry_session.as_deref(), Some("dev_1-A"));
+        assert_eq!(ok.claude_pid, Some(42));
+    }
+
+    #[test]
     fn apple_strings_after_the_environment_are_not_read_as_stamps() {
         let mut buf = procargs(&["x"], &[]);
         buf.extend_from_slice(b"CLAUDE_PID=1\0");

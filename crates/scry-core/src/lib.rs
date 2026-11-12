@@ -7,6 +7,7 @@ pub mod daemon_log;
 pub mod doctor;
 pub mod engine;
 pub mod fixture;
+pub mod home;
 pub mod label;
 pub mod launch_agent;
 pub mod model;

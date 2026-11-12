@@ -46,11 +46,26 @@ scry stop :3000 --json         # the outcome, or why nothing was stopped, as JSO
 ```
 
 Scry names a process by a command label such as `next dev --port 3000` or
-`docker exec … mysql …`. A label holds only the program, common subcommand words
-such as `run` and `dev`, flag names, files that exist and ports the process listens
-on. Any other argument becomes `…`, whatever it holds, so passwords and tokens
-given as values stay out of tables, `--json` and `scry snapshot`. `--show-command`
-prints the full command line as text on request; it is never part of `--json`.
+`docker exec … mysql …`. A label shows only:
+
+- the program, or for an interpreter the script it runs from a `bin` directory, so
+  `node …/.bin/next dev` reads `next dev`;
+- subcommand words from a fixed list, such as `run`, `dev` and `serve`, unless they
+  follow a flag;
+- flag names, never their values, and `--`;
+- the last part of an argument that names an existing file or directory on a local
+  volume, with your home directory as `~`;
+- the name of a program on your `PATH`;
+- a number equal to a port the process itself holds open as a listener;
+- for Python, the module after `-m`.
+
+Anything else becomes `…`, whatever it holds, so passwords and tokens given as
+values stay out of tables, `--json` and `scry snapshot`. A file, script or program
+named like your account is left out too. A Python multiprocessing worker, such as
+the server `uvicorn --reload` starts, is shown by the label of the process it works
+for, marked as a worker. `scry snapshot` writes your home directory as `~` in paths
+and replaces your account name anywhere else in them. `--show-command` prints the
+full command line as text on request; it is never part of `--json`.
 
 `scry stop` acts only on your own processes, never on system ones. Right before
 each signal it checks that the pid still belongs to the process it chose. It exits

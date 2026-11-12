@@ -8,9 +8,11 @@
 //!   its place, so `node …/.bin/next dev` reads `next dev`;
 //! - words from [`WORDS`], unless they follow a flag, which may take them as its value;
 //! - flag names, never their values. An argument right after a flag, shown or left out, may
-//!   be that flag's value, as in `redis-cli -a --pass`, so a flag there is left out too;
-//! - arguments that name an existing file or directory, as their last component, and names
-//!   of programs on `PATH`;
+//!   be that flag's value, as in `redis-cli -a --pass`, so a flag there is left out too.
+//!   Python's own options are read as Python reads them, so `-W ignore` is a flag and its
+//!   value, and `--` ends them;
+//! - arguments that name an existing file or directory on a local volume, as their last
+//!   component, and names of programs in the first [`MAX_PATH_DIRS`] directories of `PATH`;
 //! - numbers equal to a port the process listens on;
 //! - for Python, the module after `-m`. The code after `-c` or `-e` is always left out.
 //!
@@ -19,12 +21,18 @@
 //! spaces can hold words that look like flags: a title never shows a flag.
 //!
 //! A label shows at most [`MAX_SHOWN`] parts and reads at most [`MAX_ARGS`] arguments, each
-//! once and without recursion, so building one takes time linear in the command line.
+//! once and without recursion, so building one takes time linear in the command line. Table
+//! words and ports are checked before the file system, which is consulted only for the rest.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ffi::{CStr, OsString};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::home::Home;
 
 /// Stands for one or more arguments that were left out.
 pub const OMITTED: &str = "…";
@@ -34,6 +42,10 @@ pub const MAX_SHOWN: usize = 8;
 pub const MAX_ARGS: usize = 64;
 /// A longer argument is never looked up as a file.
 const MAX_ARG: usize = 1024;
+/// Programs are looked up in at most this many `PATH` directories.
+pub const MAX_PATH_DIRS: usize = 64;
+/// Symlinks followed in one lookup, as the kernel's own limit.
+const MAX_LINKS: usize = 32;
 /// Longer flag, program and module names are left out.
 const MAX_NAME: usize = 64;
 
@@ -75,6 +87,9 @@ const INTERPRETERS: [&str; 11] = [
 /// Interpreter flags whose next argument is code.
 const CODE_FLAGS: [&str; 5] = ["-c", "-e", "--eval", "-p", "--print"];
 
+/// Python's one-letter options that take no value. `-c`, `-m`, `-W` and `-X` take one.
+const PYTHON_FLAGS: &str = "bBdEhiIOPqRsSuvVx?";
+
 /// Launcher scripts lose these extensions: `vite/bin/vite.js` reads `vite`.
 const SCRIPT_EXTENSIONS: [&str; 3] = [".js", ".mjs", ".cjs"];
 
@@ -101,8 +116,11 @@ pub struct Facts<'a> {
     pub name: &'a str,
     /// The working directory, which relative paths resolve against.
     pub cwd: Option<&'a Path>,
-    /// Shown as `~` when an argument names it, so a label never holds the account name.
-    pub home: Option<&'a Path>,
+    /// An argument that names the home directory, by any name [`Home::is_home`] accepts,
+    /// shows as `~`. An existing file, a launcher script, the program and a program on
+    /// `PATH` whose name is the account name, in any case, are left out. The account name
+    /// can still show as a table word, a flag name or a Python module.
+    pub home: Option<&'a Home>,
     /// The ports the process listens on.
     pub ports: &'a [u16],
     pub files: &'a dyn Files,
@@ -144,6 +162,7 @@ impl CommandLabel {
                 b.show(tool);
                 args.next();
             }
+            None if f.home.is_some_and(|h| h.is_account(&program)) => b.omit(),
             None => b.show(program),
         }
         let mut before = Before::Free;
@@ -163,19 +182,42 @@ impl CommandLabel {
                 before = Before::Flag;
                 continue;
             }
-            if interpreter == Some("python") && a == "-m" {
-                interpreter = None;
-                b.show(a.to_string());
-                match args.next_if(|m| is_module(m)) {
-                    Some(module) => {
-                        b.show(module.to_string());
-                        before = Before::Free;
+            if interpreter == Some("python")
+                && let Some(option) = python_option(a)
+            {
+                // Python's grammar is known, so what follows a known option is never taken
+                // for its value by mistake.
+                before = Before::Free;
+                // A lone `-x` or a long name is shown; a cluster or an attached value is not.
+                let named = a.len() == 2 || a == "--check-hash-based-pycs";
+                if named {
+                    b.show(a.to_string());
+                } else {
+                    b.omit();
+                }
+                match option {
+                    Py::Flags => {}
+                    Py::End => interpreter = None,
+                    Py::Takes { value, attached } => {
+                        if value != PyValue::Option {
+                            interpreter = None;
+                        }
+                        if attached {
+                            continue;
+                        }
+                        match args.next() {
+                            Some(m) if value == PyValue::Module && named && is_module(m) => {
+                                b.show(m.to_string())
+                            }
+                            Some(_) => b.omit(),
+                            None => {}
+                        }
                     }
-                    None => before = Before::Flag,
                 }
                 continue;
             }
             before = if a == "--" {
+                interpreter = None;
                 b.show(a.to_string());
                 Before::Free
             } else if a.starts_with('-') && a.len() > 1 {
@@ -258,13 +300,17 @@ impl Builder {
         Before::Flag
     }
 
+    /// Ports and table words first: they need no lookup, and a lookup can be slow.
     fn word(&mut self, a: &str, before: Before, f: &Facts) -> Before {
-        if let Some(path) = existing(a, f) {
-            self.show(file_name(&path, f.home));
-        } else if is_port(a, f.ports)
-            || (is_program(a) && f.files.on_path(a))
-            || (before == Before::Free && WORDS.contains(&a))
-        {
+        let account = |name: &str| f.home.is_some_and(|h| h.is_account(name));
+        if is_port(a, f.ports) || (before == Before::Free && WORDS.contains(&a)) {
+            self.show(a.to_string());
+        } else if let Some(path) = existing(a, f) {
+            match file_name(&path, f.home) {
+                Some(name) => self.show(name),
+                None => self.omit(),
+            }
+        } else if is_program(a) && !account(a) && f.files.on_path(a) {
             self.show(a.to_string());
         } else {
             self.omit();
@@ -331,6 +377,7 @@ fn launcher(first: &str, f: &Facts) -> Option<String> {
     if first.starts_with('-') {
         return None;
     }
+    let account = |name: &str| f.home.is_some_and(|h| h.is_account(name));
     if let Some(path) = existing(first, f) {
         let dir = path.parent()?.file_name()?;
         if dir != "bin" && dir != ".bin" {
@@ -341,9 +388,77 @@ fn launcher(first: &str, f: &Facts) -> Option<String> {
             .iter()
             .find_map(|ext| name.strip_suffix(ext))
             .unwrap_or(&name);
-        return Some(printable(name));
+        return (!account(name)).then(|| printable(name));
     }
-    (is_program(first) && f.files.on_path(first)).then(|| first.to_string())
+    (is_program(first) && !account(first) && f.files.on_path(first)).then(|| first.to_string())
+}
+
+/// Python's options as Python reads them, or `None` for an argument that is not one.
+fn python_option(a: &str) -> Option<Py> {
+    if a == "--" {
+        return Some(Py::End);
+    }
+    if let Some(long) = a.strip_prefix("--") {
+        let attached = match long.split_once('=') {
+            Some((name, _)) => (name == "check-hash-based-pycs").then_some(true)?,
+            None => (long == "check-hash-based-pycs").then_some(false)?,
+        };
+        return Some(Py::Takes {
+            value: PyValue::Option,
+            attached,
+        });
+    }
+    let cluster = a.strip_prefix('-')?;
+    for (i, c) in cluster.char_indices() {
+        let value = match c {
+            'c' => PyValue::Code,
+            'm' => PyValue::Module,
+            'W' | 'X' => PyValue::Option,
+            c if PYTHON_FLAGS.contains(c) => continue,
+            _ => return None,
+        };
+        return Some(Py::Takes {
+            value,
+            attached: i + 1 < cluster.len(),
+        });
+    }
+    (!cluster.is_empty()).then_some(Py::Flags)
+}
+
+/// What one of Python's own options does with what follows it.
+#[derive(Clone, Copy, PartialEq)]
+enum Py {
+    /// One or more options that take no value, as `-u` or `-uB`.
+    Flags,
+    /// `--`: the script comes next.
+    End,
+    /// An option with a value, attached as in `-Wignore` or in the next argument.
+    Takes { value: PyValue, attached: bool },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PyValue {
+    /// `-c`: the rest of the arguments belong to the code.
+    Code,
+    /// `-m`: the rest belong to the module.
+    Module,
+    /// `-W`, `-X` or `--check-hash-based-pycs`: more of Python's own options may follow.
+    Option,
+}
+
+/// Whether `argv` is a Python multiprocessing child. The `spawn` start method runs
+/// `python3 [flags] -c 'from multiprocessing.spawn import spawn_main; …' --multiprocessing-fork`,
+/// and `forkserver` runs `-c 'from multiprocessing.forkserver import main; …'`, whose forks
+/// keep those arguments. A `fork` child keeps its parent's arguments and so its label.
+pub fn multiprocessing_worker(argv: &[String]) -> bool {
+    let argv = &argv[..argv.len().min(MAX_ARGS + 1)];
+    argv.iter().any(|a| a == "--multiprocessing-fork")
+        || argv.windows(2).any(|w| {
+            w[0] == "-c"
+                && ["spawn import", "forkserver import"]
+                    .iter()
+                    .any(|m| w[1].starts_with(&format!("from multiprocessing.{m} ")))
+        })
 }
 
 /// The path `a` names, when it exists. Relative paths resolve against the working directory.
@@ -360,9 +475,12 @@ fn existing(a: &str, f: &Facts) -> Option<PathBuf> {
     f.files.exists(&full).then_some(full)
 }
 
-/// The last component of an existing path, or `~` for the home directory. `..` is resolved
-/// by name first, so `/Users/dev/acme/..` is home too and never shows the account name.
-fn file_name(path: &Path, home: Option<&Path>) -> String {
+/// The last component of an existing path, `~` for the home directory, or `None` when it is
+/// the account name. `..` is resolved by name first, so `/Users/dev/acme/..` is home too.
+fn file_name(path: &Path, home: Option<&Home>) -> Option<String> {
+    if home.is_some_and(|h| h.is_home(path)) {
+        return Some("~".into());
+    }
     let mut resolved = PathBuf::new();
     for c in path.components() {
         match c {
@@ -373,13 +491,11 @@ fn file_name(path: &Path, home: Option<&Path>) -> String {
             c => resolved.push(c),
         }
     }
-    if home.is_some_and(|h| h == resolved) {
-        return "~".into();
-    }
-    match resolved.file_name() {
-        Some(n) => printable(&n.to_string_lossy()),
-        None => "/".into(),
-    }
+    let Some(name) = resolved.file_name() else {
+        return Some("/".into());
+    };
+    let name = name.to_string_lossy();
+    (!home.is_some_and(|h| h.is_account(&name))).then(|| printable(&name))
 }
 
 /// A port the process listens on, written as the port number exactly, so `03000` is not.
@@ -465,9 +581,32 @@ impl<'de> Deserialize<'de> for CommandLabel {
     }
 }
 
-/// The real file system, with programs looked up in this process's `PATH`.
+/// The real file system, with programs looked up in the first [`MAX_PATH_DIRS`] directories
+/// of this process's `PATH`. Only local volumes are consulted: a path is resolved one
+/// component at a time, following symlinks, and counts as missing once it reaches a volume
+/// the mount table does not mark local. Looking at a network or automounted volume can
+/// block for as long as its server does not answer.
 pub struct LiveFiles {
     path: Vec<PathBuf>,
+    /// Mount points of volumes that are not local.
+    remote: Vec<PathBuf>,
+    /// What each path looked up so far is. The keys hold no symlinks.
+    seen: RefCell<HashMap<PathBuf, Seen>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Seen {
+    Missing,
+    Remote,
+    Link(PathBuf),
+    Is(Kind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Dir,
+    File,
+    Other,
 }
 
 impl Default for LiveFiles {
@@ -478,24 +617,150 @@ impl Default for LiveFiles {
 
 impl LiveFiles {
     pub fn new() -> Self {
-        let path = std::env::var_os("PATH")
+        LiveFiles::with(std::env::var_os("PATH"), remote_mounts())
+    }
+
+    fn with(path: Option<OsString>, remote: Vec<PathBuf>) -> Self {
+        let path = path
             .map(|p| {
                 std::env::split_paths(&p)
                     .filter(|d| d.is_absolute())
+                    .take(MAX_PATH_DIRS)
                     .collect()
             })
             .unwrap_or_default();
-        LiveFiles { path }
+        LiveFiles {
+            path,
+            remote,
+            seen: RefCell::default(),
+        }
     }
+
+    /// Reads the mount table again and forgets what was looked up, as a new snapshot needs.
+    pub fn refresh(&mut self) {
+        self.remote = remote_mounts();
+        self.seen.get_mut().clear();
+    }
+
+    /// What `path` is after its symlinks, or only those before its last component when
+    /// `follow` is false. `None` when it is missing or reaches a volume that is not local.
+    fn kind(&self, path: &Path, follow: bool) -> Option<Kind> {
+        if !path.is_absolute() {
+            return None;
+        }
+        let mut todo = Vec::new();
+        push_components(&mut todo, path);
+        let mut real = PathBuf::from("/");
+        let mut kind = Kind::Dir;
+        let mut links = 0;
+        while let Some(name) = todo.pop() {
+            if kind != Kind::Dir {
+                return None;
+            }
+            if name == ".." {
+                real.pop();
+                continue;
+            }
+            let next = real.join(&name);
+            match self.look(&next) {
+                Seen::Missing | Seen::Remote => return None,
+                Seen::Link(target) if follow || !todo.is_empty() => {
+                    links += 1;
+                    if links > MAX_LINKS {
+                        return None;
+                    }
+                    if target.is_absolute() {
+                        real = PathBuf::from("/");
+                    }
+                    push_components(&mut todo, &target);
+                }
+                Seen::Link(_) => return Some(Kind::Other),
+                Seen::Is(k) => {
+                    real = next;
+                    kind = k;
+                }
+            }
+        }
+        Some(kind)
+    }
+
+    /// What one component is, looked up once. `path`'s parent holds no symlinks.
+    fn look(&self, path: &Path) -> Seen {
+        if let Some(s) = self.seen.borrow().get(path) {
+            return s.clone();
+        }
+        let s = if self.remote(path) {
+            Seen::Remote
+        } else {
+            match std::fs::symlink_metadata(path) {
+                Err(_) => Seen::Missing,
+                Ok(m) if m.file_type().is_symlink() => {
+                    std::fs::read_link(path).map_or(Seen::Missing, Seen::Link)
+                }
+                Ok(m) if m.is_dir() => Seen::Is(Kind::Dir),
+                Ok(m) if m.is_file() => Seen::Is(Kind::File),
+                Ok(_) => Seen::Is(Kind::Other),
+            }
+        };
+        self.seen.borrow_mut().insert(path.to_path_buf(), s.clone());
+        s
+    }
+
+    /// Whether `path` is on a volume that is not local, also through the data volume's
+    /// firmlinks, as `/home` leads to `/System/Volumes/Data/home`.
+    fn remote(&self, path: &Path) -> bool {
+        let data = Path::new("/System/Volumes/Data").join(path.strip_prefix("/").unwrap_or(path));
+        self.remote
+            .iter()
+            .any(|m| path.starts_with(m) || data.starts_with(m))
+    }
+}
+
+/// `path`'s components, last first, so popping reads them in order.
+fn push_components(todo: &mut Vec<OsString>, path: &Path) {
+    for c in path.components().rev() {
+        match c {
+            Component::Normal(n) => todo.push(n.to_os_string()),
+            Component::ParentDir => todo.push("..".into()),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+}
+
+/// Mount points without `MNT_LOCAL`, read without waiting on any of them. If the table
+/// cannot be read, every volume counts as local, as before Scry checked.
+fn remote_mounts() -> Vec<PathBuf> {
+    let n = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    // Room for mounts added between the two calls.
+    let cap = n as usize + 16;
+    let mut buf: Vec<libc::statfs> = Vec::with_capacity(cap);
+    let size = (cap * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+    let got = unsafe { libc::getfsstat(buf.as_mut_ptr(), size, libc::MNT_NOWAIT) };
+    if got <= 0 {
+        return Vec::new();
+    }
+    unsafe { buf.set_len(got as usize) };
+    buf.iter()
+        .filter(|s| s.f_flags & libc::MNT_LOCAL as u32 == 0)
+        .map(|s| {
+            let name = unsafe { CStr::from_ptr(s.f_mntonname.as_ptr()) };
+            PathBuf::from(name.to_string_lossy().into_owned())
+        })
+        .collect()
 }
 
 impl Files for LiveFiles {
     fn exists(&self, path: &Path) -> bool {
-        std::fs::symlink_metadata(path).is_ok()
+        self.kind(path, false).is_some()
     }
 
     fn on_path(&self, name: &str) -> bool {
-        self.path.iter().any(|d| d.join(name).is_file())
+        self.path
+            .iter()
+            .any(|d| self.kind(&d.join(name), true) == Some(Kind::File))
     }
 }
 
@@ -521,19 +786,223 @@ mod tests {
         "/Users/dev/acme/server.js",
         "/Users/dev/acme/bin/rails",
         "/Users/dev/acme/..",
+        "/System/Volumes/Data/Users/dev",
+        "/USERS/DEV",
+        "/Volumes/Backup/USERS/Dev",
+        "/Users/dev/acme/bin/dev",
     ]);
 
-    fn label(exe: &str, argv: &[&str], ports: &[u16]) -> String {
+    fn dev() -> Home {
+        Home::new(Path::new("/Users/dev")).unwrap()
+    }
+
+    fn label_on(files: &dyn Files, exe: &str, argv: &[&str], ports: &[u16]) -> String {
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let home = dev();
         let facts = Facts {
             exe: Some(exe),
             name: "fallback",
             cwd: Some(Path::new("/Users/dev/acme")),
-            home: Some(Path::new("/Users/dev")),
+            home: Some(&home),
             ports,
-            files: &DISK,
+            files,
         };
         CommandLabel::build(&argv, &facts).to_string()
+    }
+
+    fn label(exe: &str, argv: &[&str], ports: &[u16]) -> String {
+        label_on(&DISK, exe, argv, ports)
+    }
+
+    #[test]
+    fn home_by_any_name_is_tilde_and_the_account_name_never_shows() {
+        let l = |argv: &[&str]| label("/bin/app", argv, &[]);
+        assert_eq!(l(&["app", "/System/Volumes/Data/Users/dev"]), "app ~");
+        assert_eq!(l(&["app", "/USERS/DEV"]), "app ~");
+        assert_eq!(l(&["app", "/Volumes/Backup/USERS/Dev"]), "app …");
+        // A launcher script and a program named like the account are left out too.
+        assert_eq!(
+            label("/usr/bin/ruby", &["ruby", "bin/dev"], &[]),
+            "ruby …",
+            "not the launcher `dev`"
+        );
+        assert_eq!(label("/Users/dev/bin/DEV", &["DEV", "x"], &[]), "…");
+        assert_eq!(l(&["app", "dev"]), "app dev", "a table word is not a path");
+    }
+
+    #[test]
+    fn python_reads_its_own_options_as_python_does() {
+        let python = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python";
+        let l = |argv: &[&str]| label(python, argv, &[]);
+        // `--` ends Python's options: what follows is a script and its arguments.
+        assert_eq!(
+            l(&["python3", "--", "-m", "http.server"]),
+            "python3 -- -m …"
+        );
+        // `-W` and `-X` take a value and more options may follow.
+        assert_eq!(
+            l(&["python3", "-W", "ignore", "-m", "http.server"]),
+            "python3 -W … -m http.server"
+        );
+        assert_eq!(
+            l(&["python3", "-X", "dev", "-u", "-m", "http.server"]),
+            "python3 -X … -u -m http.server"
+        );
+        assert_eq!(
+            l(&["python3", "-Wignore", "-m", "http.server"]),
+            "python3 … -m http.server"
+        );
+        assert_eq!(
+            l(&[
+                "python3",
+                "--check-hash-based-pycs",
+                "never",
+                "-m",
+                "http.server"
+            ]),
+            "python3 --check-hash-based-pycs … -m http.server"
+        );
+        // Code is left out however it is given, and ends Python's options.
+        assert_eq!(l(&["python3", "-u", "-c", "3000"]), "python3 -u -c …");
+        assert_eq!(l(&["python3", "-uc", "x", "dev"]), "python3 … dev");
+        assert_eq!(l(&["python3", "-mhttp.server"]), "python3 …");
+        // An option Python does not have is read as any flag is.
+        assert_eq!(l(&["python3", "-p", "dev"]), "python3 -p …");
+    }
+
+    /// Answers like `DISK` and counts every lookup.
+    struct Counted(std::cell::Cell<usize>);
+
+    impl Files for Counted {
+        fn exists(&self, path: &Path) -> bool {
+            self.0.set(self.0.get() + 1);
+            DISK.exists(path)
+        }
+
+        fn on_path(&self, name: &str) -> bool {
+            self.0.set(self.0.get() + 1);
+            DISK.on_path(name)
+        }
+    }
+
+    #[test]
+    fn table_words_and_ports_need_no_lookup() {
+        let files = Counted(Default::default());
+        let got = label_on(
+            &files,
+            "/bin/app",
+            &["app", "run", "dev", "--port", "3000", "--watch"],
+            &[3000],
+        );
+        assert_eq!(got, "app run dev --port 3000 --watch");
+        assert_eq!(files.0.get(), 0);
+        label_on(&files, "/bin/app", &["app", "server.js"], &[]);
+        assert_eq!(files.0.get(), 1);
+    }
+
+    #[test]
+    fn multiprocessing_children_are_workers() {
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(multiprocessing_worker(&argv(&[
+            "python3",
+            "-B",
+            "-c",
+            "from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=7)",
+            "--multiprocessing-fork",
+        ])));
+        assert!(multiprocessing_worker(&argv(&[
+            "python3",
+            "-c",
+            "from multiprocessing.forkserver import main; main(3, 4, ['__main__'], **{})",
+        ])));
+        assert!(!multiprocessing_worker(&argv(&[
+            "python3",
+            "-c",
+            "from multiprocessing.resource_tracker import main;main(5)",
+        ])));
+        assert!(!multiprocessing_worker(&argv(&[
+            "python3", "-m", "uvicorn", "app:app"
+        ])));
+    }
+
+    /// A directory tree for `LiveFiles`, removed afterwards.
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(name: &str) -> Tree {
+            let p = std::env::temp_dir().join(format!("scry-label-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Tree(p.canonicalize().unwrap())
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_volume_that_is_not_local_is_never_looked_into() {
+        let t = Tree::new("remote");
+        let (local, nas) = (t.0.join("local"), t.0.join("nas"));
+        for d in [&local, &nas] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("tool"), "").unwrap();
+        }
+        std::os::unix::fs::symlink(&nas, local.join("link")).unwrap();
+        std::os::unix::fs::symlink("../nas/tool", local.join("rel")).unwrap();
+        let path = std::env::join_paths([&nas, &local]).unwrap();
+        // The mount table says `nas` is a network volume.
+        let files = LiveFiles::with(Some(path.clone()), vec![nas.clone()]);
+        assert!(files.exists(&local.join("tool")));
+        assert!(!files.exists(&nas.join("tool")));
+        assert!(!files.exists(&local.join("link/tool")), "through a symlink");
+        assert!(!files.exists(&local.join("link/../nas/tool")));
+        assert!(files.exists(&local.join("rel")), "the link itself is local");
+        assert!(!files.exists(&local.join("rel/..")));
+        assert!(files.on_path("tool"), "found in the local directory");
+        let files = LiveFiles::with(Some(path), vec![nas.clone(), local.clone()]);
+        assert!(!files.on_path("tool"));
+        // With every volume local, the same paths are found.
+        let files = LiveFiles::with(None, vec![]);
+        assert!(files.exists(&local.join("link/tool")));
+        assert!(files.exists(&local.join("./link/../local/tool")));
+        assert!(
+            !files.exists(&local.join("tool/x")),
+            "a file has no children"
+        );
+        assert!(!files.exists(Path::new("relative")));
+    }
+
+    #[test]
+    fn path_is_read_up_to_its_cap() {
+        let dirs: Vec<String> = (0..100).map(|i| format!("/opt/d{i}")).collect();
+        let files = LiveFiles::with(Some(dirs.join(":").into()), vec![]);
+        assert_eq!(files.path.len(), MAX_PATH_DIRS);
+        assert_eq!(files.path[0], Path::new("/opt/d0"));
+    }
+
+    #[test]
+    fn the_mount_table_marks_automounts_as_not_local() {
+        let remote = remote_mounts();
+        assert!(!remote.iter().any(|m| m == Path::new("/")));
+        assert!(
+            !remote
+                .iter()
+                .any(|m| m == Path::new("/System/Volumes/Data"))
+        );
+        let files = LiveFiles::new();
+        assert!(files.exists(Path::new("/usr/bin/true")));
+        // `/home` leads into the `auto_home` automount macOS sets up.
+        if remote
+            .iter()
+            .any(|m| m == Path::new("/System/Volumes/Data/home"))
+        {
+            assert!(!files.exists(Path::new("/home/dev")));
+            assert!(!files.exists(Path::new("/System/Volumes/Data/home/dev")));
+        }
     }
 
     #[test]

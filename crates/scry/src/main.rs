@@ -68,8 +68,9 @@ enum Command {
 enum BenchWhat {
     /// Time the process scan, the socket table and a full snapshot.
     Scan {
-        #[arg(long, default_value_t = 20)]
-        runs: usize,
+        /// How many times to time each, at least 1.
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
+        runs: u32,
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
@@ -145,10 +146,8 @@ fn snapshot(out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn bench_scan(runs: usize, json: bool) -> Result<()> {
-    if runs == 0 {
-        bail!("--runs must be at least 1");
-    }
+fn bench_scan(runs: u32, json: bool) -> Result<()> {
+    let runs = runs as usize;
     let (mut procs, mut socks, mut full) = (Vec::new(), Vec::new(), Vec::new());
     let (mut count, mut sockets) = (0, 0);
     let mut engine = scry_core::engine::Engine::new();

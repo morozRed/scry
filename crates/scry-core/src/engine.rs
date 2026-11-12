@@ -5,15 +5,29 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 
-use crate::label::{CommandLabel, Facts, LiveFiles};
-use crate::model::{ProcId, Project, Snapshot, Stamps};
+use crate::home::Home;
+use crate::label::{self, CommandLabel, Facts, LiveFiles};
+use crate::model::{ProcId, Project, Proto, Snapshot, Stamps};
 use crate::sys::procinfo::ArgsReader;
 use crate::sys::pulse::PulseSampler;
 use crate::{project, sys};
+
+/// Which of the viewer's processes get a command label. Building one can look up each
+/// argument as a file, and every CLI command builds a fresh engine, so a command labels only
+/// the processes it shows. A multiprocessing worker's parent, which names it, comes along.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Labels {
+    /// Every one, for `scry snapshot`.
+    All,
+    /// Those the socket table names as listening, for `ports`, `why` and `stop :port`.
+    Listeners,
+    /// One pid, for `stop <pid>`.
+    Pid(i32),
+}
 
 /// What Scry read from one process's arguments.
 struct Args {
@@ -22,17 +36,19 @@ struct Args {
     exe: Option<String>,
     argv: Vec<String>,
     stamps: Stamps,
+    worker: bool,
     /// The label and the listening ports it was built with. It is built again when they change.
     label: Option<(Vec<u16>, CommandLabel)>,
 }
 
 pub struct Engine {
+    labels: Labels,
     reader: ArgsReader,
     /// Arguments are read once per process and executable.
     args: HashMap<ProcId, Args>,
     files: LiveFiles,
     pulse: PulseSampler,
-    home: Option<PathBuf>,
+    home: Option<Home>,
     /// Account names by uid. Accounts rarely change while Scry runs.
     names: HashMap<u32, String>,
 }
@@ -44,13 +60,19 @@ impl Default for Engine {
 }
 
 impl Engine {
+    /// An engine that labels every one of the viewer's processes.
     pub fn new() -> Self {
+        Engine::labelling(Labels::All)
+    }
+
+    pub fn labelling(labels: Labels) -> Self {
         Engine {
+            labels,
             reader: ArgsReader::new(),
             args: HashMap::new(),
             files: LiveFiles::new(),
             pulse: PulseSampler::new(),
-            home: std::env::home_dir(),
+            home: Home::from_env(),
             names: HashMap::new(),
         }
     }
@@ -58,17 +80,18 @@ impl Engine {
     pub fn snapshot(&mut self) -> Result<Snapshot> {
         let mut snap = sys::scan()?;
         snap.sockets = sys::sockets::read_all()?;
+        self.files.refresh();
         let live: HashSet<ProcId> = snap.processes.iter().map(|p| p.id).collect();
         self.args.retain(|id, _| live.contains(id));
-        let mut listening: HashMap<i32, Vec<u16>> = HashMap::new();
+        let mut listening: HashMap<i32, Vec<(Proto, u16)>> = HashMap::new();
         for s in snap.sockets.iter().filter(|s| s.is_listening()) {
-            listening.entry(s.pid).or_default().push(s.local_port);
-        }
-        for ports in listening.values_mut() {
-            ports.sort_unstable();
-            ports.dedup();
+            listening
+                .entry(s.pid)
+                .or_default()
+                .push((s.proto, s.local_port));
         }
         let mut roots: HashMap<String, Option<Project>> = HashMap::new();
+        let home = self.home.as_ref().map(Home::path);
         for p in snap
             .processes
             .iter_mut()
@@ -86,6 +109,7 @@ impl Engine {
                         p.id,
                         Args {
                             exe: p.exe.clone(),
+                            worker: label::multiprocessing_worker(&read.argv),
                             argv: read.argv,
                             stamps: read.stamps,
                             label: None,
@@ -93,33 +117,71 @@ impl Engine {
                     );
                 }
             }
-            if let Some(a) = self.args.get_mut(&p.id) {
-                let ports = listening.get(&p.id.pid).map_or(&[][..], Vec::as_slice);
-                if a.label.as_ref().is_none_or(|(built, _)| built != ports) {
-                    let facts = Facts {
-                        exe: p.exe.as_deref(),
-                        name: &p.name,
-                        cwd: p.cwd.as_deref().map(Path::new),
-                        home: self.home.as_deref(),
-                        ports,
-                        files: &self.files,
-                    };
-                    a.label = Some((ports.to_vec(), CommandLabel::build(&a.argv, &facts)));
-                }
-                p.command = a.label.as_ref().map(|(_, l)| l.clone());
+            if let Some(a) = self.args.get(&p.id) {
                 p.stamps = a.stamps.clone();
+                p.worker = a.worker;
             }
             if let Some(cwd) = &p.cwd {
-                let home = self.home.as_deref();
                 p.project = roots
                     .entry(cwd.clone())
-                    .or_insert_with(|| project::find_root(Path::new(cwd), home))
+                    .or_insert_with(|| project::find_root(Path::new(cwd), home.as_deref()))
                     .clone();
             }
+        }
+        let wanted = self.wanted(&snap, &listening);
+        // A worker's parent often opened the socket and keeps it, as `uvicorn --reload`
+        // does, so its label may show the port too, once its own files confirm it.
+        let mut candidates = listening.clone();
+        for (pid, ports) in &listening {
+            if let Some(parent) = snap.process(*pid).and_then(|p| snap.worker_parent(p)) {
+                candidates
+                    .entry(parent.id.pid)
+                    .or_default()
+                    .extend(ports.iter().copied());
+            }
+        }
+        for p in snap
+            .processes
+            .iter_mut()
+            .filter(|p| p.uid == snap.viewer_uid && wanted.contains(&p.id.pid))
+        {
+            let Some(a) = self.args.get_mut(&p.id) else {
+                continue;
+            };
+            let ports = held(p.id.pid, candidates.get(&p.id.pid));
+            if a.label.as_ref().is_none_or(|(built, _)| *built != ports) {
+                let facts = Facts {
+                    exe: p.exe.as_deref(),
+                    name: &p.name,
+                    cwd: p.cwd.as_deref().map(Path::new),
+                    home: self.home.as_ref(),
+                    ports: &ports,
+                    files: &self.files,
+                };
+                a.label = Some((ports.clone(), CommandLabel::build(&a.argv, &facts)));
+            }
+            p.command = a.label.as_ref().map(|(_, l)| l.clone());
         }
         snap.user_names = self.user_names(&snap);
         snap.pulse = self.pulse.sample();
         Ok(snap)
+    }
+
+    /// The pids to label: what [`Labels`] names, and the ancestors that name its workers.
+    fn wanted(&self, snap: &Snapshot, listening: &HashMap<i32, Vec<(Proto, u16)>>) -> HashSet<i32> {
+        let mut wanted: HashSet<i32> = match self.labels {
+            Labels::All => return snap.own_processes().map(|p| p.id.pid).collect(),
+            Labels::Listeners => listening.keys().copied().collect(),
+            Labels::Pid(pid) => HashSet::from([pid]),
+        };
+        let parents: Vec<i32> = wanted
+            .iter()
+            .filter_map(|&pid| snap.process(pid))
+            .filter_map(|p| snap.worker_parent(p))
+            .map(|p| p.id.pid)
+            .collect();
+        wanted.extend(parents);
+        wanted
     }
 
     /// The raw arguments of one of the viewer's processes, as read for the last snapshot. They
@@ -149,6 +211,30 @@ impl Engine {
     }
 }
 
+/// The ports among `candidates`, from the socket table, that `pid` holds through its own
+/// open files. The table keeps `so_last_pid`, which can name a process that has since closed
+/// or handed off the socket, and a number in its arguments must not show for a port it lost.
+fn held(pid: i32, candidates: Option<&Vec<(Proto, u16)>>) -> Vec<u16> {
+    match candidates {
+        Some(candidates) => confirmed(
+            candidates,
+            &sys::sockets::listening_ports(pid).unwrap_or_default(),
+        ),
+        None => Vec::new(),
+    }
+}
+
+fn confirmed(table: &[(Proto, u16)], open: &[(Proto, u16)]) -> Vec<u16> {
+    let mut ports: Vec<u16> = table
+        .iter()
+        .filter(|t| open.contains(t))
+        .map(|&(_, port)| port)
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 fn user_name(uid: u32) -> Option<String> {
     let mut buf = vec![0 as libc::c_char; 1024];
     loop {
@@ -172,7 +258,7 @@ fn user_name(uid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -237,5 +323,80 @@ mod tests {
         assert_eq!(e.command_line(id).unwrap(), ["sleep", "30"]);
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn only_ports_a_process_still_holds_are_its_ports() {
+        let table = [(Proto::Tcp, 3000), (Proto::Udp, 5353), (Proto::Tcp, 8080)];
+        let open = [(Proto::Tcp, 8080), (Proto::Udp, 3000), (Proto::Udp, 5353)];
+        assert_eq!(confirmed(&table, &open), [5353, 8080]);
+        assert_eq!(confirmed(&table, &[]), Vec::<u16>::new());
+    }
+
+    /// A Python process that opens a listener, forks a child that keeps it, and execs into a
+    /// sleep with the port as an argument. Its own copy closes on the exec, so the socket
+    /// table's `so_last_pid` names it for a port it no longer holds.
+    #[test]
+    fn a_stale_table_pid_does_not_make_a_number_show() {
+        let script = r#"
+import os, socket, sys, time
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen()
+port = s.getsockname()[1]
+child = os.fork()
+if child == 0:
+    time.sleep(30)
+    os._exit(0)
+code = "import sys, time; print(sys.argv[1], sys.argv[2], flush=True); time.sleep(30)"
+os.execv(sys.executable, [sys.executable, "-c", code, str(port), str(child)])
+"#;
+        let mut parent = Command::new("python3")
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("python3");
+        let mut line = String::new();
+        BufReader::new(parent.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let (port, child) = line.trim().split_once(' ').expect("port and child pid");
+        let (port, child): (u16, i32) = (port.parse().unwrap(), child.parse().unwrap());
+        let pid = parent.id() as i32;
+        let snap = Engine::new().snapshot().unwrap();
+        let named: Vec<i32> = snap
+            .sockets
+            .iter()
+            .filter(|s| s.is_listening() && s.local_port == port)
+            .map(|s| s.pid)
+            .collect();
+        unsafe { libc::kill(child, libc::SIGKILL) };
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        assert_eq!(
+            named,
+            [pid],
+            "the table names the parent, which closed the socket"
+        );
+        let label = snap.process(pid).unwrap().command.as_ref().unwrap();
+        assert_eq!(label.to_string(), "python3 -c …", "not the port {port}");
+    }
+
+    #[test]
+    fn a_command_labels_only_the_processes_it_shows() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let (me, other) = (std::process::id() as i32, sleeper.id() as i32);
+        let labelled = |labels| {
+            let snap = Engine::labelling(labels).snapshot().unwrap();
+            let has = |pid| snap.process(pid).is_some_and(|p| p.command.is_some());
+            (has(me), has(other))
+        };
+        assert_eq!(labelled(Labels::All), (true, true));
+        assert_eq!(labelled(Labels::Listeners), (true, false));
+        assert_eq!(labelled(Labels::Pid(other)), (false, true));
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        drop(listener);
     }
 }

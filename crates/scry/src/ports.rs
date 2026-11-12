@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
-use scry_core::engine::Engine;
+use scry_core::engine::{Engine, Labels};
+use scry_core::home::Home;
 use scry_core::label::{printable, unprintable};
 use scry_core::sys::sockets::pid_holds_port;
 use scry_core::view::human_age;
@@ -50,17 +51,17 @@ fn parse_port(s: &str) -> Result<u16, String> {
 pub(crate) fn snapshot(fixture: Option<PathBuf>) -> Result<Snapshot> {
     match fixture {
         Some(path) => fixture::load(&path),
-        None => Engine::new().snapshot(),
+        None => Engine::labelling(Labels::Listeners).snapshot(),
     }
 }
 
-pub(crate) fn home() -> Option<String> {
-    fixture::home_dir().ok()
+pub(crate) fn home() -> Option<Home> {
+    Home::from_env()
 }
 
 pub fn ports(a: PortsArgs) -> Result<()> {
     let snap = snapshot(a.fixture)?;
-    let view = PortsView::build(&snap, home().as_deref());
+    let view = PortsView::build(&snap, home().as_ref());
     if a.json {
         println!("{}", serde_json::to_string_pretty(&view)?);
         return Ok(());
@@ -84,7 +85,10 @@ fn table(rows: &[PortRow]) -> String {
                 r.label(),
                 r.addresses.join(", "),
                 r.pid.to_string(),
-                clip(&r.process, 40),
+                match r.worker_of {
+                    Some(_) => format!("{} (worker)", clip(&r.process, 31)),
+                    None => clip(&r.process, 40),
+                },
                 r.owner.clone(),
                 r.project.clone().unwrap_or_default(),
                 r.age_secs
@@ -117,12 +121,12 @@ fn table(rows: &[PortRow]) -> String {
 
 pub fn why(a: WhyArgs) -> Result<()> {
     let live = a.fixture.is_none();
-    let mut engine = Engine::new();
+    let mut engine = Engine::labelling(Labels::Listeners);
     let snap = match a.fixture {
         Some(path) => fixture::load(&path)?,
         None => engine.snapshot()?,
     };
-    let mut why = Why::build(&snap, a.port, home().as_deref());
+    let mut why = Why::build(&snap, a.port, home().as_ref());
     if live {
         let checks: Vec<(i32, Proto)> = why
             .holders
@@ -142,7 +146,7 @@ pub fn why(a: WhyArgs) -> Result<()> {
     for h in &why.holders {
         println!();
         if why.holders.len() > 1 {
-            let process = printable(&h.row.process);
+            let process = printable(&h.row.holder());
             println!("{process} (pid {}, {}):", h.row.pid, h.row.label());
         }
         println!("Evidence:");

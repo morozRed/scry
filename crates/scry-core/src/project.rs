@@ -1,8 +1,13 @@
 //! Finds the project a working directory belongs to.
 
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use crate::model::{Project, ProjectKind};
+
+/// A `.git` file holds one `gitdir:` line; more than this is not one.
+const MAX_GIT_FILE: u64 = 4096;
 
 /// Package manager prefixes. Homebrew keeps its own git repository at its prefix and runs
 /// `brew services` from inside it, so without this stop every one of them would claim it.
@@ -54,7 +59,7 @@ fn walk(cwd: &Path, stops: &[&Path]) -> Option<Project> {
 /// A `.git` file points at the real git directory: under `worktrees/` for a linked worktree,
 /// under `modules/` for a submodule.
 fn git_file_kind(git: &Path) -> ProjectKind {
-    let text = std::fs::read_to_string(git).unwrap_or_default();
+    let text = read_small(git).unwrap_or_default();
     let target = text
         .lines()
         .find_map(|l| l.strip_prefix("gitdir:"))
@@ -67,6 +72,22 @@ fn git_file_kind(git: &Path) -> ProjectKind {
     } else {
         ProjectKind::Git
     }
+}
+
+/// The first [`MAX_GIT_FILE`] bytes of a regular file. The open neither follows a symlink nor
+/// waits for a writer, so a `.git` that is a FIFO or a link to `/dev/zero` is refused at once.
+fn read_small(path: &Path) -> Option<String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_GIT_FILE).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn project(dir: &Path, kind: ProjectKind) -> Project {
@@ -131,6 +152,37 @@ mod tests {
         assert_eq!(
             find_root(&t.dir("sub"), None).unwrap().kind,
             ProjectKind::Submodule
+        );
+    }
+
+    /// `find_root` on its own thread, failing after 5 s instead of hanging the run.
+    fn find_root_within(dir: std::path::PathBuf) -> Option<Project> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(find_root(&dir, None)));
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("find_root returned in time")
+    }
+
+    #[test]
+    fn a_git_entry_that_is_not_a_regular_file_is_never_read() {
+        let t = Tree::new("special");
+        let fifo = t.dir("fifo").join(".git");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        std::os::unix::fs::symlink("/dev/zero", t.dir("zero").join(".git")).unwrap();
+        for dir in ["fifo", "zero"] {
+            let got = find_root_within(t.0.join(dir)).expect("a .git marks the root");
+            assert_eq!(got.kind, ProjectKind::Git, "{dir}");
+        }
+        // Only the first 4 KB of a `.git` file is read.
+        let pad = "#".repeat(MAX_GIT_FILE as usize);
+        t.file(
+            "big/.git",
+            &format!("{pad}\ngitdir: /src/acme/.git/worktrees/big\n"),
+        );
+        assert_eq!(
+            find_root_within(t.0.join("big")).unwrap().kind,
+            ProjectKind::Git
         );
     }
 

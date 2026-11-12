@@ -388,14 +388,25 @@ const SOCKET_FDINFO_LEN: usize = 792;
 const SOI_PROTOCOL: usize = 180;
 const SOI_FAMILY: usize = 184;
 const SOI_KIND: usize = 256;
+const INSI_FPORT: usize = 264;
 const INSI_LPORT: usize = 268;
+/// `tcpsi_state`, after the 80-byte `in_sockinfo` in `tcp_sockinfo`.
+const TCPSI_STATE: usize = 344;
+const TSI_S_LISTEN: i32 = 1;
 const SOCKINFO_IN: i32 = 1;
 const SOCKINFO_TCP: i32 = 2;
 
-/// Whether `pid` has a socket of `proto` bound to `port` among its open files. This checks
-/// the socket table's `so_last_pid`, which can name a process that has since exited.
-/// `None` when the process cannot be inspected, which is the case for other users.
+/// Whether `pid` has a listening `proto` socket on `port` among its open files. This checks
+/// the socket table's `so_last_pid`, which can name a process that has since closed the
+/// socket. `None` when the process cannot be inspected, which is the case for other users.
 pub fn pid_holds_port(pid: i32, proto: Proto, port: u16) -> Option<bool> {
+    listening_ports(pid).map(|held| held.contains(&(proto, port)))
+}
+
+/// The ports `pid` listens on through its own open files: TCP sockets in `LISTEN`, and UDP
+/// sockets bound to a port with no peer, as [`Socket::is_listening`] reads the table. `None`
+/// when the process cannot be inspected.
+pub fn listening_ports(pid: i32) -> Option<Vec<(Proto, u16)>> {
     let entry = std::mem::size_of::<libc::proc_fdinfo>();
     let need =
         unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
@@ -422,10 +433,7 @@ pub fn pid_holds_port(pid: i32, proto: Proto, port: u16) -> Option<bool> {
         return None;
     }
     fds.truncate(got as usize / entry);
-    let want_proto = match proto {
-        Proto::Tcp => libc::IPPROTO_TCP,
-        Proto::Udp => libc::IPPROTO_UDP,
-    };
+    let mut held = Vec::new();
     let mut info = [0u8; SOCKET_FDINFO_LEN];
     for fd in fds
         .iter()
@@ -445,19 +453,27 @@ pub fn pid_holds_port(pid: i32, proto: Proto, port: u16) -> Option<bool> {
         }
         let kind = i32_ne(&info, SOI_KIND);
         let family = i32_ne(&info, SOI_FAMILY);
-        if (kind != SOCKINFO_IN && kind != SOCKINFO_TCP)
-            || (family != libc::AF_INET && family != libc::AF_INET6)
-            || i32_ne(&info, SOI_PROTOCOL) != want_proto
-        {
+        if family != libc::AF_INET && family != libc::AF_INET6 {
             continue;
         }
+        let listening = match (i32_ne(&info, SOI_PROTOCOL), kind) {
+            (libc::IPPROTO_TCP, SOCKINFO_TCP) => {
+                (i32_ne(&info, TCPSI_STATE) == TSI_S_LISTEN).then_some(Proto::Tcp)
+            }
+            (libc::IPPROTO_UDP, SOCKINFO_IN) => {
+                (i32_ne(&info, INSI_FPORT) == 0).then_some(Proto::Udp)
+            }
+            _ => None,
+        };
         // `insi_lport` holds the port in network byte order in its low 16 bits.
-        let raw = u32_ne(&info, INSI_LPORT) as u16;
-        if u16::from_be(raw) == port {
-            return Some(true);
+        let port = u16::from_be(u32_ne(&info, INSI_LPORT) as u16);
+        if let Some(proto) = listening
+            && port != 0
+        {
+            held.push((proto, port));
         }
     }
-    Some(false)
+    Some(held)
 }
 
 #[cfg(test)]
@@ -770,5 +786,25 @@ mod tests {
         assert_eq!(s.uid, unsafe { libc::getuid() });
         assert_eq!(pid_holds_port(me, Proto::Tcp, port), Some(true));
         assert_eq!(pid_holds_port(me, Proto::Udp, port), Some(false));
+    }
+
+    #[test]
+    fn only_listening_sockets_count_as_held() {
+        let me = std::process::id() as i32;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (accepted, _) = l.accept().unwrap();
+        assert!(listening_ports(me).unwrap().contains(&(Proto::Tcp, port)));
+        // The accepted connection has the same local port, but it is not a listener.
+        drop(l);
+        assert_eq!(pid_holds_port(me, Proto::Tcp, port), Some(false));
+        let bound = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let connected = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        connected.connect(bound.local_addr().unwrap()).unwrap();
+        let held = listening_ports(me).unwrap();
+        assert!(held.contains(&(Proto::Udp, bound.local_addr().unwrap().port())));
+        assert!(!held.contains(&(Proto::Udp, connected.local_addr().unwrap().port())));
+        drop((client, accepted));
     }
 }

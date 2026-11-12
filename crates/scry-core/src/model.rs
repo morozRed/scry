@@ -38,10 +38,15 @@ pub struct Process {
     pub project: Option<Project>,
     #[serde(default, skip_serializing_if = "Stamps::is_empty")]
     pub stamps: Stamps,
+    /// A Python multiprocessing worker, such as the server process `uvicorn --reload`
+    /// starts. Its arguments say only that, so views name it by [`Snapshot::worker_parent`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker: bool,
 }
 
 /// The allowlisted agent keys from a process's environment. Every other variable is dropped
-/// while the environment is parsed.
+/// while the environment is parsed, and a value of any other shape than an id is dropped
+/// too, so a stamp never carries text such as a header or a password into an output.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stamps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,18 +64,31 @@ impl Stamps {
         *self == Stamps::default()
     }
 
-    /// Takes one `KEY=value` environment entry, keeping it only if the key is allowlisted.
+    /// Takes one `KEY=value` environment entry, keeping it only if the key is allowlisted
+    /// and the value has the key's shape: an id of 1 to 64 letters, digits, `-` and `_`
+    /// (which a UUID is), or digits for `CLAUDE_PID`.
     pub fn take(&mut self, entry: &[u8]) {
         let Some(eq) = entry.iter().position(|&b| b == b'=') else {
             return;
         };
         let (key, value) = (&entry[..eq], &entry[eq + 1..]);
-        let text = || String::from_utf8_lossy(value).into_owned();
+        let id = || {
+            let ok = (1..=64).contains(&value.len())
+                && value
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+            ok.then(|| String::from_utf8_lossy(value).into_owned())
+        };
         match key {
-            b"CLAUDE_CODE_SESSION_ID" => self.claude_code_session_id = Some(text()),
-            b"CLAUDE_PID" => self.claude_pid = text().parse().ok(),
-            b"CODEX_SESSION_ID" => self.codex_session_id = Some(text()),
-            b"SCRY_SESSION" => self.scry_session = Some(text()),
+            b"CLAUDE_CODE_SESSION_ID" => self.claude_code_session_id = id(),
+            b"CLAUDE_PID" => {
+                self.claude_pid = std::str::from_utf8(value)
+                    .ok()
+                    .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                    .and_then(|v| v.parse().ok())
+            }
+            b"CODEX_SESSION_ID" => self.codex_session_id = id(),
+            b"SCRY_SESSION" => self.scry_session = id(),
             _ => {}
         }
     }
@@ -319,6 +337,24 @@ impl Snapshot {
 
     pub fn process(&self, pid: i32) -> Option<&Process> {
         self.processes.iter().find(|p| p.id.pid == pid)
+    }
+
+    /// The process a multiprocessing worker works for: its nearest ancestor that is not a
+    /// worker, since a forkserver stands between its workers and the program. Only the
+    /// worker's own user's processes count, so an orphaned worker has none.
+    pub fn worker_parent<'a>(&'a self, p: &Process) -> Option<&'a Process> {
+        if !p.worker {
+            return None;
+        }
+        let parent = |pid| self.process(pid).filter(|a| a.uid == p.uid && a.id.pid > 1);
+        let mut q = parent(p.ppid)?;
+        for _ in 0..3 {
+            if !q.worker {
+                return Some(q);
+            }
+            q = parent(q.ppid)?;
+        }
+        None
     }
 
     /// "you" for the viewer, the account name for others, `uid N` when the name is unknown.

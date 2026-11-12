@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Detail, Evidence, Fact, State, Target, human_age};
 use crate::control::system_prefix;
-use crate::fixture::tilde;
+use crate::home::Home;
 use crate::model::{Agent, IpFamily, ProjectKind, Proto, Snapshot, Socket, TcpState};
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -28,7 +28,12 @@ pub struct PortRow {
     pub start_us: Option<i64>,
     /// The command label, such as `next dev --port 3000`, for the viewer's own processes;
     /// the process name for others', and `pid N` when the pid is not in the process list.
+    /// For a multiprocessing worker, the label of the process it works for.
     pub process: String,
+    /// Set when the pid is a Python multiprocessing worker, such as the server process of
+    /// `uvicorn --reload`: the pid of the process it works for, whose label `process` is.
+    #[serde(default)]
+    pub worker_of: Option<i32>,
     /// The process's uid, or the socket's when the process is not in the list.
     pub uid: u32,
     /// "you", or the account `uid` belongs to.
@@ -71,6 +76,14 @@ impl PortRow {
         self.owner == "you"
     }
 
+    /// `process` as a list shows it, with `(worker)` after a worker's parent's label.
+    pub fn holder(&self) -> String {
+        match self.worker_of {
+            Some(_) => format!("{} (worker)", self.process),
+            None => self.process.clone(),
+        }
+    }
+
     /// What the detail pane shows for the row.
     pub fn detail(&self) -> Detail {
         let fact = |label: &str, value: String| Fact {
@@ -96,7 +109,7 @@ impl PortRow {
             .map(|s| format!("{} in the process environment (exact)", s.key))
             .collect();
         Detail {
-            title: format!("{} · {}", self.label(), self.process),
+            title: format!("{} · {}", self.label(), self.holder()),
             facts,
             sentence: self.sentence.clone(),
             evidence,
@@ -108,7 +121,7 @@ impl PortRow {
         (self.mine() && self.start_us.is_some() && self.state != Some(State::System)).then(|| {
             Target {
                 pid: self.pid,
-                command: self.process.clone(),
+                command: self.holder(),
                 session: self.session.as_ref().map(SessionRef::short),
                 evidence: self.session.as_ref().map(|_| Evidence::Stamp),
                 age_s: self.age_secs.unwrap_or(0).max(0) as u64,
@@ -134,8 +147,9 @@ pub fn port_label(proto: Proto, port: u16) -> String {
 }
 
 impl PortsView {
-    /// `home` is written as `~` in paths.
-    pub fn build(snap: &Snapshot, home: Option<&str>) -> PortsView {
+    /// Paths are shown as [`Home::redact`] writes them: home as `~`, and the account name
+    /// nowhere, as in a snapshot.
+    pub fn build(snap: &Snapshot, home: Option<&Home>) -> PortsView {
         let mut groups: BTreeMap<(u16, Proto, i32), Vec<&Socket>> = BTreeMap::new();
         for s in snap.sockets.iter().filter(|s| s.is_listening()) {
             groups
@@ -153,7 +167,7 @@ impl PortsView {
 
 fn row(
     snap: &Snapshot,
-    home: Option<&str>,
+    home: Option<&Home>,
     port: u16,
     proto: Proto,
     pid: i32,
@@ -166,13 +180,8 @@ fn row(
     // A daemon can open its socket as root and then switch users, so the socket's uid is not
     // the process's.
     let uid = p.map_or(sockets[0].uid, |p| p.uid);
-    let shown = |path: &str| {
-        let mut path = path.to_string();
-        if let Some(h) = home {
-            tilde(&mut path, h.trim_end_matches('/'));
-        }
-        path
-    };
+    let shown = |path: &str| home.map_or_else(|| path.to_string(), |h| h.redact(path));
+    let parent = p.and_then(|p| snap.worker_parent(p));
     let project = p.and_then(|p| p.project.as_ref());
     let session = p
         .and_then(|p| p.stamps.session())
@@ -195,7 +204,10 @@ fn row(
         addresses,
         pid,
         start_us: p.map(|p| p.id.start_us),
-        process: p.map_or_else(|| format!("pid {pid}"), |p| p.label()),
+        process: parent
+            .or(p)
+            .map_or_else(|| format!("pid {pid}"), |p| p.label()),
+        worker_of: parent.map(|w| w.id.pid),
         uid,
         owner: snap.owner_name(uid),
         cwd: p.and_then(|p| p.cwd.as_deref()).map(shown),
@@ -228,7 +240,10 @@ fn sentence(r: &PortRow, snap: &Snapshot, port: &str) -> String {
             r.pid, r.owner
         );
     }
-    let mut s = format!("{port} is held by `{}`", r.process);
+    let mut s = match r.worker_of {
+        Some(_) => format!("{port} is held by a worker of `{}`", r.process),
+        None => format!("{port} is held by `{}`", r.process),
+    };
     if let Some(project) = &r.project {
         s.push_str(&format!(" in {project}"));
     }
@@ -282,7 +297,7 @@ pub enum Strength {
 }
 
 impl Why {
-    pub fn build(snap: &Snapshot, port: u16, home: Option<&str>) -> Why {
+    pub fn build(snap: &Snapshot, port: u16, home: Option<&Home>) -> Why {
         let holders: Vec<Holder> = PortsView::build(snap, home)
             .rows
             .into_iter()
@@ -321,7 +336,11 @@ impl Why {
                 ":{port} is held by {} processes: {}.",
                 many.len(),
                 many.iter()
-                    .map(|r| format!("`{}` (pid {}, {})", r.process, r.pid, r.owner))
+                    .map(|r| match r.worker_of {
+                        Some(_) =>
+                            format!("a worker of `{}` (pid {}, {})", r.process, r.pid, r.owner),
+                        None => format!("`{}` (pid {}, {})", r.process, r.pid, r.owner),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -410,12 +429,21 @@ fn evidence(snap: &Snapshot, r: &PortRow) -> Vec<Proof> {
         });
         return ev;
     }
+    let own = snap
+        .process(r.pid)
+        .map_or_else(|| r.process.clone(), |p| p.label());
     ev.push(exact(format!(
         "pid {} is `{}`, started {} ago.",
         r.pid,
-        clip(&r.process, 160),
+        clip(&own, 160),
         human_age(r.age_secs.unwrap_or(0).max(0) as u64)
     )));
+    if let Some(parent) = r.worker_of {
+        ev.push(exact(format!(
+            "It is a Python multiprocessing worker. It works for pid {parent}, `{}`.",
+            clip(&r.process, 160)
+        )));
+    }
     if !r.yours(snap) {
         ev.push(exact(format!(
             "Owned by {}. Without root Scry cannot read its command line or directory.",
@@ -600,18 +628,96 @@ mod tests {
     }
 
     #[test]
-    fn home_is_written_as_tilde() {
-        let mut snap = typical();
-        for p in &mut snap.processes {
-            if let Some(proj) = &mut p.project {
-                proj.root = proj.root.replace('~', "/Users/dev");
+    fn home_is_written_as_tilde_by_any_name() {
+        let home = Home::new(std::path::Path::new("/Users/dev/")).unwrap();
+        for spelling in ["/Users/dev", "/System/Volumes/Data/Users/dev", "/USERS/DEV"] {
+            let mut snap = typical();
+            for p in &mut snap.processes {
+                if let Some(proj) = &mut p.project {
+                    proj.root = proj.root.replace('~', spelling);
+                }
             }
+            let view = PortsView::build(&snap, Some(&home));
+            let row = view.rows.iter().find(|r| r.port == 3000).unwrap();
+            assert_eq!(row.project.as_deref(), Some("~/acme/wt-auth"), "{spelling}");
+            let text = serde_json::to_string(&Why::build(&snap, 3000, Some(&home))).unwrap();
+            assert!(!text.to_lowercase().contains("/dev/"), "{spelling}: {text}");
         }
-        let view = PortsView::build(&snap, Some("/Users/dev/"));
+        // A directory outside home can hold the account name too.
+        let mut snap = typical();
+        let p = snap
+            .processes
+            .iter_mut()
+            .find(|p| p.id.pid == 1320)
+            .unwrap();
+        p.cwd = Some("/private/tmp/build-DEV/web".into());
+        let view = PortsView::build(&snap, Some(&home));
+        let row = view.rows.iter().find(|r| r.port == 3000).unwrap();
+        assert_eq!(row.cwd.as_deref(), Some("/private/tmp/build-…/web"));
+    }
+
+    /// The fixture with :3000 held by a worker that `python3 -m uvicorn --reload` started,
+    /// instead of by `next dev`.
+    fn with_worker() -> Snapshot {
+        let mut snap = typical();
+        let parent = snap.process(1320).unwrap().clone();
+        let mut worker = parent.clone();
+        worker.id.pid = 1330;
+        worker.ppid = 1320;
+        worker.worker = true;
+        worker.command =
+            Some(serde_json::from_str(r#""python3 -B -c … --multiprocessing-fork""#).unwrap());
+        snap.processes.push(worker);
+        let p = snap
+            .processes
+            .iter_mut()
+            .find(|p| p.id.pid == 1320)
+            .unwrap();
+        p.command = Some(serde_json::from_str(r#""python3 -m uvicorn … --reload""#).unwrap());
+        for s in snap.sockets.iter_mut().filter(|s| s.local_port == 3000) {
+            s.pid = 1330;
+        }
+        snap
+    }
+
+    #[test]
+    fn a_multiprocessing_worker_is_named_by_its_parent() {
+        let snap = with_worker();
+        let view = PortsView::build(&snap, None);
+        let row = view.rows.iter().find(|r| r.port == 3000).unwrap();
+        assert_eq!(row.pid, 1330);
+        assert_eq!(row.process, "python3 -m uvicorn … --reload");
+        assert_eq!(row.worker_of, Some(1320));
+        assert_eq!(row.holder(), "python3 -m uvicorn … --reload (worker)");
         assert!(
-            view.rows
-                .iter()
-                .any(|r| r.project.as_deref() == Some("~/acme/wt-auth"))
+            row.sentence
+                .starts_with(":3000 is held by a worker of `python3 -m uvicorn … --reload` in "),
+            "{}",
+            row.sentence
+        );
+        let why = Why::build(&snap, 3000, None);
+        let ev: Vec<&str> = why.holders[0]
+            .evidence
+            .iter()
+            .map(|e| e.detail.as_str())
+            .collect();
+        assert!(
+            ev.iter()
+                .any(|e| e.starts_with("pid 1330 is `python3 -B -c … --multiprocessing-fork`")),
+            "{ev:#?}"
+        );
+        assert!(
+            ev.contains(&"It is a Python multiprocessing worker. It works for pid 1320, `python3 -m uvicorn … --reload`."),
+            "{ev:#?}"
+        );
+        // A worker whose parent is gone, or another user's, keeps its own label.
+        let mut orphan = snap.clone();
+        orphan.processes.retain(|p| p.id.pid != 1320);
+        let view = PortsView::build(&orphan, None);
+        let row = view.rows.iter().find(|r| r.port == 3000).unwrap();
+        assert_eq!(
+            (row.process.as_str(), row.worker_of),
+            ("python3 -B -c … --multiprocessing-fork", None)
         );
     }
 

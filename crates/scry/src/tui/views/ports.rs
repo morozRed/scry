@@ -37,7 +37,7 @@ fn rows(board: &Board) -> Load<Vec<Row>> {
                     cells: vec![
                         Cell::num(format!(":{}", p.port), p.port.into()),
                         Cell::muted(p.addresses.join(", ")),
-                        Cell::text(&p.process)
+                        Cell::text(p.holder())
                             .with_context((p.owner != "you").then_some(p.owner.as_str())),
                         Cell::muted(p.project.as_deref().unwrap_or("")),
                         Cell::text(p.session.as_ref().map(|s| s.short()).unwrap_or_default()),

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use scry_core::control::{self, Target};
 use scry_core::fixture;
+use scry_core::home::Home;
 use scry_core::label::{CommandLabel, Facts, Files, WORDS};
 use scry_core::model::{
     IpFamily, ProcId, Process, Proto, SNAPSHOT_SCHEMA, Snapshot, Socket, TcpState,
@@ -21,8 +22,11 @@ const CWD: &str = "/Users/dev/acme";
 const PYTHON: &str =
     "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python";
 
-const FILES: [&str; 8] = [
+const FILES: [&str; 11] = [
     "/Users/dev",
+    "/System/Volumes/Data/Users/dev",
+    "/USERS/DEV",
+    "/Volumes/Backup/USERS/Dev",
     "/Users/dev/acme",
     "/Users/dev/acme/server.js",
     "/Users/dev/acme/node_modules/.bin/next",
@@ -69,12 +73,17 @@ impl Files for Disk {
     }
 }
 
+fn home() -> Home {
+    Home::new(Path::new(HOME)).unwrap()
+}
+
 fn build(exe: &str, argv: &[String], ports: &[u16]) -> CommandLabel {
+    let home = home();
     let facts = Facts {
         exe: Some(exe),
         name: "app",
         cwd: Some(Path::new(CWD)),
-        home: Some(Path::new(HOME)),
+        home: Some(&home),
         ports,
         files: &Disk,
     };
@@ -114,6 +123,7 @@ fn outputs(command: &CommandLabel) -> Vec<(&'static str, String)> {
             cwd: Some(CWD.into()),
             project: None,
             stamps: Default::default(),
+            worker: false,
         }],
         sockets: vec![Socket {
             proto: Proto::Tcp,
@@ -129,8 +139,9 @@ fn outputs(command: &CommandLabel) -> Vec<(&'static str, String)> {
         }],
         ..Snapshot::default()
     };
-    let ports = PortsView::build(&snap, Some(HOME));
-    let why = Why::build(&snap, PORT, Some(HOME));
+    let home = home();
+    let ports = PortsView::build(&snap, Some(&home));
+    let why = Why::build(&snap, PORT, Some(&home));
     let target = control::resolve(&snap, Target::Port(PORT)).expect("a stoppable holder");
     let text: Vec<String> = ports
         .rows
@@ -144,7 +155,7 @@ fn outputs(command: &CommandLabel) -> Vec<(&'static str, String)> {
         .collect();
     vec![
         ("label", command.to_string()),
-        ("snapshot", json(&fixture::redact(snap.clone(), HOME))),
+        ("snapshot", json(&fixture::redact(snap.clone(), &home))),
         ("ports --json", json(&ports)),
         ("ports and why text", text.join("\n") + &why.sentence),
         ("why --json", json(&why)),
@@ -373,6 +384,23 @@ const CORPUS: &[(&[&str], &str)] = &[
 fn no_secret_from_the_corpus_reaches_any_output() {
     for (argv, secret) in CORPUS {
         assert_hidden(argv, secret);
+    }
+}
+
+#[test]
+fn the_account_name_reaches_no_output_by_any_spelling_of_home() {
+    for path in [
+        "/System/Volumes/Data/Users/dev",
+        "/USERS/DEV",
+        "/Volumes/Backup/USERS/Dev",
+    ] {
+        let label = build("/usr/local/bin/app", &strings(&["app", path]), &[PORT]);
+        for (name, out) in outputs(&label) {
+            assert!(
+                !out.to_lowercase().contains("dev"),
+                "the account name leaks into {name} for {path}: {out}"
+            );
+        }
     }
 }
 

@@ -5,9 +5,8 @@ use std::io::{BufRead, IsTerminal, Write};
 use anyhow::Result;
 use clap::Args;
 use scry_core::control::{self, Outcome, StopTarget, TERM_GRACE, Target};
-use scry_core::engine::Engine;
+use scry_core::engine::{Engine, Labels};
 use scry_core::label::printable;
-use scry_core::view::ports::clip;
 use serde_json::{Value, json};
 
 /// Stop one of your processes by pid or by the port it holds. Sends SIGTERM and waits 3 s.
@@ -29,12 +28,16 @@ pub struct StopArgs {
 }
 
 pub fn run(a: StopArgs) -> Result<()> {
-    let snap = Engine::new().snapshot()?;
+    let labels = match a.target {
+        Target::Pid(pid) => Labels::Pid(pid),
+        Target::Port(_) => Labels::Listeners,
+    };
+    let snap = Engine::labelling(labels).snapshot()?;
     let t = match control::resolve(&snap, a.target) {
         Ok(t) => t,
         Err(r) => refuse(a.json, None, json!(r), &r.to_string()),
     };
-    let what = clip(&printable(&t.process), 120);
+    let what = printable(&t.described());
     let pid = t.id.pid;
     if !a.yes {
         if !std::io::stdin().is_terminal() {
@@ -43,11 +46,11 @@ pub fn run(a: StopArgs) -> Result<()> {
                 Some(&t),
                 json!({ "refused": "unconfirmed", "pid": pid }),
                 &format!(
-                    "Would stop pid {pid} (`{what}`). Pass --yes to confirm without a terminal."
+                    "Would stop pid {pid} ({what}). Pass --yes to confirm without a terminal."
                 ),
             );
         }
-        eprint!("Stop pid {pid} (`{what}`) with SIGTERM? [y/N] ");
+        eprint!("Stop pid {pid} ({what}) with SIGTERM? [y/N] ");
         std::io::stderr().flush()?;
         let mut answer = String::new();
         std::io::stdin().lock().read_line(&mut answer)?;
@@ -70,11 +73,11 @@ pub fn run(a: StopArgs) -> Result<()> {
     } else {
         match &outcome {
             Outcome::Exited { signal, after_ms } => println!(
-                "Stopped pid {pid} (`{what}`) with {signal} after {:.1} s.",
+                "Stopped pid {pid} ({what}) with {signal} after {:.1} s.",
                 *after_ms as f64 / 1000.0
             ),
             Outcome::StillRunning { after_ms } => println!(
-                "pid {pid} (`{what}`) is still running {:.1} s after SIGTERM. Run `scry stop {pid} --kill` to send SIGKILL.",
+                "pid {pid} ({what}) is still running {:.1} s after SIGTERM. Run `scry stop {pid} --kill` to send SIGKILL.",
                 *after_ms as f64 / 1000.0,
             ),
         }

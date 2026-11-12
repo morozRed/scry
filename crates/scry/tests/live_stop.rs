@@ -147,6 +147,7 @@ fn wrong_arguments_exit_64_not_the_still_running_2() {
         &["stop"],
         &["why", "port"],
         &["ports", "--nope"],
+        &["bench", "scan", "--runs", "0"],
     ] {
         let out = scry(args);
         assert_eq!(out.status.code(), Some(64), "{args:?}");

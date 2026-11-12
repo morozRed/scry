@@ -217,6 +217,7 @@ fn read_process(id: ProcId) -> Option<Process> {
         cwd: None,
         project: None,
         stamps: Default::default(),
+        worker: false,
     })
 }
 
