@@ -6,7 +6,7 @@ use scry_core::disk::clean::Allows;
 use scry_core::disk::forecast::Forecast;
 use scry_core::view::disk::{DiskItem, DiskList};
 use scry_core::view::worktrees::bytes;
-use scry_core::view::{Board, Load, Tab, Tone, human_bytes};
+use scry_core::view::{Board, Load, Tab, Tone, disk_bytes};
 
 use super::{Cell, Column, Ink, Row, SortKey, ViewDef};
 
@@ -39,9 +39,14 @@ fn rows(board: &Board) -> Load<Vec<Row>> {
 }
 
 fn row(d: &DiskItem, sizing: bool) -> Row {
-    let size = |b: Option<u64>, prefix: &str| match b {
-        Some(b) if d.stale => Cell::num(format!("{prefix}{}…", human_bytes(b)), b),
-        Some(b) => Cell::num(format!("{prefix}{}", human_bytes(b)), b),
+    // A worktree whose folder is gone has nothing to wait for.
+    let size = |b: Option<u64>, prefix: &str, gone: &str| match b {
+        Some(b) if d.stale => Cell::num(format!("{prefix}{}…", disk_bytes(b)), b),
+        Some(b) => Cell::num(format!("{prefix}{}", disk_bytes(b)), b),
+        None if d.gone => Cell {
+            key: SortKey::None,
+            ..Cell::num(gone, 0)
+        },
         None if sizing => Cell::num("…", 0),
         None => Cell {
             key: SortKey::None,
@@ -58,8 +63,8 @@ fn row(d: &DiskItem, sizing: bool) -> Row {
         cells: vec![
             Cell::text(&d.name).with_context(context),
             Cell::muted(d.kind.word()),
-            size(d.size, ""),
-            size(d.frees, if d.at_least { "≥" } else { "" }),
+            size(d.size, "", "gone"),
+            size(d.frees, if d.at_least { "≥" } else { "" }, "-"),
             cleanup(d),
             Cell::muted(&d.creator),
         ],
@@ -143,12 +148,16 @@ fn outlook(list: &DiskList) -> Vec<(String, Ink)> {
                     Ink::Tone(tone),
                 ),
                 (
-                    format!(" at −{}/day", human_bytes(per_day.unsigned_abs())),
+                    format!(" at −{}/day", disk_bytes(per_day.unsigned_abs())),
                     Ink::Muted,
                 ),
             ]
         }
         Some(Forecast::NotFilling { .. }) => vec![("not filling".into(), Ink::Tone(Tone::Ok))],
+        Some(Forecast::Stale { .. }) => vec![(
+            "no forecast: the recorder has stopped; scry daemon status".into(),
+            Ink::Muted,
+        )],
         Some(Forecast::Warming {
             have_hours,
             need_hours,

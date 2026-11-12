@@ -93,8 +93,9 @@ impl Safe {
 
 /// Proof that pruning a worktree's record loses nothing: its folder is gone and no folder
 /// links back to the record, it is not locked, the record holds only git's standard files and
-/// known agent bookkeeping, and its HEAD is a branch, which pruning keeps, or a commit some
-/// other ref holds.
+/// known agent bookkeeping, its index stages nothing its HEAD lacks, and its HEAD is a branch,
+/// which pruning keeps, or a commit a local branch or tag holds. The record's reflog goes
+/// with it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Prunable {
     branch_only: Option<u32>,
@@ -112,10 +113,14 @@ pub(super) enum Reading {
     /// The folder is a valid worktree and git read it.
     Present(GitFacts),
     /// Registered, and the folder is gone. `only_here` counts the commits at the record's
-    /// HEAD that no other ref holds; on a detached HEAD a prune loses them.
+    /// HEAD that no other ref holds; on a detached HEAD a prune loses them, and those no
+    /// local branch or tag holds, `detached_only`, too.
     Missing {
         detached: bool,
         only_here: Option<u32>,
+        detached_only: u32,
+        /// The record's index stages something its HEAD lacks.
+        staged: bool,
         record_extras: Vec<String>,
         /// A folder elsewhere whose `.git` links back to this record.
         moved_to: Option<PathBuf>,
@@ -154,11 +159,13 @@ pub(super) fn judge(reading: Reading, lock: Option<&Lock>) -> WorktreeState {
         Reading::Missing {
             detached,
             only_here,
+            detached_only,
+            staged,
             record_extras,
             moved_to: None,
         } => {
-            let loses = detached && only_here != Some(0);
-            if locked.is_none() && !loses && record_extras.is_empty() {
+            let loses = detached && (only_here != Some(0) || detached_only > 0);
+            if locked.is_none() && !loses && !staged && record_extras.is_empty() {
                 WorktreeState::CanPrune(Prunable {
                     branch_only: only_here.filter(|_| !detached),
                 })
@@ -166,9 +173,22 @@ pub(super) fn judge(reading: Reading, lock: Option<&Lock>) -> WorktreeState {
                 let extras = (!record_extras.is_empty()).then_some(Concern::RecordExtras {
                     names: record_extras,
                 });
+                // Commits no ref at all holds are named once, as only here; this names those
+                // only a remote branch holds, which a fetch can drop.
+                let unheld = (detached && detached_only > 0 && only_here == Some(0)).then_some(
+                    Concern::DetachedOnly {
+                        commits: detached_only,
+                    },
+                );
                 look(
                     Concern::FolderMissing,
-                    vec![locked, only(only_here), extras],
+                    vec![
+                        locked,
+                        only(only_here),
+                        unheld,
+                        staged.then_some(Concern::Staged),
+                        extras,
+                    ],
                 )
             }
         }

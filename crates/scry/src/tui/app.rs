@@ -77,7 +77,7 @@ pub enum Mode {
     Filter,
     Sheet(Sheet),
     /// A cleanup waiting for its confirmation; a delete waits for its name to be typed.
-    Clean(CleanSheet),
+    Clean(Box<CleanSheet>),
     Help,
 }
 
@@ -89,6 +89,8 @@ pub struct CleanSheet {
     pub shown: String,
     /// Typed so far; a delete needs the plan's word.
     pub typed: String,
+    /// Said above the confirmation: the agent that writes there is running.
+    pub warning: Option<String>,
 }
 
 /// A confirmation listing exactly what an action would touch.
@@ -173,6 +175,9 @@ pub struct App {
     /// How wide the list was last drawn, which decides the columns on screen. Keys act on
     /// what was last drawn.
     pub list_width: Cell<u16>,
+    /// Says which agent that writes into a disk item is running, if one is; asked as a
+    /// cleanup's sheet opens. Nothing for a fixture.
+    pub writer: fn(&str) -> Option<String>,
 }
 
 impl App {
@@ -187,6 +192,7 @@ impl App {
             toast: None,
             fresh: Fresh::default(),
             list_width: Cell::new(MIN_W),
+            writer: |_| None,
         }
     }
 
@@ -254,7 +260,24 @@ impl App {
     /// RAM, do not count.
     pub fn replace_board(&mut self, board: Board) -> Vec<String> {
         let before = self.rows();
+        // Where the selected row stood, so when it goes, as after a cleanup, the cursor stays
+        // on the row that takes its place rather than jumping to the top.
+        let was_at = before.ready().and_then(|rows| {
+            let shown = self.shown(rows);
+            let at = self.cursor(&shown);
+            let selected = self.state().selected.as_deref()?;
+            (shown.get(at)?.row.id == selected).then_some(at)
+        });
         self.board = board;
+        if let (Some(at), Load::Ready(rows)) = (was_at, self.rows()) {
+            let shown = self.shown(&rows);
+            let selected = self.state().selected.clone();
+            let still = shown.iter().any(|s| Some(&s.row.id) == selected.as_ref());
+            if !still && let Some(next) = shown.get(at.min(shown.len().saturating_sub(1))) {
+                let id = next.row.id.clone();
+                self.state_mut().selected = Some(id);
+            }
+        }
         match (before, self.rows()) {
             (Load::Ready(old), Load::Ready(new)) => new
                 .iter()
@@ -520,8 +543,8 @@ impl App {
                 let Mode::Clean(sheet) = std::mem::replace(&mut self.mode, Mode::Normal) else {
                     return Action::None;
                 };
-                let typed = word.map(|_| sheet.typed);
-                Action::Clean(Box::new((sheet.plan, typed)))
+                let CleanSheet { plan, typed, .. } = *sheet;
+                Action::Clean(Box::new((plan, word.map(|_| typed))))
             }
             (KeyCode::Backspace, Some(_)) => {
                 sheet.typed.pop();
@@ -558,8 +581,9 @@ impl App {
                     plan: plan.clone(),
                     shown: item.path.clone(),
                     typed: String::new(),
+                    warning: (self.writer)(&plan.item),
                 };
-                return self.enter(Mode::Clean(sheet));
+                return self.enter(Mode::Clean(Box::new(sheet)));
             }
             (None, Allows::Command { command }) => (
                 format!("Scry runs nothing here. Run it yourself: {command}"),
@@ -608,6 +632,10 @@ impl App {
     }
 
     fn enter(&mut self, mode: Mode) -> Action {
+        // A sheet asks for a decision; an older word in the footer would read as its answer.
+        if matches!(mode, Mode::Sheet(_) | Mode::Clean(_)) {
+            self.toast = None;
+        }
         self.mode = mode;
         Action::Redraw
     }

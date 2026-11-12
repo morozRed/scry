@@ -32,7 +32,7 @@ use serde::Serialize;
 use crate::size::SubtreeSize;
 
 pub use creator::{Agent, Clues, CreatorEvidence, CreatorSource, ProbableCreator};
-pub use discover::{ScanOptions, apply_sizes, measure, scan};
+pub use discover::{ScanOptions, apply_sizes, measure, record_staged, scan, unheld};
 pub use verdict::{Finished, KeptBy, NothingLost, Prunable, Safe};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -49,6 +49,8 @@ pub struct Worktree {
     pub creator: ProbableCreator,
     /// When git registered it: the birth time of its record under `.git/worktrees`.
     pub created_at: Option<i64>,
+    /// Its record, `.git/worktrees/<name>`, for one git knows.
+    pub record: Option<PathBuf>,
 }
 
 impl Worktree {
@@ -285,6 +287,9 @@ pub enum Concern {
     DetachedOnly {
         commits: u32,
     },
+    /// The record's index holds staged changes that its HEAD does not: pruning the record
+    /// drops them.
+    Staged,
     /// Registered, but the folder is gone.
     FolderMissing,
     /// Registered, its folder is gone, and a folder elsewhere links back to the record: it

@@ -5,7 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use scry_core::view::{Board, Pulse, Tab, Tone, human_bytes};
+use scry_core::view::{Board, Pulse, Tab, Tone, disk_bytes, human_bytes};
 
 use unicode_width::UnicodeWidthStr;
 
@@ -123,7 +123,7 @@ fn pulse<'a>(theme: &Theme, p: &Pulse) -> Vec<Vec<Span<'a>>> {
     if let Some(disk) = &p.disk {
         let mut seg = vec![
             label("disk "),
-            Span::styled(human_bytes(disk.free), theme.text),
+            Span::styled(disk_bytes(disk.free), theme.text),
         ];
         if let Some(days) = disk.full_in_days {
             let tone = if days < FORECAST_WARN_DAYS {

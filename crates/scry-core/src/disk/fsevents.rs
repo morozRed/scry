@@ -188,11 +188,16 @@ pub fn since(paths: &[PathBuf], since: u64, timeout: Duration) -> History {
             ..History::default()
         };
     }
-    if since >= upto {
+    if since == upto {
         return History {
             upto,
             ..History::default()
         };
+    }
+    // The counter went backwards, as on a volume restored from a backup: the ids since
+    // `since` say nothing about what changed.
+    if since > upto {
+        return lost();
     }
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
@@ -323,6 +328,17 @@ mod tests {
             !h.lost && h.changed.is_empty() && h.rescan.is_empty(),
             "{h:?}"
         );
+    }
+
+    #[test]
+    fn a_counter_that_went_backwards_is_lost_history() {
+        let t = tempfile::tempdir().unwrap();
+        let h = since(
+            &[t.path().to_path_buf()],
+            current_id() + 1_000_000_000,
+            Duration::from_secs(5),
+        );
+        assert!(h.lost, "{h:?}");
     }
 
     #[test]

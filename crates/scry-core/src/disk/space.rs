@@ -58,6 +58,27 @@ pub struct Space {
     pub snapshots: Vec<String>,
 }
 
+/// Finder's available space on the volume that holds `path`, without the snapshots, so the
+/// daemon can record it with every sample.
+pub fn important(path: &Path) -> Option<u64> {
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: the URL is owned here and released before returning.
+    unsafe {
+        let url = CFURLCreateFromFileSystemRepresentation(
+            std::ptr::null(),
+            bytes.as_ptr(),
+            bytes.len() as CFIndex,
+            1,
+        );
+        if url.is_null() {
+            return None;
+        }
+        let important = number(url, kCFURLVolumeAvailableCapacityForImportantUsageKey);
+        CFRelease(url);
+        important
+    }
+}
+
 /// Reads the volume that holds `path`.
 pub fn read(path: &Path) -> Result<Space> {
     let bytes = path.as_os_str().as_bytes();

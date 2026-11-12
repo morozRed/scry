@@ -1,6 +1,8 @@
-//! When the disk fills, from the daemon's samples of available space. Nothing is said until
-//! the samples span 48 hours, and the trend is a Theil–Sen slope: the median of the slopes
-//! between every pair of samples, so one big download or a cleanup does not swing it.
+//! When the disk fills, from the daemon's samples of available space as Finder counts it,
+//! the figure the Disk view shows. Nothing is said until the samples span 48 hours, nor when
+//! the newest is over a day old, and the trend is a Theil–Sen slope: the median of the slopes
+//! between every pair of samples, so one big download or a cleanup does not swing it. The
+//! days left count from now, not from the last sample.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +12,9 @@ use crate::model::DiskSample;
 pub const NEEDS_MS: i64 = 48 * 3600 * 1000;
 /// How far back the trend looks.
 pub const WINDOW_MS: i64 = 14 * 86_400 * 1000;
+/// A newest sample older than this means the recorder stopped; a trend from then says
+/// nothing about now.
+pub const STALE_MS: i64 = 24 * 3600 * 1000;
 /// Further out than this reads as not filling.
 const HORIZON_DAYS: f64 = 365.0;
 /// Pairs grow with the square of the samples, so long histories are thinned to this many.
@@ -20,6 +25,8 @@ const MAX_POINTS: usize = 400;
 pub enum Forecast {
     /// The recorder has written nothing for this volume.
     NoSamples,
+    /// The newest sample is more than a day old.
+    Stale { hours_ago: f64 },
     /// Under 48 hours of samples.
     Warming { have_hours: f64, need_hours: f64 },
     /// Free space is flat or growing, or would last past a year.
@@ -46,6 +53,11 @@ impl Forecast {
             Forecast::NoSamples => "No disk history yet. A forecast needs 48 h of samples from \
                                     the background recorder; start it with scry daemon install."
                 .into(),
+            Forecast::Stale { hours_ago } => format!(
+                "No forecast: the newest sample is {} old, so the recorder has stopped; \
+                 scry daemon status says why.",
+                ago(*hours_ago)
+            ),
             Forecast::Warming {
                 have_hours,
                 need_hours,
@@ -55,7 +67,7 @@ impl Forecast {
                 hours(need_hours - have_hours)
             ),
             Forecast::NotFilling { per_day, over_days } => format!(
-                "Not filling: over the last {} free space {} {} a day.",
+                "Not filling: over the last {} available space {} {} a day.",
                 days(*over_days),
                 if *per_day >= 0 { "grew" } else { "shrank" },
                 crate::view::worktrees::bytes(per_day.unsigned_abs())
@@ -65,7 +77,7 @@ impl Forecast {
                 per_day,
                 over_days,
             } => format!(
-                "Full in ~{} at the pace of the last {}: {} less free space a day.",
+                "Full in ~{} at the pace of the last {}: {} less available a day.",
                 days(*d),
                 days(*over_days),
                 crate::view::worktrees::bytes(per_day.unsigned_abs())
@@ -83,6 +95,14 @@ fn hours(h: f64) -> String {
     }
 }
 
+fn ago(h: f64) -> String {
+    if h < 48.0 {
+        format!("{:.0} h", h.round())
+    } else {
+        days(h / 24.0)
+    }
+}
+
 fn days(d: f64) -> String {
     match d.round() as i64 {
         n if n <= 1 => "1 day".into(),
@@ -90,16 +110,32 @@ fn days(d: f64) -> String {
     }
 }
 
-/// The forecast from `samples` of one volume, oldest first, as of `now_ms`.
+/// The forecast from `samples` of one volume, oldest first, as of `now_ms`. Only samples
+/// that hold Finder's available space count.
 pub fn forecast(samples: &[DiskSample], now_ms: i64) -> Forecast {
-    let recent: Vec<&DiskSample> = samples
+    let in_window: Vec<&DiskSample> = samples
         .iter()
         .filter(|s| s.at_ms >= now_ms - WINDOW_MS && s.at_ms <= now_ms)
         .collect();
-    let (Some(first), Some(last)) = (recent.first(), recent.last()) else {
+    let recent: Vec<(i64, u64)> = in_window
+        .iter()
+        .filter_map(|s| Some((s.at_ms, s.important_bytes?)))
+        .collect();
+    let Some(newest) = in_window.last() else {
         return Forecast::NoSamples;
     };
-    let span = last.at_ms - first.at_ms;
+    if now_ms - newest.at_ms > STALE_MS {
+        return Forecast::Stale {
+            hours_ago: (now_ms - newest.at_ms) as f64 / 3_600_000.0,
+        };
+    }
+    let (Some(first), Some(last)) = (recent.first(), recent.last()) else {
+        return Forecast::Warming {
+            have_hours: 0.0,
+            need_hours: NEEDS_MS as f64 / 3_600_000.0,
+        };
+    };
+    let span = last.0 - first.0;
     if span < NEEDS_MS || recent.len() < 3 {
         return Forecast::Warming {
             have_hours: span as f64 / 3_600_000.0,
@@ -110,7 +146,7 @@ pub fn forecast(samples: &[DiskSample], now_ms: i64) -> Forecast {
     let points: Vec<(f64, f64)> = recent
         .iter()
         .step_by(step)
-        .map(|s| (s.at_ms as f64 / 86_400_000.0, s.avail_bytes as f64))
+        .map(|&(at, avail)| (at as f64 / 86_400_000.0, avail as f64))
         .collect();
     let slope = theil_sen(&points);
     let over_days = span as f64 / 86_400_000.0;
@@ -118,7 +154,9 @@ pub fn forecast(samples: &[DiskSample], now_ms: i64) -> Forecast {
     if slope >= 0.0 {
         return Forecast::NotFilling { per_day, over_days };
     }
-    let days = last.avail_bytes as f64 / -slope;
+    // Days from the last sample at its pace, less the time since it was taken.
+    let since_last = (now_ms - last.0) as f64 / 86_400_000.0;
+    let days = (last.1 as f64 / -slope - since_last).max(0.0);
     if days > HORIZON_DAYS {
         return Forecast::NotFilling { per_day, over_days };
     }
@@ -173,6 +211,7 @@ mod tests {
                     total_bytes: 1000 * GB,
                     free_bytes: avail as u64,
                     avail_bytes: avail as u64,
+                    important_bytes: Some(avail as u64),
                 }
             })
             .collect()
@@ -263,6 +302,58 @@ mod tests {
             matches!(f, Forecast::NotFilling { per_day: 0, .. }),
             "{f:?}"
         );
+    }
+
+    #[test]
+    fn the_countdown_runs_from_now_not_from_the_last_sample() {
+        let at = |hours_ago: i64, gb: u64| DiskSample {
+            at_ms: NOW - hours_ago * HOUR,
+            volume: "/".into(),
+            total_bytes: 1000 * GB,
+            free_bytes: gb * GB,
+            avail_bytes: gb * GB,
+            important_bytes: Some(gb * GB),
+        };
+        // 70, 60 and 50 GB seven, six and five days ago, and nothing since: no forecast.
+        let mut s = vec![at(7 * 24, 70), at(6 * 24, 60), at(5 * 24, 50)];
+        assert!(matches!(forecast(&s, NOW), Forecast::Stale { .. }));
+        // The same pace, last sampled twenty hours ago with 8 GB left: from that sample it
+        // would read as most of a day, but those twenty hours have passed.
+        s.push(at(20, 8));
+        let f = forecast(&s, NOW);
+        let Forecast::FullIn { days, .. } = f else {
+            panic!("{f:?}")
+        };
+        assert!(days < 0.1, "{days}");
+    }
+
+    #[test]
+    fn a_stopped_recorder_gives_no_forecast() {
+        let s = series(NOW - 3 * 24 * HOUR, 72, 100 * GB, -2 * GB as i64);
+        let f = forecast(&s, NOW);
+        assert!(
+            matches!(f, Forecast::Stale { hours_ago } if (hours_ago - 72.0).abs() < 0.1),
+            "{f:?}"
+        );
+        assert!(f.sentence().contains("3 days old"), "{}", f.sentence());
+        assert_eq!(f.full_in_days(), None);
+    }
+
+    #[test]
+    fn the_forecast_follows_finders_available_not_statfs() {
+        // statfs's figure is flat, but Finder's available falls 2 GB a day: purgeable space
+        // is being used up.
+        let mut s = series(NOW, 72, 100 * GB, -2 * GB as i64);
+        for x in &mut s {
+            x.avail_bytes = 20 * GB;
+            x.free_bytes = 20 * GB;
+        }
+        assert!(matches!(forecast(&s, NOW), Forecast::FullIn { .. }));
+        // Samples from before Scry kept Finder's figure do not count.
+        for x in &mut s {
+            x.important_bytes = None;
+        }
+        assert!(matches!(forecast(&s, NOW), Forecast::Warming { .. }));
     }
 
     #[test]

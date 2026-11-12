@@ -1,7 +1,15 @@
 //! Sizes kept in the store between readings. FSEvents says which folders changed since each
 //! was measured, and only those are walked again; a size is never patched from an event.
-//! A folder replaced by another (a new inode), dropped events, or an event log that was reset
-//! make the size stale too.
+//! A folder replaced by another (a new inode), dropped events, an event log that was reset
+//! or an event counter that went backwards make the size stale too.
+//!
+//! A single file, such as Docker's disk, is read again with `lstat` every time: it grows in
+//! place, and the events name only its folder.
+//!
+//! A hard-linked file is counted in the first part a walk meets it in. A part walked alone
+//! could count it again while another part keeps a cached size that counts it, so when a
+//! walk meets a hard-linked file with a link outside what it walked, or a part walked again
+//! held one before, every part is walked again together.
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
@@ -12,7 +20,7 @@ use serde::Serialize;
 
 use super::fsevents;
 use crate::paths::Paths;
-use crate::protected::{FileId, file_id};
+use crate::protected::file_id;
 use crate::size::{SubtreeSize, Walker, measure_file};
 use crate::store::{SizeRow, Store};
 
@@ -73,8 +81,12 @@ pub struct CacheStats {
     pub held: usize,
     /// Parts walked again.
     pub measured: usize,
-    /// FSEvents lost events, or its log was reset: everything was measured.
+    /// FSEvents lost events, its log was reset, or its counter went backwards: everything
+    /// was measured.
     pub lost: bool,
+    /// A part walked again shares hard-linked files with parts that were not, so every part
+    /// was walked again together.
+    pub relinked: bool,
     pub history_ms: f64,
     pub walk_ms: f64,
 }
@@ -156,12 +168,15 @@ impl SizeCache {
                 return look;
             }
         }
-        let mut rows: HashMap<(PathBuf, bool), SizeRow> = store
-            .size_rows()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| ((r.path.clone(), r.top), r))
-            .collect();
+        // Paths compare by component, so `x` and an older Scry's `x/` are one key: the row
+        // checked last wins.
+        let mut rows: HashMap<(PathBuf, bool), SizeRow> = HashMap::new();
+        for r in store.size_rows().unwrap_or_default() {
+            let key = (r.path.clone(), r.top);
+            if rows.get(&key).is_none_or(|old| old.event_id < r.event_id) {
+                rows.insert(key, r);
+            }
+        }
 
         // A part is a candidate when its row is for the same folder on the logged volume.
         let mut since = vec![u64::MAX; n];
@@ -172,8 +187,10 @@ impl SizeCache {
             let Some(row) = rows.remove(&(p.path.clone(), p.top)) else {
                 continue;
             };
-            let same = std::fs::symlink_metadata(&p.path)
-                .is_ok_and(|m| file_id(&m) == row.id && m.dev() as i32 == dev);
+            let meta = std::fs::symlink_metadata(&p.path);
+            let same = meta
+                .as_ref()
+                .is_ok_and(|m| file_id(m) == row.id && m.dev() as i32 == dev && !m.is_file());
             if same {
                 since[i] = row.event_id;
                 stale_now[i] = row.dirty;
@@ -184,6 +201,14 @@ impl SizeCache {
         }
         let candidates: Vec<usize> = (0..n).filter(|&i| since[i] != u64::MAX).collect();
         if candidates.is_empty() {
+            look.stats.history_ms = ms(start);
+            return look;
+        }
+        // A row stamped after the counter's present comes from a log that went back, as on a
+        // restored volume; nothing it says can be trusted.
+        let present = fsevents::current_id();
+        if candidates.iter().any(|&i| since[i] > present) {
+            look.stats.lost = true;
             look.stats.history_ms = ms(start);
             return look;
         }
@@ -262,53 +287,58 @@ impl SizeCache {
         let mut stats = look.stats;
         // Stamped before the walk, so a change made while it runs is seen by the next look.
         let event_id = fsevents::current_id();
-        let stale: Vec<usize> = (0..parts.len()).filter(|&i| look.stale[i]).collect();
-        let ids: Vec<Option<FileId>> = stale
-            .iter()
-            .map(|&i| {
-                std::fs::symlink_metadata(&parts[i].path)
-                    .ok()
-                    .map(|m| file_id(&m))
-            })
-            .collect();
-        let is_file: Vec<bool> = stale
-            .iter()
-            .map(|&i| std::fs::symlink_metadata(&parts[i].path).is_ok_and(|m| m.is_file()))
-            .collect();
-        let folders: Vec<PathBuf> = stale
-            .iter()
-            .zip(&is_file)
-            .filter(|(_, f)| !**f)
-            .map(|(&i, _)| parts[i].path.clone())
-            .collect();
-        // Every folder that is a part of its own, so a `top` part reads only its files and
-        // no folder is counted twice. A walk still enters its own root.
-        let mut fence: Vec<PathBuf> = parts.iter().map(|p| p.path.clone()).collect();
-        fence.extend(exclude.iter().cloned());
-        let mut walked = Walker::new(home)
-            .exclude(fence)
-            .parts(1)
-            .measure(&folders)
-            .into_iter();
-
+        let now = crate::sys::now_ms();
         let mut out: Vec<SubtreeSize> = look
             .cached
             .iter()
             .map(|c| c.clone().unwrap_or_default())
             .collect();
         let mut rows = Vec::new();
-        let now = crate::sys::now_ms();
-        for ((&i, id), file) in stale.iter().zip(ids).zip(is_file) {
-            let size = if file {
-                measure_file(&parts[i].path)
-            } else {
-                walked.next().unwrap_or_default()
-            };
+        let is_file =
+            |i: usize| std::fs::symlink_metadata(&parts[i].path).is_ok_and(|m| m.is_file());
+        let (files, mut folders): (Vec<usize>, Vec<usize>) = (0..parts.len())
+            .filter(|&i| look.stale[i])
+            .partition(|&i| is_file(i));
+        for &i in &files {
+            out[i] = measure_file(&parts[i].path);
+            let id = std::fs::symlink_metadata(&parts[i].path).ok();
+            if let (None, Some(m)) = (&out[i].error, id) {
+                rows.push(SizeRow {
+                    path: parts[i].path.clone(),
+                    top: parts[i].top,
+                    id: file_id(&m),
+                    size: out[i].clone(),
+                    event_id,
+                    measured_ms: now,
+                    dirty: false,
+                });
+            }
+        }
+        let held_links = folders
+            .iter()
+            .any(|&i| look.cached[i].as_ref().is_some_and(|c| c.shared_links));
+        let mut walked = self.walk(parts, &folders, home, exclude);
+        let met_links = walked.iter().any(|(_, s)| s.shared_links);
+        if !folders.is_empty() && (held_links || met_links) {
+            let every: Vec<usize> = (0..parts.len()).filter(|&i| !is_file(i)).collect();
+            if every.len() > folders.len() {
+                folders = every;
+                walked = self.walk(parts, &folders, home, exclude);
+                stats.relinked = true;
+            }
+        }
+        for (i, size) in walked {
             let big = size.files + size.dirs > self.split_above;
             if size.error.is_none() && big && !parts[i].top {
                 // The same walk, in parts: stored so the next layout measures them apart.
                 for p in &size.parts {
-                    let path = parts[i].path.join(&p.rel);
+                    // Joined with an empty part, a path gains a trailing slash, and the store
+                    // would key it apart from the part itself.
+                    let path = if p.rel.as_os_str().is_empty() {
+                        parts[i].path.clone()
+                    } else {
+                        parts[i].path.join(&p.rel)
+                    };
                     if let Ok(m) = std::fs::symlink_metadata(&path) {
                         rows.push(SizeRow {
                             path,
@@ -322,6 +352,9 @@ impl SizeCache {
                     }
                 }
             }
+            let id = std::fs::symlink_metadata(&parts[i].path)
+                .ok()
+                .map(|m| file_id(&m));
             if let (None, Some(id)) = (&size.error, id) {
                 rows.push(SizeRow {
                     path: parts[i].path.clone(),
@@ -338,9 +371,29 @@ impl SizeCache {
         if let Some(store) = &self.store {
             let _ = store.put_size_rows(&rows);
         }
-        stats.measured = stale.len();
+        stats.measured = files.len() + folders.len();
         stats.walk_ms = ms(start);
         (out, stats)
+    }
+
+    /// The folder parts `which` measured in one walk, with one record of hard links.
+    fn walk(
+        &self,
+        parts: &[Part],
+        which: &[usize],
+        home: &Path,
+        exclude: &[PathBuf],
+    ) -> Vec<(usize, SubtreeSize)> {
+        if which.is_empty() {
+            return Vec::new();
+        }
+        let folders: Vec<PathBuf> = which.iter().map(|&i| parts[i].path.clone()).collect();
+        // Every folder that is a part of its own, so a `top` part reads only its files and
+        // no folder is counted twice. A walk still enters its own root.
+        let mut fence: Vec<PathBuf> = parts.iter().map(|p| p.path.clone()).collect();
+        fence.extend(exclude.iter().cloned());
+        let sizes = Walker::new(home).exclude(fence).parts(1).measure(&folders);
+        which.iter().copied().zip(sizes).collect()
     }
 }
 
@@ -545,6 +598,102 @@ mod tests {
         assert_eq!(l.stale, [true]);
         assert!(l.stats.lost, "a different log reads as lost history");
         assert!(l.cached[0].is_none());
+    }
+
+    fn write_mib(path: &Path, seed: u8) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Varied bytes, so nothing stores it sparse or compressed.
+        let data: Vec<u8> = (0..1 << 20)
+            .map(|i: u32| (i as u8).wrapping_mul(13) ^ seed)
+            .collect();
+        fs::write(path, data).unwrap();
+    }
+
+    #[test]
+    fn a_part_walked_again_alone_never_counts_a_hard_link_twice() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let caches = home.join("Caches");
+        write_mib(&caches.join("a/big"), 1);
+        fs::create_dir_all(caches.join("b")).unwrap();
+        fs::hard_link(caches.join("a/big"), caches.join("b/link")).unwrap();
+        let parts = vec![Part::whole(caches.join("a")), Part::whole(caches.join("b"))];
+        let c = cache(state.path());
+        let l = c.look(&parts, &home);
+        let (cold, _) = c.measure(&parts, &l, &home, &[]);
+        let total = |s: &[SubtreeSize]| s.iter().map(|x| x.size.allocated).sum::<u64>();
+        let first = total(&cold);
+        assert!(
+            (1 << 20..1 << 21).contains(&first),
+            "counted once: {cold:?}"
+        );
+        assert!(cold.iter().all(|s| s.shared_links));
+
+        // Only the part the link was not counted in changes.
+        let zero = cold
+            .iter()
+            .position(|s| s.size.allocated < 1 << 19)
+            .unwrap();
+        fs::write(parts[zero].path.join("small"), b"x").unwrap();
+        let mut want = [false, false];
+        want[zero] = true;
+        let l = look_until(&c, &parts, &home, &want);
+        assert_eq!(l.stale, want);
+        let (warm, stats) = c.measure(&parts, &l, &home, &[]);
+        assert!(stats.relinked, "{stats:?}");
+        assert_eq!(stats.measured, 2);
+        let second = total(&warm);
+        assert!(
+            second < first + (1 << 19),
+            "still counted once: {first} then {second}"
+        );
+    }
+
+    #[test]
+    fn a_single_file_is_read_again_on_every_look() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let raw = home.join("vms/0/data/Docker.raw");
+        fs::create_dir_all(raw.parent().unwrap()).unwrap();
+        fs::write(&raw, vec![1u8; 64 * 1024]).unwrap();
+        let parts = vec![Part::whole(raw.clone())];
+        let c = cache(state.path());
+        let l = c.look(&parts, &home);
+        let (before, _) = c.measure(&parts, &l, &home, &[]);
+        // Grown in place, the same inode: an event would name only its folder.
+        let mut f = fs::OpenOptions::new().append(true).open(&raw).unwrap();
+        std::io::Write::write_all(&mut f, &vec![2u8; 1 << 20]).unwrap();
+        drop(f);
+        let l = c.look(&parts, &home);
+        assert_eq!(l.stale, [true], "never trusted from the cache");
+        assert!(l.cached[0].is_some(), "the last size shows meanwhile");
+        let (after, _) = c.measure(&parts, &l, &home, &[]);
+        assert!(
+            after[0].size.allocated >= before[0].size.allocated + (1 << 20),
+            "{before:?} then {after:?}"
+        );
+    }
+
+    #[test]
+    fn an_event_counter_that_went_backwards_makes_every_size_stale() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::create_dir_all(home.join("x")).unwrap();
+        let parts = vec![Part::whole(home.join("x"))];
+        let c = cache(state.path());
+        let l = c.look(&parts, &home);
+        c.measure(&parts, &l, &home, &[]);
+        let store = c.store().unwrap();
+        // As if the volume came back from a backup: the rows are ahead of the counter.
+        let mut rows = store.size_rows().unwrap();
+        rows[0].event_id = fsevents::current_id() + 1_000_000_000;
+        store.put_size_rows(&rows).unwrap();
+        let l = c.look(&parts, &home);
+        assert_eq!(l.stale, [true]);
+        assert!(l.stats.lost);
     }
 
     #[test]

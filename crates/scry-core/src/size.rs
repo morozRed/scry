@@ -45,6 +45,14 @@ pub struct SubtreeSize {
     /// tree in parts needs it for a part below the tree's root.
     #[serde(default)]
     pub git_at_root: bool,
+    /// Folders inside it on another volume, such as a mounted disk image. They are not
+    /// entered, so nothing in them is counted.
+    #[serde(default)]
+    pub mounts: u64,
+    /// It holds a hard-linked file with a link the walk met elsewhere or did not meet at all,
+    /// so its allocated bytes depend on what else was walked with it.
+    #[serde(default)]
+    pub shared_links: bool,
     /// Why the subtree was not walked at all.
     pub error: Option<String>,
     /// The same walk cut into parts, when [`Walker::parts`] asked for them.
@@ -169,6 +177,8 @@ impl Walker {
                 o.skipped += t.skipped;
                 o.repos.extend(t.repos);
                 o.git_at_root |= t.git_at_root;
+                o.mounts += t.mounts;
+                o.shared_links |= t.shared_links;
             }
             for (all, mine) in parts.iter_mut().zip(w.parts) {
                 for (k, t) in mine {
@@ -180,6 +190,12 @@ impl Walker {
             o.repos.sort();
         }
         for link in links.into_inner().unwrap().into_values() {
+            if link.seen < link.nlink || link.shared || link.part_shared {
+                out[link.tree].shared_links = true;
+                if let Some(k) = &link.part {
+                    parts[link.tree].entry(k.clone()).or_default().shared_links = true;
+                }
+            }
             if link.seen >= link.nlink && !link.shared {
                 out[link.tree].size.reclaimable += link.private;
                 if let (Some(k), false) = (link.part, link.part_shared) {
@@ -347,6 +363,8 @@ struct Tally {
     repos: Vec<PathBuf>,
     /// For a tree, a `.git` in its root; while one folder is counted, a `.git` in it.
     git_at_root: bool,
+    mounts: u64,
+    shared_links: bool,
 }
 
 impl Tally {
@@ -358,6 +376,8 @@ impl Tally {
         self.skipped += o.skipped;
         self.repos.extend(o.repos.iter().cloned());
         self.git_at_root |= o.git_at_root;
+        self.mounts += o.mounts;
+        self.shared_links |= o.shared_links;
     }
 
     fn into_size(mut self) -> SubtreeSize {
@@ -372,6 +392,8 @@ impl Tally {
             skipped: self.skipped,
             repos: self.repos,
             git_at_root: self.git_at_root,
+            mounts: self.mounts,
+            shared_links: self.shared_links,
             ..SubtreeSize::default()
         }
     }
@@ -545,15 +567,15 @@ impl Ctx<'_> {
         if e.name.eq_ignore_ascii_case(b".git") {
             t.git_at_root = true;
         }
-        if e.dev != self.devs[tree] {
+        let id = (e.dev, e.ino);
+        // Only a volume mounted here has another device; the kernel may not say it is a
+        // folder.
+        if e.dev != self.devs[tree] || (e.objtype == VDIR && e.mount_point) {
+            t.mounts += 1;
             return;
         }
-        let id = (e.dev, e.ino);
         if e.objtype == VDIR {
-            if e.mount_point
-                || self.walker.exclude.contains(&id)
-                || self.walker.protected.folder(id).is_some()
-            {
+            if self.walker.exclude.contains(&id) || self.walker.protected.folder(id).is_some() {
                 return;
             }
             let Ok(name) = CString::new(e.name) else {
@@ -588,7 +610,9 @@ impl Ctx<'_> {
             Some(link) => {
                 link.seen += 1;
                 link.shared |= link.tree != tree;
-                link.part_shared |= link.tree != tree || link.part.as_ref() != at.part;
+                let elsewhere = link.tree != tree || link.part.as_ref() != at.part;
+                link.part_shared |= elsewhere;
+                t.shared_links |= elsewhere;
             }
             None => {
                 t.allocated += e.alloc;

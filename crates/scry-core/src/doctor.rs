@@ -556,6 +556,7 @@ mod tests {
                 total_bytes: 10,
                 free_bytes: 5,
                 avail_bytes: 4,
+                important_bytes: None,
             }),
         };
         s

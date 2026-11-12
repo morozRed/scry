@@ -20,7 +20,7 @@
     "memory": "normal",
     "swap_used": 1288490188,
     "disk": {
-      "free": 90194313216,
+      "free": 84000000000,
       "full_in_days": 19
     }
   },
@@ -897,8 +897,8 @@
           "repo": "acme",
           "branch": "feat/auth",
           "state": "can_go",
-          "size": 1350565888,
-          "frees": 956301312,
+          "size": 1257812500,
+          "frees": 912000000,
           "creator": "Claude Code",
           "last_commit": "3d",
           "detail": {
@@ -937,8 +937,8 @@
           "repo": "acme",
           "branch": "worktree-agent-7f3a9c2e",
           "state": "can_go",
-          "size": 451936256,
-          "frees": 421527552,
+          "size": 431000000,
+          "frees": 402000000,
           "creator": "Claude Code",
           "last_commit": "2d",
           "detail": {
@@ -980,6 +980,7 @@
           "frees": null,
           "creator": "Codex",
           "last_commit": null,
+          "gone": true,
           "detail": {
             "title": "2c41/billing-api · billing-api",
             "facts": [
@@ -989,14 +990,14 @@
               },
               {
                 "label": "size",
-                "value": "not measured"
+                "value": "folder is gone"
               },
               {
                 "label": "creator",
                 "value": "Codex"
               }
             ],
-            "sentence": "2c41/billing-api is registered in billing-api but its folder is gone; `git worktree prune` removes only the record and frees almost nothing.",
+            "sentence": "2c41/billing-api is registered in billing-api but its folder is gone; pruning removes only its own record and frees almost nothing.",
             "evidence": [
               "path ~/.codex/worktrees/2c41/billing-api",
               "branch fix/rounding at 0c33e81",
@@ -1011,8 +1012,8 @@
           "repo": "acme",
           "branch": "spike/search",
           "state": "needs_look",
-          "size": 2363490304,
-          "frees": 1814036480,
+          "size": 2201171875,
+          "frees": 1689453125,
           "creator": "unknown",
           "last_commit": "2w",
           "detail": {
@@ -1050,8 +1051,8 @@
           "repo": "acme",
           "branch": "feat/settings-ui",
           "state": "dirty",
-          "size": 1052770304,
-          "frees": 639631360,
+          "size": 1004000000,
+          "frees": 610000000,
           "creator": "Claude Code",
           "last_commit": "2h",
           "detail": {
@@ -1063,7 +1064,7 @@
               },
               {
                 "label": "size",
-                "value": "1004 MB"
+                "value": "1.0 GB"
               },
               {
                 "label": "creator",
@@ -1089,8 +1090,8 @@
           "repo": "billing-api",
           "branch": "codex/refactor-ledger",
           "state": "active",
-          "size": 686817280,
-          "frees": 102760448,
+          "size": 655000000,
+          "frees": 98000000,
           "creator": "Codex",
           "last_commit": "5h",
           "detail": {
@@ -1128,8 +1129,8 @@
           "repo": "acme",
           "branch": "release/2.4",
           "state": "locked",
-          "size": 1505755136,
-          "frees": 1155530752,
+          "size": 1402343750,
+          "frees": 1076171875,
           "creator": "unknown",
           "last_commit": "3w",
           "detail": {
@@ -1176,9 +1177,9 @@
     "value": {
       "space": {
         "volume": "Macintosh HD",
-        "total": 994662584320,
-        "available": 90194313216,
-        "purgeable": 22548578304,
+        "total": 926351718903,
+        "available": 84000000000,
+        "purgeable": 21000000000,
         "snapshots": [
           "com.apple.TimeMachine.2026-11-10-091502.local",
           "com.apple.TimeMachine.2026-11-11-091447.local"
@@ -1187,12 +1188,12 @@
       "forecast": {
         "state": "full_in",
         "days": 19.3,
-        "per_day": -4724464025,
+        "per_day": -4399999999,
         "over_days": 6.0
       },
       "trash": {
         "known": "scry",
-        "bytes": 2576980377,
+        "bytes": 2399999999,
         "items": 2
       },
       "items": [
@@ -1201,8 +1202,8 @@
           "name": "Docker.raw",
           "kind": "docker",
           "path": "~/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw",
-          "size": 68719476736,
-          "frees": 68719476736,
+          "size": 64000000000,
+          "frees": 64000000000,
           "at_least": false,
           "stale": false,
           "creator": "Docker Desktop",
@@ -1246,8 +1247,8 @@
           "name": "Xcode DerivedData",
           "kind": "xcode",
           "path": "~/Library/Developer/Xcode/DerivedData",
-          "size": 22978075033,
-          "frees": 22441204121,
+          "size": 21399999999,
+          "frees": 20899999999,
           "at_least": true,
           "stale": false,
           "creator": "Xcode",
@@ -1265,8 +1266,8 @@
               16777234,
               9001
             ],
-            "allocated": 22978075033,
-            "reclaimable": 22441204121,
+            "allocated": 21399999999,
+            "reclaimable": 20899999999,
             "repo": null,
             "word": "Xcode DerivedData"
           },
@@ -1304,8 +1305,8 @@
           "name": "Simulator devices",
           "kind": "simulators",
           "path": "~/Library/Developer/CoreSimulator",
-          "size": 15247133900,
-          "frees": 12670153523,
+          "size": 14199999999,
+          "frees": 11800000000,
           "at_least": true,
           "stale": false,
           "creator": "Xcode",
@@ -1349,8 +1350,8 @@
           "name": "Claude Code sessions",
           "kind": "agent_logs",
           "path": "~/.claude/projects",
-          "size": 4402341478,
-          "frees": 4402341478,
+          "size": 4100000000,
+          "frees": 4100000000,
           "at_least": false,
           "stale": false,
           "creator": "Claude Code",
@@ -1367,8 +1368,8 @@
               16777234,
               9002
             ],
-            "allocated": 4402341478,
-            "reclaimable": 4402341478,
+            "allocated": 4100000000,
+            "reclaimable": 4100000000,
             "repo": null,
             "word": null
           },
@@ -1406,8 +1407,8 @@
           "name": "npm cache",
           "kind": "package_cache",
           "path": "~/.npm",
-          "size": 3972844748,
-          "frees": 3972844748,
+          "size": 3699999999,
+          "frees": 3699999999,
           "at_least": false,
           "stale": false,
           "creator": "npm",
@@ -1425,8 +1426,8 @@
               16777234,
               9003
             ],
-            "allocated": 3972844748,
-            "reclaimable": 3972844748,
+            "allocated": 3699999999,
+            "reclaimable": 3699999999,
             "repo": null,
             "word": "npm cache"
           },
@@ -1464,8 +1465,8 @@
           "name": "App caches",
           "kind": "app_caches",
           "path": "~/Library/Caches",
-          "size": 3328599654,
-          "frees": 3221225472,
+          "size": 3100000000,
+          "frees": 3000000000,
           "at_least": true,
           "stale": false,
           "creator": "apps",
@@ -1509,8 +1510,8 @@
           "name": "Homebrew cache",
           "kind": "package_cache",
           "path": "~/Library/Caches/Homebrew",
-          "size": 2362232012,
-          "frees": 2362232012,
+          "size": 2199999999,
+          "frees": 2199999999,
           "at_least": false,
           "stale": false,
           "creator": "Homebrew",
@@ -1554,8 +1555,8 @@
           "name": "pnpm store",
           "kind": "package_cache",
           "path": "~/Library/pnpm/store",
-          "size": 6871947673,
-          "frees": 2254857830,
+          "size": 6399999999,
+          "frees": 2100000000,
           "at_least": true,
           "stale": false,
           "creator": "pnpm",
@@ -1599,8 +1600,8 @@
           "name": "Cargo registry",
           "kind": "package_cache",
           "path": "~/.cargo/registry",
-          "size": 2040109465,
-          "frees": 2040109465,
+          "size": 1899999999,
+          "frees": 1899999999,
           "at_least": false,
           "stale": false,
           "creator": "Cargo",
@@ -1618,8 +1619,8 @@
               16777234,
               9006
             ],
-            "allocated": 2040109465,
-            "reclaimable": 2040109465,
+            "allocated": 1899999999,
+            "reclaimable": 1899999999,
             "repo": null,
             "word": "Cargo registry"
           },
@@ -1657,8 +1658,8 @@
           "name": "wt-search",
           "kind": "worktree",
           "path": "~/work/acme-wt-search",
-          "size": 2363490304,
-          "frees": 1814036480,
+          "size": 2201171875,
+          "frees": 1689453125,
           "at_least": true,
           "stale": false,
           "creator": "unknown",
@@ -1703,8 +1704,8 @@
           "name": "Xcode Archives",
           "kind": "xcode",
           "path": "~/Library/Developer/Xcode/Archives",
-          "size": 1717986918,
-          "frees": 1717986918,
+          "size": 1600000000,
+          "frees": 1600000000,
           "at_least": false,
           "stale": false,
           "creator": "Xcode",
@@ -1721,8 +1722,8 @@
               16777234,
               9007
             ],
-            "allocated": 1717986918,
-            "reclaimable": 1717986918,
+            "allocated": 1600000000,
+            "reclaimable": 1600000000,
             "repo": null,
             "word": null
           },
@@ -1760,8 +1761,8 @@
           "name": "wt-release",
           "kind": "worktree",
           "path": "~/work/acme-wt-release",
-          "size": 1505755136,
-          "frees": 1155530752,
+          "size": 1402343750,
+          "frees": 1076171875,
           "at_least": true,
           "stale": false,
           "creator": "unknown",
@@ -1806,8 +1807,8 @@
           "name": "web/node_modules",
           "kind": "node_modules",
           "path": "~/sources/acme/web/node_modules",
-          "size": 3006477107,
-          "frees": 966367641,
+          "size": 2800000000,
+          "frees": 921599999,
           "at_least": true,
           "stale": false,
           "creator": "package manager",
@@ -1825,8 +1826,8 @@
               16777234,
               9004
             ],
-            "allocated": 3006477107,
-            "reclaimable": 966367641,
+            "allocated": 2800000000,
+            "reclaimable": 921599999,
             "repo": null,
             "word": "web/node_modules"
           },
@@ -1864,8 +1865,8 @@
           "name": "wt-auth",
           "kind": "worktree",
           "path": "~/sources/acme/.claude/worktrees/wt-auth",
-          "size": 1350565888,
-          "frees": 956301312,
+          "size": 1257812500,
+          "frees": 912000000,
           "at_least": true,
           "stale": false,
           "creator": "Claude Code",
@@ -1882,8 +1883,8 @@
               16777234,
               9011
             ],
-            "allocated": 1350565888,
-            "reclaimable": 956301312,
+            "allocated": 1257812500,
+            "reclaimable": 912000000,
             "repo": "/Users/dev/sources/acme",
             "word": null
           },
@@ -1912,7 +1913,7 @@
               "path ~/sources/acme/.claude/worktrees/wt-auth",
               "a worktree of acme, labelled can go",
               "1.3 GB on disk in 12000 files; a delete frees at least 912 MB at once; the rest is shared with clones, snapshots or hard links",
-              "cleanup: moved to the Trash, then `git worktree prune` drops git's record; Put Back restores the folder",
+              "cleanup: its folder moves to the Trash and git keeps its record, so Put Back in Finder gives a working checkout; pruning the record is a separate step",
               "made by Claude Code"
             ]
           }
@@ -1922,8 +1923,8 @@
           "name": "Codex sessions",
           "kind": "agent_logs",
           "path": "~/.codex/sessions",
-          "size": 859832320,
-          "frees": 859832320,
+          "size": 820000000,
+          "frees": 820000000,
           "at_least": false,
           "stale": false,
           "creator": "Codex",
@@ -1940,8 +1941,8 @@
               16777234,
               9008
             ],
-            "allocated": 859832320,
-            "reclaimable": 859832320,
+            "allocated": 820000000,
+            "reclaimable": 820000000,
             "repo": null,
             "word": null
           },
@@ -1979,8 +1980,8 @@
           "name": "wt-ui",
           "kind": "worktree",
           "path": "~/sources/acme/.claude/worktrees/wt-ui",
-          "size": 1052770304,
-          "frees": 639631360,
+          "size": 1004000000,
+          "frees": 610000000,
           "at_least": true,
           "stale": false,
           "creator": "Claude Code",
@@ -1995,7 +1996,7 @@
             "facts": [
               {
                 "label": "size",
-                "value": "1004 MB"
+                "value": "1.0 GB"
               },
               {
                 "label": "frees",
@@ -2014,7 +2015,7 @@
             "evidence": [
               "path ~/sources/acme/.claude/worktrees/wt-ui",
               "a worktree of acme, labelled dirty",
-              "1004 MB on disk in 12000 files; a delete frees at least 610 MB at once; the rest is shared with clones, snapshots or hard links",
+              "1.0 GB on disk in 12000 files; a delete frees at least 610 MB at once; the rest is shared with clones, snapshots or hard links",
               "cleanup: none; Scry shows its size only",
               "made by Claude Code"
             ]
@@ -2025,8 +2026,8 @@
           "name": "agent-7f3a9c2e",
           "kind": "worktree",
           "path": "~/sources/acme/.claude/worktrees/agent-7f3a9c2e",
-          "size": 451936256,
-          "frees": 421527552,
+          "size": 431000000,
+          "frees": 402000000,
           "at_least": true,
           "stale": false,
           "creator": "Claude Code",
@@ -2043,8 +2044,8 @@
               16777234,
               9012
             ],
-            "allocated": 451936256,
-            "reclaimable": 421527552,
+            "allocated": 431000000,
+            "reclaimable": 402000000,
             "repo": "/Users/dev/sources/acme",
             "word": null
           },
@@ -2073,7 +2074,7 @@
               "path ~/sources/acme/.claude/worktrees/agent-7f3a9c2e",
               "a worktree of acme, labelled can go",
               "431 MB on disk in 12000 files; a delete frees at least 402 MB at once; the rest is shared with clones, snapshots or hard links",
-              "cleanup: moved to the Trash, then `git worktree prune` drops git's record; Put Back restores the folder",
+              "cleanup: its folder moves to the Trash and git keeps its record, so Put Back in Finder gives a working checkout; pruning the record is a separate step",
               "made by Claude Code"
             ]
           }
@@ -2083,8 +2084,8 @@
           "name": "a91c/billing-api",
           "kind": "worktree",
           "path": "~/.codex/worktrees/a91c/billing-api",
-          "size": 686817280,
-          "frees": 102760448,
+          "size": 655000000,
+          "frees": 98000000,
           "at_least": true,
           "stale": false,
           "creator": "Codex",
@@ -2133,6 +2134,7 @@
           "frees": null,
           "at_least": true,
           "stale": false,
+          "gone": true,
           "creator": "Codex",
           "allows": {
             "allows": "prune"
@@ -2147,6 +2149,11 @@
             "allocated": 0,
             "reclaimable": 0,
             "repo": "/Users/dev/sources/billing-api",
+            "record": "/Users/dev/sources/billing-api/.git/worktrees/billing-api",
+            "record_id": [
+              16777234,
+              9107
+            ],
             "word": null
           },
           "detail": {
@@ -2154,7 +2161,7 @@
             "facts": [
               {
                 "label": "size",
-                "value": "measuring…"
+                "value": "folder is gone"
               },
               {
                 "label": "by",
@@ -2165,12 +2172,12 @@
                 "value": "prune"
               }
             ],
-            "sentence": "2c41/billing-api is registered in billing-api but its folder is gone; `git worktree prune` removes only the record and frees almost nothing.",
+            "sentence": "2c41/billing-api is registered in billing-api but its folder is gone; pruning removes only its own record and frees almost nothing.",
             "evidence": [
               "path ~/.codex/worktrees/2c41/billing-api",
               "a worktree of billing-api, labelled can prune",
-              "not measured: its folder is gone",
-              "cleanup: `git worktree prune` drops git's record; there is no folder to remove",
+              "its folder is gone, so there is nothing to measure",
+              "cleanup: removes only this worktree's own record in the repo's git folder, with its HEAD, index and reflog; its branch and every other worktree's record stay",
               "made by Codex"
             ]
           }
@@ -2178,7 +2185,7 @@
       ],
       "sizing": false,
       "worktrees_pending": false,
-      "reclaimable": 37778515555,
+      "reclaimable": 35183984372,
       "config": "~/.config/scry/config.toml",
       "destructive": true
     }

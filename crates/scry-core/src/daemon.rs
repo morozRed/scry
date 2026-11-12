@@ -384,7 +384,11 @@ pub fn run(paths: &Paths) -> Result<()> {
     ));
     let (recorder, recording) = recorder::spawn(paths.clone())?;
     let sig = sample_until_stopped(&store, interval, &rx, || {
-        sys::volume_space(Path::new(SAMPLED_VOLUME))
+        let volume = Path::new(SAMPLED_VOLUME);
+        sys::volume_space(volume).map(|mut s| {
+            s.important_bytes = crate::disk::space::important(volume);
+            s
+        })
     });
     recorder.stop();
     let _ = recording.join();

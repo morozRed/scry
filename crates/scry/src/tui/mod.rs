@@ -95,6 +95,9 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     let theme = Theme::new(SHIPPED, colors);
     let mut motion = Motion::new(theme.motion);
     let mut app = App::new(board, source, theme);
+    if live.is_some() {
+        app.writer = clean::writer_running;
+    }
 
     let (tx, rx) = mpsc::channel();
     let workers = live.map(|l| l.spawn(tx));
@@ -124,7 +127,6 @@ struct Live {
 struct Storage {
     worktrees: ScanOptions,
     paths: Paths,
-    destructive: bool,
 }
 
 impl Live {
@@ -137,7 +139,6 @@ impl Live {
             storage: Storage {
                 worktrees: ScanOptions::new(&paths.user_home, config.code_roots),
                 paths,
-                destructive: config.destructive,
             },
         })
     }
@@ -154,12 +155,11 @@ impl Live {
         let storage = self.storage;
         let home = storage.paths.user_home.clone();
         let paths = storage.paths.clone();
-        let destructive = storage.destructive;
         std::thread::spawn(move || read_storage(&to, &asks, &storage));
         let (clean, jobs) = mpsc::channel();
         let reread = worktrees.clone();
         std::thread::spawn(move || {
-            run_cleanups(&tx, &jobs, &reread, &home, &paths, destructive);
+            run_cleanups(&tx, &jobs, &reread, &home, &paths);
         });
         Workers {
             now,
@@ -247,8 +247,10 @@ fn read_storage(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, s: &Storag
     while asks.recv().is_ok() {
         while asks.try_recv().is_ok() {}
         let now = unix_now();
+        // Each reading offers what the config allows now.
+        let destructive = clean::destructive_now(&s.paths);
         let disk = |items: &[disk::Item], pending| {
-            let list = disk::view(items, &cache, &s.paths, s.destructive, pending);
+            let list = disk::view(items, &cache, &s.paths, destructive, pending);
             Update::Disk(Box::new(Load::Ready(list)))
         };
         let worktrees = |scan: &WorktreeScan, sizing| {
@@ -298,26 +300,28 @@ fn read_storage(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, s: &Storag
 }
 
 /// Runs each confirmed cleanup, which checks its target again first, then asks for a new
-/// reading so the lists show what is left.
+/// reading so the lists show what is left. `destructive` is read from the config again for
+/// each one, and a store that cannot be opened refuses every one.
 fn run_cleanups(
     tx: &mpsc::Sender<Update>,
     jobs: &mpsc::Receiver<(Plan, Option<String>)>,
     reread: &mpsc::Sender<()>,
     home: &Path,
     paths: &Paths,
-    destructive: bool,
 ) {
     let store = paths
         .ensure_state()
         .and_then(|()| Store::open(&paths.db()))
         .ok();
+    let destructive = || clean::destructive_now(paths);
     while let Ok((plan, typed)) = jobs.recv() {
         let ctx = Context {
             home,
             store: store.as_ref(),
             actor: "tui",
-            destructive,
+            destructive: &destructive,
             label: &clean::relabel,
+            moment: None,
         };
         let result = clean::execute(&plan, typed.as_deref(), &ctx);
         if tx.send(Update::Cleaned(result)).is_err() {
@@ -550,7 +554,15 @@ fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
             true
         }
         Update::Cleaned(Err(refusal)) => {
-            app.notify_for(refusal.to_string(), Tone::Warn, DONE_FOR);
+            let tone = if refusal.changed() {
+                Tone::Danger
+            } else {
+                Tone::Warn
+            };
+            app.notify_for(refusal.to_string(), tone, DONE_FOR);
+            if refusal.changed() {
+                app.fresh.worktrees = Some(now);
+            }
             true
         }
     }

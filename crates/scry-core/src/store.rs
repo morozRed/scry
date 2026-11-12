@@ -93,6 +93,9 @@ const MIGRATIONS: &[&str] = &[
         ino        INTEGER NOT NULL,
         bytes      INTEGER NOT NULL
     );",
+    // Finder's available space beside `statfs`'s, so the forecast follows what the Disk view
+    // shows.
+    "ALTER TABLE disk_sample ADD COLUMN important_bytes INTEGER;",
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -182,14 +185,16 @@ impl Store {
 
     pub fn insert_sample(&self, s: &DiskSample) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO disk_sample (at_ms, volume, total_bytes, free_bytes, avail_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO disk_sample
+               (at_ms, volume, total_bytes, free_bytes, avail_bytes, important_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 s.at_ms,
                 s.volume,
                 s.total_bytes as i64,
                 s.free_bytes as i64,
-                s.avail_bytes as i64
+                s.avail_bytes as i64,
+                s.important_bytes.map(|b| b as i64)
             ],
         )?;
         Ok(())
@@ -208,18 +213,10 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT at_ms, volume, total_bytes, free_bytes, avail_bytes
+                "SELECT at_ms, volume, total_bytes, free_bytes, avail_bytes, important_bytes
                  FROM disk_sample ORDER BY id DESC LIMIT 1",
                 [],
-                |r| {
-                    Ok(DiskSample {
-                        at_ms: r.get(0)?,
-                        volume: r.get(1)?,
-                        total_bytes: r.get::<_, i64>(2)? as u64,
-                        free_bytes: r.get::<_, i64>(3)? as u64,
-                        avail_bytes: r.get::<_, i64>(4)? as u64,
-                    })
-                },
+                sample_row,
             )
             .optional()?)
     }
@@ -411,18 +408,10 @@ impl Store {
     /// Samples of `volume` taken at or after `since_ms`, oldest first.
     pub fn samples_since(&self, volume: &str, since_ms: i64) -> Result<Vec<DiskSample>> {
         let mut stmt = self.conn.prepare(
-            "SELECT at_ms, volume, total_bytes, free_bytes, avail_bytes FROM disk_sample
-             WHERE volume = ?1 AND at_ms >= ?2 ORDER BY at_ms",
+            "SELECT at_ms, volume, total_bytes, free_bytes, avail_bytes, important_bytes
+             FROM disk_sample WHERE volume = ?1 AND at_ms >= ?2 ORDER BY at_ms",
         )?;
-        let rows = stmt.query_map(params![volume, since_ms], |r| {
-            Ok(DiskSample {
-                at_ms: r.get(0)?,
-                volume: r.get(1)?,
-                total_bytes: r.get::<_, i64>(2)? as u64,
-                free_bytes: r.get::<_, i64>(3)? as u64,
-                avail_bytes: r.get::<_, i64>(4)? as u64,
-            })
-        })?;
+        let rows = stmt.query_map(params![volume, since_ms], sample_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -621,6 +610,17 @@ pub struct Trashed {
     pub bytes: u64,
 }
 
+fn sample_row(r: &rusqlite::Row) -> rusqlite::Result<DiskSample> {
+    Ok(DiskSample {
+        at_ms: r.get(0)?,
+        volume: r.get(1)?,
+        total_bytes: r.get::<_, i64>(2)? as u64,
+        free_bytes: r.get::<_, i64>(3)? as u64,
+        avail_bytes: r.get::<_, i64>(4)? as u64,
+        important_bytes: r.get::<_, Option<i64>>(5)?.map(|b| b as u64),
+    })
+}
+
 fn key(agent: &str, id: &str) -> Option<SessionKey> {
     Some(SessionKey {
         agent: Agent::from_short(agent)?,
@@ -677,6 +677,7 @@ mod tests {
             total_bytes: 1 << 40,
             free_bytes: 1 << 38,
             avail_bytes: 1 << 37,
+            important_bytes: Some(1 << 38),
         }
     }
 

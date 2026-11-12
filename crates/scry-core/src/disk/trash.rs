@@ -160,7 +160,8 @@ impl TrashSize {
 }
 
 /// The size of `~/.Trash` when it can be read, else what Scry's records say is still there:
-/// an item counts while its path in the Trash holds the same file it moved.
+/// an item counts while its path in the Trash holds the same file it moved, and once
+/// however often it was put back and trashed again to the same place.
 pub fn size(home: &Path, store: Option<&Store>) -> TrashSize {
     let trash = home.join(".Trash");
     if std::fs::read_dir(&trash).is_ok() {
@@ -175,12 +176,18 @@ pub fn size(home: &Path, store: Option<&Store>) -> TrashSize {
         }
     }
     let records = store.and_then(|s| s.trashed().ok()).unwrap_or_default();
-    let still: Vec<_> = records
-        .iter()
-        .filter(|t| std::fs::symlink_metadata(&t.trash_path).is_ok_and(|m| file_id(&m) == t.id))
+    // The newest record of each object, by where it is and what it is.
+    let mut latest = std::collections::HashMap::new();
+    for t in &records {
+        latest.insert((t.trash_path.as_path(), t.id), t.bytes);
+    }
+    let still: Vec<u64> = latest
+        .into_iter()
+        .filter(|((path, id), _)| std::fs::symlink_metadata(path).is_ok_and(|m| file_id(&m) == *id))
+        .map(|(_, bytes)| bytes)
         .collect();
     TrashSize::Scry {
-        bytes: still.iter().map(|t| t.bytes).sum(),
+        bytes: still.iter().sum(),
         items: still.len(),
     }
 }
@@ -252,5 +259,35 @@ mod tests {
             }
         );
         assert!(matches!(size(&home, Some(&store)), TrashSize::All { .. }));
+    }
+
+    #[test]
+    fn trashed_put_back_and_trashed_again_counts_once() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().canonicalize().unwrap();
+        let store = Store::open(&home.join("scry.db")).unwrap();
+        let landed = home.join("landed");
+        std::fs::create_dir_all(&landed).unwrap();
+        let id = file_id(&std::fs::metadata(&landed).unwrap());
+        for at_ms in 1..=3 {
+            store
+                .record_trashed(&crate::store::Trashed {
+                    at_ms,
+                    item: "x".into(),
+                    from: "/x".into(),
+                    trash_path: landed.clone(),
+                    id,
+                    bytes: 500,
+                })
+                .unwrap();
+        }
+        // No Trash folder here, so only Scry's records count.
+        assert_eq!(
+            size(&home, Some(&store)),
+            TrashSize::Scry {
+                bytes: 500,
+                items: 1
+            }
+        );
     }
 }

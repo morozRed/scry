@@ -52,6 +52,9 @@ pub struct DiskItem {
     pub at_least: bool,
     /// Shown from the cache while it is measured again.
     pub stale: bool,
+    /// A worktree whose folder is gone: there is nothing to measure.
+    #[serde(default)]
+    pub gone: bool,
     pub creator: String,
     pub allows: Allows,
     /// A worktree's label.
@@ -159,6 +162,7 @@ fn item(it: &Item, destructive: bool, home: &Path, config: &Path) -> DiskItem {
     let allows = clean::allows(it, destructive);
     let sized = it.size.as_ref().filter(|s| s.error.is_none());
     let path = tilde(&it.path, home);
+    let gone = it.worktree.is_some() && it.file_id.is_none();
     let fact = |label: &str, value: String| Fact {
         label: label.into(),
         value,
@@ -166,7 +170,11 @@ fn item(it: &Item, destructive: bool, home: &Path, config: &Path) -> DiskItem {
     let mut facts = Vec::new();
     facts.push(fact(
         "size",
-        sized.map_or("measuring…".into(), |s| bytes(s.size.allocated)),
+        match sized {
+            Some(s) => bytes(s.size.allocated),
+            None if gone => "folder is gone".into(),
+            None => "measuring…".into(),
+        },
     ));
     if let Some(s) = sized {
         let lower = if it.at_least() { "≥ " } else { "" };
@@ -204,27 +212,38 @@ fn item(it: &Item, destructive: bool, home: &Path, config: &Path) -> DiskItem {
                 evidence.push(format!("{} could not be read", count(s.skipped, "entry")));
             }
         }
+        _ if gone => evidence.push("its folder is gone, so there is nothing to measure".into()),
         Some(s) => evidence.push(format!(
             "not measured: {}",
             s.error.as_deref().unwrap_or("unknown")
         )),
         None => evidence.push("not measured yet".into()),
     }
+    if !it.inside.is_empty() {
+        let names: Vec<&str> = it.inside.iter().map(|i| i.name.as_str()).collect();
+        evidence.push(format!(
+            "not counted here: {}, inside it but listed on {} own",
+            names.join(", "),
+            if names.len() == 1 { "its" } else { "their" }
+        ));
+    }
     if it.stale {
         evidence.push("changed since it was measured; the size shown is the last one read".into());
     }
     evidence.push(match &allows {
         Allows::Trash => match &it.worktree {
-            Some(_) => "cleanup: moved to the Trash, then `git worktree prune` drops git's \
-                        record; Put Back restores the folder"
+            Some(_) => "cleanup: its folder moves to the Trash and git keeps its record, so \
+                        Put Back in Finder gives a working checkout; pruning the record is a \
+                        separate step"
                 .into(),
             None => "cleanup: moved to the Trash, where Put Back restores it".into(),
         },
         Allows::Delete { word } => {
             format!("cleanup: deleted for good once you type {word}; its tool fills it again")
         }
-        Allows::Prune => "cleanup: `git worktree prune` drops git's record; there is no \
-                          folder to remove"
+        Allows::Prune => "cleanup: removes only this worktree's own record in the repo's git \
+                          folder, with its HEAD, index and reflog; its branch and every other \
+                          worktree's record stay"
             .into(),
         Allows::Command { command } => {
             format!("cleanup: run `{command}` yourself; Scry runs nothing")
@@ -246,6 +265,7 @@ fn item(it: &Item, destructive: bool, home: &Path, config: &Path) -> DiskItem {
         frees: sized.map(|s| s.size.reclaimable),
         at_least: it.at_least(),
         stale: it.stale,
+        gone,
         creator: it.creator().to_string(),
         state: it.worktree.as_ref().map(|w| w.status.state()),
         plan: clean::plan(it, destructive).ok(),

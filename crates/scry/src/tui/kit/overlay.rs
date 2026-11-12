@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Row, Table, Wrap};
-use scry_core::view::{human_age, human_bytes};
+use scry_core::view::{Tone, human_age, human_bytes};
 
 use scry_core::disk::clean::Action;
 use scry_core::view::worktrees::bytes;
@@ -202,8 +202,9 @@ pub fn clean_sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &CleanSheet)
     let (title, what) = match p.action {
         Action::Trash if p.repo.is_some() => (
             format!("Move the worktree {} to the Trash?", p.name),
-            "Then git worktree prune drops git's record of it. Put Back in Finder restores the \
-             folder. Space returns only when the Trash is emptied.",
+            "Only its folder moves. git keeps its record, so Put Back in Finder gives a working \
+             checkout; until then it shows as can prune. Space returns only when the Trash is \
+             emptied.",
         ),
         Action::Trash => (
             format!("Move {} to the Trash?", p.name),
@@ -214,16 +215,20 @@ pub fn clean_sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &CleanSheet)
             "It does not go to the Trash. Its tool fills it again when it needs it.",
         ),
         Action::Prune => (
-            format!("Prune git's record of {}?", p.name),
-            "Its folder is already gone; git worktree prune drops the records of every \
-             worktree of this repo whose folder is gone.",
+            format!("Remove git's record of {}?", p.name),
+            "Its folder is already gone. Only this worktree's record goes, with its HEAD, index \
+             and reflog; its branch and every other worktree's record stay. A folder of it in \
+             the Trash would then come back without its link to git.",
         ),
     };
     let mut text = vec![
         Line::styled(title, theme.strong),
         Line::styled(what, theme.muted),
-        Line::raw(""),
     ];
+    if let Some(w) = &sheet.warning {
+        text.push(Line::styled(w.clone(), theme.tone(Tone::Warn)));
+    }
+    text.push(Line::raw(""));
     let row = |label: &str, value: String, style| {
         Line::from(vec![
             Span::styled(format!("{label:<8}"), theme.heading),
@@ -249,6 +254,14 @@ pub fn clean_sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &CleanSheet)
     }
     if let Some(name) = p.repo.as_ref().and_then(|r| r.file_name()) {
         text.push(row("repo", name.to_string_lossy().into_owned(), theme.text));
+    }
+    if let (Action::Prune, Some(record)) = (p.action, &p.record) {
+        let name = record.file_name().map(|n| n.to_string_lossy().into_owned());
+        text.push(row(
+            "record",
+            format!(".git/worktrees/{}", name.unwrap_or_default()),
+            theme.text,
+        ));
     }
     if let Some(word) = &p.word {
         text.push(Line::raw(""));

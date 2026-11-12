@@ -1037,6 +1037,63 @@ fn a_fixture_never_cleans_anything() {
 }
 
 #[test]
+fn opening_a_cleanup_sheet_clears_the_footer() {
+    let mut a = disk();
+    a.notify(
+        "Moved 2.1 GB to Trash. Empty it to free the space.",
+        Tone::Ok,
+    );
+    press(&mut a, "jt");
+    assert!(matches!(a.mode, Mode::Clean(_)));
+    assert!(a.toast.is_none());
+}
+
+#[test]
+fn after_a_cleanup_the_cursor_stays_on_the_row_that_took_its_place() {
+    let mut a = disk();
+    press(&mut a, "jj");
+    let Load::Ready(rows) = a.rows() else {
+        unreachable!()
+    };
+    let (gone, next) = (rows[2].id.clone(), rows[3].id.clone());
+    assert_eq!(a.selected_row().unwrap().id, gone);
+    let mut board = a.board.clone();
+    if let Load::Ready(list) = &mut board.disk {
+        list.items.retain(|d| d.id != gone);
+    }
+    a.replace_board(board);
+    assert_eq!(a.selected_row().unwrap().id, next);
+}
+
+#[test]
+fn trashing_agent_sessions_warns_when_that_agent_is_running() {
+    let mut a = disk();
+    a.writer = |item| {
+        (item == "claude-projects").then(|| "Claude Code is running (2 processes).".to_string())
+    };
+    let Load::Ready(rows) = a.rows() else {
+        unreachable!()
+    };
+    let at = rows
+        .iter()
+        .position(|r| r.cells[0].text == "Claude Code sessions")
+        .unwrap();
+    press(&mut a, &"j".repeat(at));
+    press(&mut a, "t");
+    let Mode::Clean(sheet) = &a.mode else {
+        panic!("{:?}", a.mode)
+    };
+    assert!(sheet.warning.is_some());
+    assert!(screen(&render(&a, 120, 40)).contains("Claude Code is running (2 processes)."));
+    // Another item says nothing.
+    press(&mut a, "\x1bgjt");
+    let Mode::Clean(sheet) = &a.mode else {
+        panic!("{:?}", a.mode)
+    };
+    assert_eq!(sheet.warning, None);
+}
+
+#[test]
 fn disk_has_loading_failed_and_first_run_states() {
     let mut a = disk();
     a.board.disk = Load::Loading;

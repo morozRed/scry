@@ -29,8 +29,8 @@ pub struct DiskArgs {
 }
 
 /// Clean up one item from `scry disk`: move it to the Trash, delete a cache after its name
-/// is typed, or prune a worktree that is gone. Exits 0 when done and 1 when nothing was
-/// done.
+/// is typed, or remove the record of a worktree whose folder is gone. Exits 0 when done and
+/// 1 when it was refused or stopped partway, saying exactly what changed.
 #[derive(Args)]
 pub struct CleanArgs {
     /// The item's id as `scry disk` prints it.
@@ -228,6 +228,9 @@ pub fn clean(args: CleanArgs) -> Result<()> {
         Err(r) => refuse(args.json, None, &r),
     };
     let what = describe(&plan, &home);
+    if let Some(w) = clean::writer_running(&plan.item) {
+        eprintln!("{}", printable(&format!("Warning: {w}")));
+    }
     let typed = match (args.yes, &plan.word) {
         (true, None) => None,
         (true, Some(_)) => args.confirm.clone(),
@@ -267,12 +270,15 @@ pub fn clean(args: CleanArgs) -> Result<()> {
             }
         }
     };
+    // Read again right before acting: the config may have changed while the prompt waited.
+    let destructive = || clean::destructive_now(&d.paths);
     let ctx = Context {
         home: &home,
         store: d.cache.store(),
         actor: "cli",
-        destructive: d.config.destructive,
+        destructive: &destructive,
         label: &clean::relabel,
+        moment: None,
     };
     match clean::execute(&plan, typed.as_deref(), &ctx) {
         Ok(done) => {
@@ -301,7 +307,8 @@ fn describe(plan: &Plan, home: &Path) -> String {
     let size = bytes(plan.allocated);
     match plan.action {
         Action::Trash if plan.repo.is_some() => format!(
-            "move the worktree {path} ({size}) to the Trash, then run git worktree prune in its repo"
+            "move the worktree's folder {path} ({size}) to the Trash; git keeps its record, so \
+             Put Back in Finder gives a working checkout"
         ),
         Action::Trash => format!("move {path} ({size}) to the Trash"),
         Action::Delete => format!(
@@ -309,8 +316,9 @@ fn describe(plan: &Plan, home: &Path) -> String {
             bytes(plan.reclaimable)
         ),
         Action::Prune => format!(
-            "run git worktree prune in {} to drop the record of {path}",
-            plan.repo
+            "remove {}, git's record of the missing worktree {path}, and nothing else; its \
+             branch and every other worktree's record stay",
+            plan.record
                 .as_deref()
                 .map_or(PathBuf::new(), Path::to_path_buf)
                 .display()
@@ -318,10 +326,16 @@ fn describe(plan: &Plan, home: &Path) -> String {
     }
 }
 
-/// Says why nothing was done, as JSON on stdout or text on stderr, and exits 1.
+/// Says why nothing was done, or what was done before it stopped, as JSON on stdout or text
+/// on stderr, and exits 1.
 fn refuse(json: bool, plan: Option<&Plan>, r: &Refusal) -> ! {
     if json {
-        let out = json!({ "plan": plan, "refusal": r, "message": r.to_string() });
+        let out = json!({
+            "plan": plan,
+            "refusal": r,
+            "changed": r.changed(),
+            "message": r.to_string()
+        });
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     } else {
         eprintln!("{}", printable(&r.to_string()));

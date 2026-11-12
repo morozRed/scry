@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod clean;
 pub mod forecast;
 pub mod fsevents;
+pub mod hold;
 pub mod space;
 pub mod trash;
 
@@ -46,6 +47,18 @@ pub struct Item {
     /// The size is the cached one and is being measured again.
     pub stale: bool,
     pub worktree: Option<WorktreeFacts>,
+    /// It is the home folder, or a folder above Desktop, Documents or Downloads.
+    pub fenced: bool,
+    /// Other items inside its folder. Each is measured on its own and not counted here.
+    pub inside: Vec<Inside>,
+}
+
+/// An item inside another's folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inside {
+    pub name: String,
+    pub kind: Kind,
+    pub path: PathBuf,
 }
 
 impl Item {
@@ -89,12 +102,14 @@ impl Item {
 /// What the worktree scan said about a worktree item.
 #[derive(Clone, Debug)]
 pub struct WorktreeFacts {
-    /// The repository's main checkout, where `git worktree prune` runs.
+    /// The repository's main checkout.
     pub repo: PathBuf,
     pub repo_name: String,
     pub status: Status,
     pub sentence: String,
     pub creator: String,
+    /// git's record of it, `.git/worktrees/<name>`.
+    pub record: Option<PathBuf>,
 }
 
 /// The items of a reading and the parts they are measured in.
@@ -137,6 +152,8 @@ impl Layout {
                 size: None,
                 stale: false,
                 worktree: None,
+                fenced: false,
+                inside: Vec::new(),
             })
             .collect();
         if let Some(scan) = scan {
@@ -159,9 +176,29 @@ impl Layout {
                         status: r.status,
                         sentence: r.sentence,
                         creator: r.creator,
+                        record: w.record.clone(),
                     }),
+                    fenced: false,
+                    inside: Vec::new(),
                 });
             }
+        }
+        let fence = hold::Fence::new(home);
+        let all: Vec<Inside> = items
+            .iter()
+            .map(|i| Inside {
+                name: i.name.clone(),
+                kind: i.kind(),
+                path: i.path.clone(),
+            })
+            .collect();
+        for item in &mut items {
+            item.fenced = item.file_id.is_some_and(|id| !fence.allows(id));
+            item.inside = all
+                .iter()
+                .filter(|o| o.path != item.path && o.path.starts_with(&item.path))
+                .cloned()
+                .collect();
         }
         let roots: HashSet<&Path> = items.iter().map(|i| i.path.as_path()).collect();
         let mut parts = Vec::new();
@@ -207,6 +244,8 @@ impl Layout {
             sum.files += s.files;
             sum.dirs += s.dirs;
             sum.skipped += s.skipped;
+            sum.mounts += s.mounts;
+            sum.shared_links |= s.shared_links;
             // Repositories are found relative to the part; the item wants them relative to
             // itself, and a part below the item's root that holds a `.git` is one.
             let rel = part

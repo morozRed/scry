@@ -6,8 +6,7 @@ your Mac.
 Coding agents such as Claude Code and Codex start dev servers, MCP servers and
 headless browsers, create worktrees and fill caches. When a session ends, much of
 that stays behind. Scry traces each of these back to the project and the agent
-session that made it, so you can see what is safe to stop or delete. An MCP server
-that gives agents the same answers is planned.
+session that made it, so you can see what is safe to stop or delete.
 
 > **Status:** early development. The process scan, the terminal UI shell and the
 > `ports`, `why`, `stop`, `agents`, `leftovers`, `worktrees`, `disk` and `clean`
@@ -172,17 +171,37 @@ Docker's disk, package caches, agent session logs, app caches, every `node_modul
 under your code roots, and linked worktrees. It never looks inside Desktop,
 Documents or Downloads. Each item shows the space it holds and at least what
 deleting it frees at once, which is less when its files are clones or hard links of
-others, as pnpm and uv make them. Free space is what Finder calls available;
-purgeable space and local snapshots are listed apart. A forecast of when the disk
-fills appears once the background recorder has 48 hours of samples.
+others, as pnpm and uv make them. Sizes are in decimal units, as Finder shows them
+(1 GB is 1,000,000,000 bytes). Free space is what Finder calls available; purgeable
+space and local snapshots are listed apart. A forecast of when that available space
+runs out appears once the background recorder has 48 hours of samples, counts the
+days from now, and is withheld while the newest sample is more than a day old.
 
-Each item allows one cleanup: **trash** (Put Back restores it; space returns when
-the Trash is emptied), **delete** for caches a tool fills again, after you type the
-item's name, **command**, which shows the tool's own cleanup for you to run, or
-**never**. A worktree goes to the Trash only when it is labelled "can go", and git's
-record of it is pruned after. Right before acting Scry checks that the folder is
-still the one it listed and the worktree's label has not changed. Cleanup is off
-until you set `destructive = true`, and every attempt is written to an audit log.
+Each item allows one cleanup: **trash** (Put Back in Finder restores it; space
+returns when the Trash is emptied), **delete** for caches a tool fills again, after
+you type the item's name, **command**, which shows the tool's own cleanup for you to
+run, or **never**. Scry never removes the home folder, a folder that Desktop,
+Documents or Downloads lies inside, or a cache that holds a git repository, a
+worktree or a mounted volume.
+
+A worktree labelled "can go" goes to the Trash as a folder only: git keeps its record
+in `.git/worktrees/<name>`, so Put Back gives a working checkout with its history,
+and until then the worktree shows as "can prune". **prune** removes that one record
+and nothing else, never `git worktree prune`, which would drop the record of every
+worktree whose folder is missing. It refuses a record that is locked, stages changes
+its HEAD lacks, or has a detached HEAD no branch or tag holds; the record's reflog
+goes with it, and a folder of it still in the Trash then comes back without its
+link to git.
+
+Right before acting, Scry reads `destructive` from the config again, walks the folder
+for repositories, worktrees and mounted volumes, reads a worktree's label again with
+`git status`, and checks that the folder and every folder above it are the ones it
+listed, opening each without following a symlink. What lands in the Trash must be
+that folder, or it is moved back; a delete goes through the folder Scry opened and
+never into another volume. Cleanup is off until you set `destructive = true`. Every
+attempt writes two rows to the audit log in Scry's store: what it is about to do,
+then what happened, including exactly what changed if it stopped partway. When the
+log cannot be written, nothing is done.
 
 Sizes are kept in Scry's store and checked against FSEvents, so a second run walks
 only what changed since the first.

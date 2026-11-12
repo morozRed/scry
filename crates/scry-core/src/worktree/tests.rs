@@ -430,8 +430,8 @@ fn a_missing_folder_can_be_pruned_and_frees_nothing() {
     assert_eq!(r.reclaimable, None);
     assert_eq!(
         r.sentence,
-        "app-orphan is registered in app but its folder is gone; `git worktree prune` removes \
-         only the record and frees almost nothing."
+        "app-orphan is registered in app but its folder is gone; pruning removes only its own \
+         record and frees almost nothing."
     );
     assert!(
         says(
