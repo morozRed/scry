@@ -22,14 +22,10 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{self, Event, KeyEvent};
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use ratatui::{DefaultTerminal, Terminal};
+use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use scry_core::config::Config;
 use scry_core::control::TERM_GRACE;
 use scry_core::disk::cache::SizeCache;
@@ -79,10 +75,11 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     tty::save();
     watch_signals()?;
     leave_on_panic();
-    // Declared before the terminal, so it is dropped after it.
+    let mut terminal = Terminal::new(CrosstermBackend::new(Screen(stdout())))?;
+    // Declared after the terminal, so the terminal is put back before the terminal's own
+    // drop shows the cursor, which `Screen` then drops instead of blocking on.
     let _restore = Restore;
     enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
     // Asked in raw mode and before the event loop reads a key, so the answer is read here
     // and the question needs no terminal modes of its own.
     let mut answer = tty::Answer::default();
@@ -423,28 +420,57 @@ fn unix_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// Raw mode, then the alternate screen. Each step is recorded once it worked, so when a
-/// later one fails `leave` still undoes the earlier.
+/// Raw mode, then the alternate screen, both under the terminal's mode lock, so a restore
+/// from the signal thread lands after both or keeps them from happening. Each step is
+/// recorded once it worked, so when a later one fails `leave` still undoes the earlier.
 fn enter() -> io::Result<()> {
-    tty::change(enable_raw_mode)?;
-    RAW.store(true, Ordering::Relaxed);
-    execute!(stdout(), EnterAlternateScreen)?;
-    ALTERNATE.store(true, Ordering::Relaxed);
-    Ok(())
+    tty::change(|| {
+        enable_raw_mode()?;
+        RAW.store(true, Ordering::Relaxed);
+        tty::enter_alternate(&SIGNAL)?;
+        ALTERNATE.store(true, Ordering::Relaxed);
+        Ok(())
+    })
 }
 
-/// Undoes what `enter` did, each step once, and shows the cursor. Both steps are tried
-/// whatever the other did; the first error is returned.
+/// Undoes what `enter` did, each step once, and shows the cursor. Neither step blocks on a
+/// terminal that stopped reading. The error is raw mode's; leaving the screen is best
+/// effort.
 fn leave() -> io::Result<()> {
     let mut result = Ok(());
     if RAW.swap(false, Ordering::Relaxed) {
         result = disable_raw_mode();
     }
     if ALTERNATE.swap(false, Ordering::Relaxed) {
-        result = result.and(execute!(stdout(), LeaveAlternateScreen, Show));
+        tty::leave_alternate();
     }
     result
 }
+
+/// Stdout while the alternate screen is on. Before and after, writes are dropped: the
+/// terminal's drop shows the cursor, which leaving has done already, and that write would
+/// block on a terminal that stopped reading.
+struct Screen(io::Stdout);
+
+impl io::Write for Screen {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if ALTERNATE.load(Ordering::Relaxed) {
+            self.0.write(buf)
+        } else {
+            Ok(buf.len())
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if ALTERNATE.load(Ordering::Relaxed) {
+            self.0.flush()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+type Tui = Terminal<CrosstermBackend<Screen>>;
 
 /// Puts the terminal back on every way out of `run`, setup errors included.
 struct Restore;
@@ -479,7 +505,7 @@ fn exit_on_signal() {
 /// Draws only when something changed, or while an effect runs. `typed` are keys read with
 /// the colour answer; `late` picks the rest of an unfinished answer out of the keys.
 fn event_loop(
-    terminal: &mut DefaultTerminal,
+    terminal: &mut Tui,
     app: &mut App,
     motion: &mut Motion,
     rx: &mpsc::Receiver<Update>,
@@ -712,7 +738,7 @@ fn watch_signals() -> Result<()> {
 }
 
 /// Ctrl-Z: give the shell its terminal back, stop, and take it again on `fg`.
-fn suspend(terminal: &mut DefaultTerminal) -> Result<()> {
+fn suspend(terminal: &mut Tui) -> Result<()> {
     leave()?;
     // SAFETY: raising a signal at the calling thread has no memory effects.
     unsafe { libc::raise(libc::SIGTSTP) };

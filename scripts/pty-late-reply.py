@@ -3,7 +3,10 @@
 end: an answer that comes late, in pieces or after the wait never reaches the TUI as keys,
 keys typed while Scry waits are kept whole, an unknown terminal is not asked, a setup that
 fails leaves the terminal cooked, and SIGTERM ends Scry with the terminal cooked even
-during the query or once the terminal stops reading.
+during the query or once the terminal stops reading. Also: a DA1 answer that never
+finishes does not swallow the next key, q exits in time on a terminal that stopped
+reading, and a hang-up during setup or on a terminal Scry cannot open again leaves the
+alternate screen off.
 
 tmux answers the query itself, so this drives a bare pty.
 Usage: scripts/pty-late-reply.py [path/to/scry]
@@ -35,6 +38,8 @@ TRUECOLOR = b"\x1b[38;2;"
 ROWS, COLS = 30, 100
 # Scry waits this long after SIGTERM for its loop to stop before it restores and exits.
 GRACE = 1.0
+# Entering or leaving the alternate screen waits this long for a terminal that stopped reading.
+SCREEN_WAIT = 1.0
 SEQUENCE = re.compile(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(\x07|\x1b\\)|.)")
 
 
@@ -69,13 +74,14 @@ def screen(out):
 
 
 class Tui:
-    def __init__(self, term_program="ghostty", fixture=FIX, full_output=False, left_non_blocking=False):
+    def __init__(self, term_program="ghostty", fixture=FIX, full_output=False, left_non_blocking=False, locked=False):
         drop = ("NO_COLOR", "SSH_CONNECTION", "SSH_TTY", "SCRY_COLOR_QUERY", "TERM_PROGRAM", "COLORFGBG", "TMUX")
         env = {k: v for k, v in os.environ.items() if k not in drop}
         env.update(TERM="xterm-256color", COLORTERM="truecolor")
         if term_program:
             env["TERM_PROGRAM"] = term_program
         self.fd, slave = os.openpty()
+        self.slave_name = os.ttyname(slave)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
         report, told = os.pipe()
         # A stand-in shell leads the session and owns the terminal, as in a real terminal.
@@ -89,7 +95,7 @@ class Tui:
             fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
             pid = os.fork()
             if pid == 0:
-                self.exec_scry(slave, env, fixture, full_output, left_non_blocking)
+                self.exec_scry(slave, env, fixture, full_output, left_non_blocking, locked)
             os.write(told, struct.pack("i", pid))
             os.write(told, struct.pack("i", os.waitpid(pid, 0)[1]))
             os._exit(0)
@@ -101,7 +107,11 @@ class Tui:
         self.status = None
 
     @staticmethod
-    def exec_scry(slave, env, fixture, full_output, left_non_blocking):
+    def exec_scry(slave, env, fixture, full_output, left_non_blocking, locked):
+        if locked:
+            # As a terminal owned by another user: Scry cannot open it again by name, so it
+            # restores through the descriptors it was given.
+            os.fchmod(slave, 0)
         for fd in (0, 1, 2):
             os.dup2(slave, fd)
         os.close(slave)
@@ -143,6 +153,32 @@ class Tui:
         while needle not in self.out and time.monotonic() < end and not self.exited():
             self.pump(0.005)
         return needle in self.out
+
+    def stop_reading(self):
+        """Fills the output queue through a descriptor of our own, as a terminal that
+        stopped reading leaves it, so Scry's next write would block."""
+        fd = os.open(self.slave_name, os.O_WRONLY | os.O_NONBLOCK | os.O_NOCTTY)
+        try:
+            while True:
+                os.write(fd, b"x" * 512)
+        except BlockingIOError:
+            pass
+        os.close(fd)
+
+    def drain(self):
+        """Reads what is left once Scry has exited."""
+        while select.select([self.fd], [], [], 0.05)[0]:
+            try:
+                data = os.read(self.fd, 65536)
+            except OSError:
+                return
+            if not data:
+                return
+            self.out += data
+
+    def alternate(self):
+        """Whether the last alternate-screen switch Scry wrote turned it on."""
+        return self.out.rfind(b"\x1b[?1049h") > self.out.rfind(b"\x1b[?1049l")
 
     def write(self, data):
         if not self.exited():
@@ -350,6 +386,52 @@ os.kill(t.pid, signal.SIGTERM)
 check(
     "SIGTERM once the terminal stops reading exits 143 in the grace period, cooked",
     drawn and t.wait_exit(GRACE + 0.5, read=False) and t.code() == 143 and t.cooked(),
+    t,
+)
+t.close()
+
+answer(
+    "a DA1 answer cut off for good does not swallow the q after it",
+    [(0.5, REPLY[:-4])],
+    look=True,
+)
+
+# The frame is drawn, then the terminal stops reading and q is pressed: leaving the
+# alternate screen gives up after its wait instead of blocking.
+t = Tui(term_program=None, fixture=DESIGN)
+drawn = t.shows("fixture design.json")
+t.pump(0.4)
+t.stop_reading()
+t.write(b"q")
+check(
+    "q once the terminal stops reading exits 0 within the screen wait, cooked",
+    drawn and t.wait_exit(SCREEN_WAIT + 1.0, read=False) and t.code() == 0 and t.cooked(),
+    t,
+)
+t.close()
+
+# A hang-up at any moment of setup, the alternate screen included, leaves it off.
+for delay in (0.0, 0.005, 0.01, 0.02, 0.03, 0.05, 0.08):
+    t = Tui(term_program=None)
+    time.sleep(delay)
+    os.kill(t.pid, signal.SIGHUP)
+    ended = t.wait_exit(3)
+    t.drain()
+    check(
+        "SIGHUP %d ms into setup leaves the alternate screen off, cooked" % (delay * 1000),
+        ended and t.cooked() and not t.alternate(),
+        t,
+    )
+    t.close()
+
+t = Tui(term_program=None, locked=True)
+drawn = t.wait_for(DRAWN)
+os.kill(t.pid, signal.SIGHUP)
+ended = t.wait_exit(3)
+t.drain()
+check(
+    "SIGHUP on a terminal Scry cannot open again leaves the alternate screen through stdout",
+    drawn and ended and t.code() == 129 and t.cooked() and not t.alternate(),
     t,
 )
 t.close()

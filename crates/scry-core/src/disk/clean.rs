@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::catalog::Cleanup;
+use super::clones;
 use super::hold::{self, Fence, Held, HoldError, Removed};
 use super::trash::{self, TrashSize};
 use super::{Item, WorktreeFacts};
@@ -170,7 +171,12 @@ fn kept(item: &Item) -> Option<String> {
         if size.git_at_root {
             return Some("It is a git repository; Scry never removes one with a cache.".into());
         }
-        if let Some(r) = size.repos.first() {
+        // A clone a tool keeps is read with git right before the cleanup, not here.
+        if let Some(r) = size
+            .repos
+            .iter()
+            .find(|r| clones::managed(&item.id, r).is_none())
+        {
             return Some(format!(
                 "The git repository {} sits inside it; Scry never removes one with a cache.",
                 r.display()
@@ -705,11 +711,19 @@ fn look_inside(plan: &Plan, home: &Path) -> Result<SubtreeSize, Refusal> {
         if walk.git_at_root {
             return Err(holds("a git repository at its top".into()));
         }
-        if let Some(r) = walk.repos.first() {
-            return Err(holds(format!(
-                "a git repository or worktree at {}",
-                r.display()
-            )));
+        for r in &walk.repos {
+            let Some(shape) = clones::managed(&plan.item, r) else {
+                return Err(holds(format!(
+                    "a git repository or worktree at {}",
+                    r.display()
+                )));
+            };
+            if let Err(why) = clones::regenerable(&plan.path.join(r), shape, GIT_TIMEOUT) {
+                return Err(holds(format!(
+                    "a git repository at {} that {why}",
+                    r.display()
+                )));
+            }
         }
     }
     if plan.action == Action::Delete && walk.skipped > 0 {

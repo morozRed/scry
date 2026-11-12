@@ -461,9 +461,14 @@ const KEYS: [(&str, &str, &str); 16] = [
     ("", "q", "quit"),
 ];
 
-/// The keys, centred over the body on a raised card with a margin of plain background.
+/// The keys, centred over the body on a raised card with a margin of plain background. On a
+/// body too short for every key, the blank line under the title and the margin above and
+/// below go first, so at 80×24 every key still shows.
 pub fn help(f: &mut Frame, body: Rect, theme: &Theme) {
-    let mut lines = vec![Line::styled("Keys", theme.strong), Line::raw("")];
+    let mut lines = vec![Line::styled("Keys", theme.strong)];
+    if KEYS.len() as u16 + 4 <= body.height {
+        lines.push(Line::raw(""));
+    }
     lines.extend(KEYS.iter().map(|(group, keys, what)| {
         Line::from(vec![
             Span::styled(format!("{group:<7}"), theme.heading),

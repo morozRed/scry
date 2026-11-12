@@ -9,6 +9,7 @@
 pub mod cache;
 pub mod catalog;
 pub mod clean;
+pub mod clones;
 pub mod forecast;
 pub mod fsevents;
 pub mod hold;

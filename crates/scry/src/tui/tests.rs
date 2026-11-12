@@ -174,6 +174,26 @@ fn help_overlay() {
 }
 
 #[test]
+fn every_key_on_the_help_card_shows_at_the_smallest_size() {
+    for theme in [tinted(), Theme::new(Look::Tinted, Colors::Ansi)] {
+        let mut a = App::new(design_board(), Source::Fixture("d".into()), theme);
+        press(&mut a, "?");
+        let text = screen(&render(&a, 80, 24));
+        for what in [
+            "first and last row",
+            "this help",
+            "suspend to the shell",
+            "quit",
+        ] {
+            assert!(text.contains(what), "{what} is cut off:\n{text}");
+        }
+        // With room, the title keeps its blank line.
+        let text = screen(&render(&a, 80, 30));
+        assert!(text.contains("Keys") && text.contains("quit"), "{text}");
+    }
+}
+
+#[test]
 fn too_small() {
     insta::assert_snapshot!(render(&typical(), 60, 10));
 }

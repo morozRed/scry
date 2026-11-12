@@ -38,8 +38,13 @@ const BEL: u8 = 0x07;
 const ESC: u8 = 0x1b;
 /// Longest colour spec and DA1 parameter list that still count as an answer.
 const SPEC_MAX: u8 = 48;
+/// Enters the alternate screen.
+const ENTER: &[u8] = b"\x1b[?1049h";
 /// Leaves the alternate screen and shows the cursor.
 const LEAVE: &[u8] = b"\x1b[?1049l\x1b[?25h";
+/// How long entering or leaving the alternate screen waits for a terminal that is not
+/// reading. A terminal that reads at all takes a few bytes at once.
+const SCREEN_WAIT: Duration = Duration::from_secs(1);
 
 /// The terminal crossterm reads, and its modes before Scry changed any.
 struct Saved {
@@ -83,10 +88,9 @@ static SAVED: OnceLock<Saved> = OnceLock::new();
 /// Scry's own non-blocking open of the terminal stdout is, so leaving the alternate screen
 /// from the signal thread cannot block on a terminal that stopped reading.
 static SCREEN: OnceLock<OwnedFd> = OnceLock::new();
-/// Held while raw mode goes on, and by `restore_and_exit` until the exit, so raw mode cannot
-/// come back after the terminal was put back. Only mode changes take it, never a write: a
-/// write blocks while the terminal is not reading, and the signal thread must always get
-/// the lock.
+/// Held while raw mode and the alternate screen go on, and by `restore_and_exit` until the
+/// exit, so neither can come back after the terminal was put back. No blocking write happens
+/// under it: the signal thread must get the lock within `SCREEN_WAIT`.
 static MODES: Mutex<()> = Mutex::new(());
 
 /// Remembers the modes of the terminal crossterm uses (stdin when it is one, else /dev/tty)
@@ -125,12 +129,33 @@ fn open(path: &CStr, access: libc::c_int) -> Option<OwnedFd> {
     (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// Runs `f`, which puts the terminal in raw mode. Once `restore_and_exit` has started it
-/// waits for the exit instead, so raw mode cannot come back after the restore. Leaving raw
-/// mode needs no lock: landing after the restore changes nothing.
+/// Runs `f`, which puts the terminal in raw mode and enters the alternate screen. Once
+/// `restore_and_exit` has started it waits for the exit instead, so neither can come back
+/// after the restore. Leaving needs no lock: landing after the restore changes nothing.
 pub fn change<T>(f: impl FnOnce() -> T) -> T {
     let _held = MODES.lock().unwrap_or_else(PoisonError::into_inner);
     f()
+}
+
+/// Enters the alternate screen without blocking: an error when the terminal took not all of
+/// it within `SCREEN_WAIT`, or once `signal` is set. Call it inside [`change`].
+pub fn enter_alternate(signal: &AtomicI32) -> io::Result<()> {
+    let stopped = || signal.load(Ordering::Relaxed) != 0;
+    if put(ENTER, SCREEN_WAIT, &stopped) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the terminal did not take the alternate screen; it is not reading",
+        ))
+    }
+}
+
+/// Leaves the alternate screen and shows the cursor, waiting at most `SCREEN_WAIT` for a
+/// terminal that is not reading. Best effort: a report of the failure would go to the
+/// same terminal and block on it.
+pub fn leave_alternate() {
+    put(LEAVE, SCREEN_WAIT, &|| false);
 }
 
 /// Puts back the saved modes, then leaves the alternate screen and shows the cursor if the
@@ -142,15 +167,43 @@ pub fn restore_and_exit(code: i32) -> ! {
     if let Some(saved) = SAVED.get() {
         saved.put_back();
     }
-    if let Some(screen) = SCREEN.get() {
-        // SAFETY: writes `LEAVE.len()` bytes from a static buffer to a descriptor that stays
-        // open for the life of the process. It is non-blocking, so a full output queue
-        // fails with EAGAIN instead of waiting.
-        unsafe { libc::write(screen.as_raw_fd(), LEAVE.as_ptr().cast(), LEAVE.len()) };
-    }
+    put(LEAVE, Duration::ZERO, &|| false);
     // SAFETY: _exit ends the process and runs nothing else. `process::exit` would first
     // flush Rust's stdout buffer, a write that can block on the same full queue.
     unsafe { libc::_exit(code) }
+}
+
+/// Writes `bytes` to the terminal stdout is without ever blocking, waiting up to `wait` for
+/// room. It goes through Scry's own non-blocking descriptor, or, when the terminal could
+/// not be opened again, through stdout made non-blocking for the write. Says whether all of
+/// it went.
+fn put(bytes: &[u8], wait: Duration, stopped: &dyn Fn() -> bool) -> bool {
+    let deadline = Instant::now() + wait;
+    let sent = match SCREEN.get() {
+        Some(screen) => send(screen.as_raw_fd(), bytes, deadline, stopped),
+        None => non_blocking(libc::STDOUT_FILENO, || {
+            send(libc::STDOUT_FILENO, bytes, deadline, stopped)
+        }),
+    };
+    sent == bytes.len()
+}
+
+/// Runs `f` with `fd` non-blocking, then puts its flags back. The flags belong to the open
+/// file, which the shell shares, so they are changed only for this one write.
+fn non_blocking<T>(fd: RawFd, f: impl FnOnce() -> T) -> T {
+    // SAFETY: F_GETFL reads the flags of any descriptor; it fails on a closed one.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let change = flags >= 0 && flags & libc::O_NONBLOCK == 0;
+    if change {
+        // SAFETY: F_SETFL sets flags this descriptor already had, plus O_NONBLOCK.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    }
+    let out = f();
+    if change {
+        // SAFETY: puts back the flags F_GETFL read.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    }
+    out
 }
 
 /// What the terminal said to the colour question.
@@ -233,14 +286,11 @@ fn retry(kind: io::ErrorKind) -> bool {
     matches!(kind, io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock)
 }
 
-/// Writes as much of `bytes` as the terminal takes before `deadline`. Returns how much.
+/// Writes as much of `bytes` as the terminal takes before `deadline`, trying once even when
+/// it has passed. Returns how much.
 fn send(fd: RawFd, bytes: &[u8], deadline: Instant, stopped: &dyn Fn() -> bool) -> usize {
     let mut sent = 0;
     while sent < bytes.len() && !stopped() {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
-        }
         let rest = &bytes[sent..];
         // SAFETY: writes at most `rest.len()` bytes from a live slice. The descriptor is
         // non-blocking, so a full output queue returns EAGAIN instead of waiting.
@@ -250,7 +300,8 @@ fn send(fd: RawFd, bytes: &[u8], deadline: Instant, stopped: &dyn Fn() -> bool) 
             continue;
         }
         let kind = io::Error::last_os_error().kind();
-        if !retry(kind) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if n == 0 || !retry(kind) || left.is_zero() {
             break;
         }
         if kind == io::ErrorKind::WouldBlock && ready(fd, Dir::Write, left.min(SLICE)).is_err() {
@@ -474,7 +525,17 @@ impl LateReply {
                 }
                 // Not an answer after all, and `key` may start the next one.
                 None if self.at != Grammar::Ground => {
-                    let mut out = self.release();
+                    let mut out = match self.at {
+                        // No key starts with `CSI ?`, so this was an unfinished DA1 answer,
+                        // and its start is dropped rather than left to swallow `key`.
+                        Grammar::Da1(_) => {
+                            self.at = Grammar::Ground;
+                            self.held.clear();
+                            self.cut.clear();
+                            Vec::new()
+                        }
+                        _ => self.release(),
+                    };
                     out.extend(self.feed(key, now));
                     return out;
                 }
@@ -944,6 +1005,56 @@ mod tests {
         let (mut late, now) = after(b"\x1b[");
         assert!(feed_all(&mut late, &read(&DA1[2..]), now).is_empty());
         assert_eq!(chars(&late.feed(read(b"q")[0], now)), "q");
+    }
+
+    #[test]
+    fn an_unfinished_da1_answer_never_swallows_the_next_key() {
+        // DA1 cut at the deadline after its parameters began, then never finished.
+        let (mut late, now) = after(&[FG, BG, &DA1[..5]].concat());
+        assert_eq!(chars(&late.feed(read(b"q")[0], now)), "q");
+        assert_eq!(chars(&late.feed(read(b"j")[0], now)), "j");
+
+        // The same after the window, when the guard still holds the answer's start.
+        let (mut late, now) = after(&DA1[..5]);
+        let then = now + LATE_FOR + LATE_QUIET;
+        assert_eq!(chars(&late.feed(read(b"q")[0], then)), "q");
+
+        // Cut at `ESC [`, with `?6` read later as keys: still an answer, not a key.
+        let (mut late, now) = after(b"\x1b[");
+        assert!(feed_all(&mut late, &read(b"?6"), now).is_empty());
+        assert_eq!(chars(&late.feed(read(b"q")[0], now)), "q");
+
+        // An answer that does finish is still swallowed whole.
+        let (mut late, now) = after(&DA1[..5]);
+        assert!(feed_all(&mut late, &read(&DA1[5..]), now).is_empty());
+        assert_eq!(chars(&late.feed(read(b"q")[0], now)), "q");
+    }
+
+    #[test]
+    fn writes_to_a_terminal_that_stopped_reading_end_in_time() {
+        let (_ours, theirs) = pty();
+        let fd = theirs.as_raw_fd();
+        // SAFETY: F_GETFL reads the flags of an open descriptor.
+        let blocking = || unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK == 0;
+        assert!(blocking());
+        // Fill the output queue, as a terminal that stopped reading leaves it.
+        let chunk = [b'x'; 512];
+        non_blocking(fd, || {
+            // SAFETY: writes from a live buffer to an open descriptor.
+            while unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) } > 0 {}
+        });
+        assert!(blocking(), "the flags are put back");
+        let start = Instant::now();
+        let wait = Duration::from_millis(200);
+        let sent = non_blocking(fd, || send(fd, LEAVE, start + wait, &|| false));
+        assert_eq!(sent, 0);
+        assert!(start.elapsed() < wait + Duration::from_millis(300));
+        assert!(blocking(), "the flags are put back");
+        // A deadline that has passed still gets one try, and a signal ends the wait.
+        let start = Instant::now();
+        assert_eq!(non_blocking(fd, || send(fd, LEAVE, start, &|| false)), 0);
+        assert_eq!(send(fd, LEAVE, start + SCREEN_WAIT, &|| true), 0);
+        assert!(start.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
