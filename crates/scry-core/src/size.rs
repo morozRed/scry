@@ -1,13 +1,18 @@
-//! Sizes subtrees in one `getattrlistbulk` walk: the bytes they hold on disk and at least the
-//! bytes a delete gives back at once. The Worktrees view sizes each worktree with it; the Disk
-//! view sizes catalog entries with it.
+//! Sizes subtrees in one `getattrlistbulk` walk: the bytes they hold on disk, at least the
+//! bytes a delete gives back at once, and the repositories nested inside. The Worktrees view
+//! sizes each worktree with it; the Disk view sizes catalog entries with it.
+//!
+//! Each queued folder keeps its parent open until it is opened itself, so a deep tree walked
+//! by several threads can need more descriptors than macOS's default soft limit of 256. The
+//! limit belongs to the whole process, so the program raises it at start-up, not this module;
+//! a folder that cannot be opened is counted as skipped.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex};
 
 use libc::c_void;
 use serde::Serialize;
@@ -33,6 +38,9 @@ pub struct SubtreeSize {
     pub dirs: u64,
     /// Entries that could not be read and are missing from `size`.
     pub skipped: u64,
+    /// Folders below the root that hold a `.git` of their own, relative to the root and
+    /// sorted. A `.git` directly in the root, such as a worktree's own link, is not listed.
+    pub repos: Vec<PathBuf>,
     /// Why the subtree was not walked at all.
     pub error: Option<String>,
 }
@@ -76,7 +84,6 @@ impl Walker {
     /// Sizes each subtree, in order. A hard-linked file inside two subtrees is allocated to
     /// the first one walked, and is reclaimable only from a subtree that holds all its links.
     pub fn measure(&self, roots: &[PathBuf]) -> Vec<SubtreeSize> {
-        raise_fd_limit();
         let mut out = vec![SubtreeSize::default(); roots.len()];
         let mut jobs = Vec::new();
         let mut devs = vec![0; roots.len()];
@@ -84,6 +91,10 @@ impl Walker {
             let root = match self.protected.resolve(root) {
                 Resolved::Inside(folder) => {
                     out[i].error = Some(format!("{} is a protected folder", folder.display()));
+                    continue;
+                }
+                Resolved::Unresolvable => {
+                    out[i].error = Some("its path cannot be resolved".into());
                     continue;
                 }
                 Resolved::Outside(root) => root,
@@ -95,6 +106,7 @@ impl Walker {
                     jobs.push(Job {
                         dir: Open::Root(fd),
                         tree: i,
+                        rel: PathBuf::new(),
                     });
                 }
                 Err(e) => out[i].error = Some(e.to_string()),
@@ -129,7 +141,11 @@ impl Walker {
                 o.files += t.files;
                 o.dirs += t.dirs;
                 o.skipped += t.skipped;
+                o.repos.extend(t.repos);
             }
+        }
+        for o in &mut out {
+            o.repos.sort();
         }
         for link in links.into_inner().unwrap().into_values() {
             if link.seen >= link.nlink && !link.shared {
@@ -138,27 +154,6 @@ impl Walker {
         }
         out
     }
-}
-
-/// A queued folder keeps its parent open until it is opened itself, so a deep tree walked by
-/// several threads can hold more descriptors than macOS's default soft limit of 256.
-fn raise_fd_limit() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        let mut r = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
-            return;
-        }
-        // OPEN_MAX, the most setrlimit accepts on macOS.
-        let want = r.rlim_max.min(10_240);
-        if r.rlim_cur < want {
-            r.rlim_cur = want;
-            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
-        }
-    });
 }
 
 fn fstat_id(fd: &OwnedFd) -> Option<FileId> {
@@ -194,6 +189,8 @@ fn open_child(parent: &OwnedFd, name: &CStr, listed: FileId) -> Option<OwnedFd> 
 struct Job {
     dir: Open,
     tree: usize,
+    /// The folder's path relative to its subtree's root.
+    rel: PathBuf,
 }
 
 enum Open {
@@ -259,6 +256,13 @@ struct Tally {
     files: u64,
     dirs: u64,
     skipped: u64,
+    repos: Vec<PathBuf>,
+}
+
+/// The folder whose entries are being counted.
+struct Dir<'a> {
+    tree: usize,
+    rel: &'a Path,
 }
 
 struct Ctx<'a> {
@@ -284,6 +288,10 @@ impl Ctx<'_> {
 
     fn read_dir(&self, job: Job, buf: &mut [u8], t: &mut Tally) -> Vec<Job> {
         let mut found = Vec::new();
+        let at_dir = Dir {
+            tree: job.tree,
+            rel: &job.rel,
+        };
         let fd = match job.dir {
             Open::Root(fd) => fd,
             Open::Child { parent, name, id } => match open_child(&parent, &name, id) {
@@ -319,23 +327,21 @@ impl Ctx<'_> {
                     break;
                 };
                 at += entry.len;
-                self.count(job.tree, &fd, entry, t, &mut found);
+                self.count(&at_dir, &fd, entry, t, &mut found);
             }
         }
         found
     }
 
-    fn count(
-        &self,
-        tree: usize,
-        dir: &Arc<OwnedFd>,
-        e: Entry,
-        t: &mut Tally,
-        found: &mut Vec<Job>,
-    ) {
+    fn count(&self, at: &Dir, dir: &Arc<OwnedFd>, e: Entry, t: &mut Tally, found: &mut Vec<Job>) {
+        let tree = at.tree;
         if e.error != 0 {
             t.skipped += 1;
             return;
+        }
+        // APFS ignores case by default, and so does git looking for `.git` there.
+        if e.name.eq_ignore_ascii_case(b".git") && !at.rel.as_os_str().is_empty() {
+            t.repos.push(at.rel.to_path_buf());
         }
         if e.dev != self.devs[tree] {
             return;
@@ -354,6 +360,7 @@ impl Ctx<'_> {
             };
             t.dirs += 1;
             found.push(Job {
+                rel: at.rel.join(OsStr::from_bytes(e.name)),
                 dir: Open::Child {
                     parent: Arc::clone(dir),
                     name,
@@ -678,6 +685,26 @@ mod tests {
         fs::remove_file(root.join("a.real/b")).unwrap();
         fs::create_dir(root.join("a.real/b")).unwrap();
         assert!(open_child(&parent, c"b", b).is_none());
+    }
+
+    #[test]
+    fn lists_repositories_nested_below_the_root_but_not_its_own_link() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("wt");
+        fs::create_dir_all(root.join("src/inner/.git/objects")).unwrap();
+        fs::create_dir_all(root.join("deep/a/b")).unwrap();
+        fs::write(root.join(".git"), "gitdir: /x\n").unwrap();
+        fs::write(root.join("deep/a/b/.git"), "gitdir: /y\n").unwrap();
+        fs::create_dir_all(root.join("skipped/.git")).unwrap();
+        let [r] = walker(t.path())
+            .exclude([root.join("skipped")])
+            .measure(std::slice::from_ref(&root))
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            r.repos,
+            [PathBuf::from("deep/a/b"), PathBuf::from("src/inner")]
+        );
     }
 
     #[test]

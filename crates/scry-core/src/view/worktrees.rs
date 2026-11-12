@@ -1,25 +1,26 @@
-//! The Worktrees view as plain data: one row per worktree with a status word, the sentence
-//! that explains it and the evidence behind it. Skins only draw this.
+//! The Worktrees view model: one row per worktree with a status word, the sentence that
+//! explains it and the evidence behind it, from a `worktree` scan. Skins only draw this.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Serialize;
 
-use super::{
-    Changes, Concern, GitFacts, Head, KeptBy, Merge, NotRead, Upstream, Worktree, WorktreeScan,
-    WorktreeState,
+use super::human_bytes;
+use crate::worktree::{
+    Changes, Concern, GitFacts, Head, KeptBy, Merge, NotRead, ReposInside, Upstream, Worktree,
+    WorktreeScan, WorktreeState,
 };
-use crate::view::human_bytes;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
-    /// Provably safe to delete.
+    /// Every loss check passed and its work is finished, as of the last fetch. Ignored files
+    /// are not checked; see `WorktreeState::CanGo`.
     CanGo,
     /// Only git's record is left, and pruning it frees almost nothing.
     CanPrune,
-    /// Looks stale, but may hold work.
+    /// Removing it could lose something, or its work may not be finished.
     NeedsLook,
     /// Has uncommitted changes.
     Dirty,
@@ -43,7 +44,8 @@ impl Status {
         }
     }
 
-    /// Deleting the folder loses nothing.
+    /// Whether a cleanup may offer to remove the folder: only for "can go". Scry's cleanup
+    /// moves folders to the Trash, so an ignored file the checks do not cover can be put back.
     pub fn removable(self) -> bool {
         self == Status::CanGo
     }
@@ -223,14 +225,17 @@ fn sentence(w: &Worktree, now: i64, home: &Path) -> String {
         None => String::new(),
     };
     match &w.state {
-        WorktreeState::CanGo(safe) => match safe.kept_by() {
-            KeptBy::DefaultBranch { name: into } => {
-                format!("{name} is merged into {into} and clean{frees}.")
+        WorktreeState::CanGo(safe) => {
+            let as_of = as_of_fetch(safe.finished().fetched_at(), now);
+            match safe.finished().kept_by() {
+                KeptBy::DefaultBranch { name: into } => {
+                    format!("{name} is clean and merged into {into} {as_of}{frees}.")
+                }
+                KeptBy::Upstream { name: up } => {
+                    format!("{name} is clean and every commit is on {up} {as_of}{frees}.")
+                }
             }
-            KeptBy::Upstream { name: up } => {
-                format!("{name} is clean and every commit is on {up}{frees}.")
-            }
-        },
+        }
         WorktreeState::CanPrune(_) => format!(
             "{name} is registered in {} but its folder is gone; `git worktree prune` removes \
              only the record and frees almost nothing.",
@@ -279,7 +284,12 @@ fn active(name: &str, f: &GitFacts, now: i64) -> String {
         .last_commit
         .map(|t| format!("; its last commit was {}", long_age(now - t)))
         .unwrap_or_default();
+    let detached_only = f.per_worktree.detached_only;
     match (&f.merge, &f.upstream) {
+        _ if detached_only > 0 => format!(
+            "{name} has {} on its detached HEAD that no branch or tag holds{when}.",
+            count(detached_only as usize, "commit")
+        ),
         (
             _,
             Upstream::Tracking {
@@ -295,6 +305,20 @@ fn active(name: &str, f: &GitFacts, now: i64) -> String {
     }
 }
 
+/// When the claims about remote branches were last true: git's refs for them change only on
+/// a fetch, and Scry never fetches.
+fn as_of_fetch(fetched_at: Option<i64>, now: i64) -> String {
+    match fetched_at {
+        Some(t) => format!("as of the last fetch, {}", long_age(now - t)),
+        None => "as of the last fetch (time unknown)".into(),
+    }
+}
+
+/// "1 file is" or "3 files are".
+fn count_verb(n: usize, noun: &str, one: &str, many: &str) -> String {
+    format!("{} {}", count(n, noun), if n == 1 { one } else { many })
+}
+
 fn concern(w: &Worktree, c: &Concern, home: &Path) -> String {
     let holds = match sized(w) {
         Some(s) => format!(" holds {}", count(s.files as usize, "file")),
@@ -303,17 +327,56 @@ fn concern(w: &Worktree, c: &Concern, home: &Path) -> String {
     match c {
         Concern::UpstreamGone { upstream } => format!("its upstream {upstream} is gone"),
         Concern::OnlyHere { commits } => format!(
-            "{} {} nowhere else",
-            count(*commits as usize, "commit"),
-            if *commits == 1 { "exists" } else { "exist" }
+            "{} nowhere else",
+            count_verb(*commits as usize, "commit", "exists", "exist")
         ),
         Concern::Stashed { entries } => format!(
-            "{} {} made on its branch",
-            count(*entries as usize, "stash entry"),
-            if *entries == 1 { "was" } else { "were" }
+            "{} made {}",
+            count_verb(*entries as usize, "stash entry", "was", "were"),
+            match w.head {
+                Head::Detached { .. } => "at its HEAD",
+                _ => "on its branch",
+            }
         ),
         Concern::Locked { .. } => format!("it is locked{}", locked_by(w)),
+        Concern::HiddenFromStatus { files } => format!(
+            "{} hidden from git status",
+            count_verb(*files as usize, "file", "is", "are")
+        ),
+        Concern::Submodules { paths } => format!(
+            "it has {} checked out, which `git worktree remove` refuses to remove",
+            count(paths.len(), "submodule")
+        ),
+        Concern::WorktreesInside { paths } => format!(
+            "{} inside it",
+            count_verb(paths.len(), "other worktree", "sits", "sit")
+        ),
+        Concern::ReposInside { paths } => format!(
+            "{} inside it",
+            count_verb(paths.len(), "repository", "sits", "sit")
+        ),
+        Concern::NotWalked => {
+            "its folder was not walked, so a repository inside it would go unseen".into()
+        }
+        Concern::Unread { entries } => format!(
+            "{} inside it could not be read",
+            count(*entries as usize, "entry")
+        ),
+        Concern::RecordExtras { names } => format!(
+            "its record in the repo's git folder also holds {}",
+            and_list(names)
+        ),
+        Concern::DetachedOnly { commits } => format!(
+            "its detached HEAD holds {} that no branch or tag holds",
+            count(*commits as usize, "commit")
+        ),
         Concern::FolderMissing => "its folder is gone".into(),
+        Concern::MovedTo { path } => {
+            let to = tilde(path, home);
+            format!(
+                "its folder was moved by hand to {to}; `git worktree repair {to}` reconnects it"
+            )
+        }
         Concern::NoGitLink if holds.is_empty() => "its folder has no .git link".into(),
         Concern::NoGitLink => format!("its folder has no .git link but{holds}"),
         Concern::LinkElsewhere { gitdir } => format!(
@@ -334,6 +397,9 @@ fn concern(w: &Worktree, c: &Concern, home: &Path) -> String {
 }
 
 fn locked_by(w: &Worktree) -> String {
+    if w.lock.as_ref().is_some_and(|l| l.unreadable) {
+        return " (its lock file could not be read)".into();
+    }
     match w.lock.as_ref().and_then(|l| l.reason.as_deref()) {
         Some(r) if r.starts_with("claude agent ") => match claude_lock_pid(r) {
             Some(pid) => format!(" by a Claude Code agent (pid {pid})"),
@@ -356,14 +422,22 @@ fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
         Head::Unknown => {}
     }
     if let Some(f) = w.state.facts() {
-        facts_evidence(f, now, &mut out);
+        facts_evidence(f, now, home, &mut out);
     }
     match &w.state {
         WorktreeState::CanGo(safe) => {
-            let (KeptBy::DefaultBranch { name } | KeptBy::Upstream { name }) = safe.kept_by();
+            out.push(
+                "nothing to lose: a valid, unlocked worktree; git status lists nothing and \
+                 nothing is hidden from it; no submodule, worktree or repository sits inside \
+                 it; its record holds only git's standard files. Ignored files are not checked"
+                    .into(),
+            );
+            let finished = safe.finished();
+            let (KeptBy::DefaultBranch { name } | KeptBy::Upstream { name }) = finished.kept_by();
             out.push(format!(
-                "a valid, unlocked worktree with no changes and no stash entries; {name} holds \
-                 every commit of HEAD"
+                "finished: {name} holds every commit of HEAD {}, and no stash entry was made \
+                 on it",
+                as_of_fetch(finished.fetched_at(), now)
             ));
         }
         WorktreeState::CanPrune(p) => {
@@ -382,6 +456,13 @@ fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
             for c in concerns {
                 match c {
                     Concern::FolderMissing => out.push("the folder does not exist".into()),
+                    Concern::MovedTo { path } => out.push(format!(
+                        "the folder does not exist, and {} links back to its record",
+                        tilde(path, home)
+                    )),
+                    Concern::RecordExtras { names } if facts.is_none() => {
+                        out.push(format!("its record also holds {}", names.join(", ")))
+                    }
                     Concern::NoGitLink => out.push("the folder has no .git file".into()),
                     Concern::LinkElsewhere { gitdir } => out.push(format!(
                         ".git points at {}, not at its own record",
@@ -409,6 +490,7 @@ fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
     }
     if let Some(lock) = &w.lock {
         out.push(match &lock.reason {
+            _ if lock.unreadable => "locked: the lock file is there but could not be read".into(),
             Some(r) => format!("locked: {r}"),
             None => "locked".into(),
         });
@@ -453,13 +535,61 @@ fn evidence(w: &Worktree, now: i64, home: &Path) -> Vec<String> {
     out
 }
 
-fn facts_evidence(f: &GitFacts, now: i64, out: &mut Vec<String>) {
+fn facts_evidence(f: &GitFacts, now: i64, home: &Path, out: &mut Vec<String>) {
     out.push(match f.changes {
         Changes::Clean => "git status: clean, untracked and submodule changes included".into(),
         Changes::Dirty { changed, untracked } => {
             format!("git status: {}", changes_phrase(changed, untracked))
         }
     });
+    let p = &f.per_worktree;
+    let paths = |ps: &[std::path::PathBuf]| {
+        let shown: Vec<String> = ps.iter().map(|q| tilde(q, home)).collect();
+        shown.join(", ")
+    };
+    if p.hidden > 0 {
+        out.push(format!(
+            "{} flagged assume-unchanged or skip-worktree, so git status does not compare {} \
+             with the folder",
+            count(p.hidden as usize, "file"),
+            if p.hidden == 1 { "it" } else { "them" }
+        ));
+    }
+    if !p.submodules.is_empty() {
+        out.push(format!("submodules checked out: {}", paths(&p.submodules)));
+    }
+    if !p.worktrees_inside.is_empty() {
+        out.push(format!("worktrees inside: {}", paths(&p.worktrees_inside)));
+    }
+    match &p.repos_inside {
+        ReposInside::Unknown => out.push("not walked for repositories inside".into()),
+        ReposInside::Walked { repos, unread } => {
+            if !repos.is_empty() {
+                out.push(format!(
+                    "folders inside with their own .git: {}",
+                    paths(repos)
+                ));
+            }
+            if *unread > 0 {
+                out.push(format!(
+                    "{} inside could not be read",
+                    count(*unread as usize, "entry")
+                ));
+            }
+        }
+    }
+    if !p.record_extras.is_empty() {
+        out.push(format!(
+            "its record also holds {}",
+            p.record_extras.join(", ")
+        ));
+    }
+    if p.detached_only > 0 {
+        out.push(format!(
+            "{} at the detached HEAD that no branch or tag holds",
+            count(p.detached_only as usize, "commit")
+        ));
+    }
     out.push(match &f.merge {
         Merge::Merged { into } => format!("HEAD is in {into}"),
         Merge::Unmerged { into } => format!("HEAD has commits not in {into}"),
@@ -495,6 +625,13 @@ fn facts_evidence(f: &GitFacts, now: i64, out: &mut Vec<String>) {
     if let Some(t) = f.last_commit {
         out.push(format!("last commit {}", long_age(now - t)));
     }
+    out.push(match f.fetched_at {
+        Some(t) => format!(
+            "the repo last fetched {}; remote branches are as of then",
+            long_age(now - t)
+        ),
+        None => "no fetch on record; remote branches are as of the clone or a push".into(),
+    });
 }
 
 /// Claude Code writes "claude agent <name> (pid <pid> start …)".

@@ -1,12 +1,26 @@
-//! Linked git worktrees under the code roots and agent folders: what deleting each one would
+//! Linked git worktrees under the code roots and agent folders: what removing each one would
 //! cost, how much space it holds, and the agent that probably made it.
+//!
+//! Two questions decide a worktree's label, and `verdict` keeps them apart:
+//!
+//! - **Loss: what does removing the folder destroy?** Working files and the worktree's own git
+//!   state. Scry checks that `git status` lists nothing, that no file is hidden from it, that
+//!   no submodule, other worktree or repository sits inside, that the worktree's record holds
+//!   only git's standard files, that a detached HEAD is held by a local branch or tag, and
+//!   that it is not locked. Ignored files are not checked: a local `.env` goes with the folder.
+//! - **Finished: is its work done?** Asked only when nothing is lost: HEAD is in the default
+//!   branch or on its upstream, as of the repo's last fetch. Scry never fetches.
+//!
+//! "Can go" needs both, and no stash entry made on the worktree: stash entries belong to the
+//! repo and outlive it, but one may be work set aside and forgotten. Scry's cleanup is meant
+//! to move a folder to the Trash rather than delete it, so anything these checks miss can
+//! still be put back.
 
 mod creator;
 mod discover;
 #[cfg(test)]
 mod tests;
 mod verdict;
-pub mod view;
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +30,7 @@ use crate::size::SubtreeSize;
 
 pub use creator::{Agent, CreatorEvidence, CreatorSource, ProbableCreator};
 pub use discover::{ScanOptions, measure, scan};
-pub use verdict::{KeptBy, Prunable, Safe};
+pub use verdict::{Finished, KeptBy, NothingLost, Prunable, Safe};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Worktree {
@@ -77,16 +91,18 @@ pub enum Head {
     Unknown,
 }
 
-/// What deleting a worktree would cost. Only `verdict` can build the `Safe` and `Prunable`
+/// What removing a worktree would cost. Only `verdict` can build the `Safe` and `Prunable`
 /// that `CanGo` and `CanPrune` carry, and only after every check passed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorktreeState {
-    /// Deleting the folder loses nothing.
+    /// Every loss check passed and its work is finished; see `Safe` for what that covers.
+    /// Ignored files are not checked.
     CanGo(Safe),
     /// The folder is gone; pruning removes only git's record of it.
     CanPrune(Prunable),
-    /// Looks stale, but deleting it could lose work. Each concern says what to check.
+    /// Removing it could lose something, or its work may not be finished. Each concern says
+    /// what to check.
     NeedsLook {
         concerns: Vec<Concern>,
         facts: Option<GitFacts>,
@@ -95,8 +111,8 @@ pub enum WorktreeState {
     Dirty(GitFacts),
     /// Clean and locked: git keeps it until it is unlocked.
     Locked(GitFacts),
-    /// Clean, with commits that are not merged or not all pushed, and nothing suggests it is
-    /// stale.
+    /// Clean and unlocked, with commits not merged or not all pushed, and nothing suggests it
+    /// is stale. Anything else removing it would lose is in its facts.
     Active(GitFacts),
     /// Not read, so nothing is claimed about it.
     NotRead(NotRead),
@@ -115,19 +131,59 @@ impl WorktreeState {
     }
 }
 
-/// What one `git status` and the repo's refs say about a worktree whose folder git can use.
+/// What a look at a worktree whose folder git can use found: one `git status`, its index,
+/// its record, the repo's refs and, once `measure` ran, the folders inside it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GitFacts {
     pub changes: Changes,
+    /// Its own git state and contents that removing the folder destroys and `git status`
+    /// does not show.
+    pub per_worktree: PerWorktree,
     pub merge: Merge,
     pub upstream: Upstream,
-    /// Stash entries made on its branch, or on a detached HEAD at its commit.
+    /// Stash entries whose message names its branch, or, when its HEAD is detached, that
+    /// were made at its HEAD's commit. Stash entries belong to the repo and outlive it.
     pub stashes: u32,
     /// Commits at HEAD that no other branch, remote branch or tag holds. Counted only where
     /// it is evidence: for a branch whose upstream is gone.
     pub only_here: Option<u32>,
     /// Committer time of HEAD, Unix seconds.
     pub last_commit: Option<i64>,
+    /// When the repo last fetched, from the newest `FETCH_HEAD`, Unix seconds. Remote-tracking
+    /// refs say what the remote held then; Scry itself never talks to a remote.
+    pub fetched_at: Option<i64>,
+}
+
+/// What belongs to one worktree beyond its tracked and untracked files, so removing it
+/// destroys it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PerWorktree {
+    /// Index entries flagged assume-unchanged or skip-worktree. `git status` does not compare
+    /// them with the folder, so an edit to one is invisible to it.
+    pub hidden: u32,
+    /// Submodules checked out inside it, relative to it. `git worktree remove` refuses these.
+    pub submodules: Vec<PathBuf>,
+    /// Other worktrees that the scan found inside its folder.
+    pub worktrees_inside: Vec<PathBuf>,
+    /// Folders inside it with a `.git` of their own, from the size walk.
+    pub repos_inside: ReposInside,
+    /// Entries in its record under `.git/worktrees` beyond git's standard files, such as
+    /// `config.worktree`, `hooks`, `refs` or `rebase-merge`.
+    pub record_extras: Vec<String>,
+    /// Commits at a detached HEAD that no local branch or tag holds. HEAD goes with the
+    /// worktree, and with it the only ref to them.
+    pub detached_only: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReposInside {
+    /// Not walked: sizing was skipped, or the walk could not open the folder.
+    #[default]
+    Unknown,
+    /// Folders inside it holding a `.git`, relative to it. `unread` entries could not be
+    /// read, and one could hold another.
+    Walked { repos: Vec<PathBuf>, unread: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -151,7 +207,8 @@ pub enum Merge {
     Unmerged { into: String },
     /// HEAD has no commit yet.
     Unborn,
-    /// The repo has no `origin/HEAD`, `main` or `master` to compare with.
+    /// The repo has no `origin/HEAD`, and no `main` or `master`, local or remote, to compare
+    /// with.
     NoDefaultBranch,
 }
 
@@ -159,7 +216,7 @@ pub enum Merge {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Upstream {
     None,
-    /// A remote branch that still exists.
+    /// A remote branch whose remote-tracking ref is here, so it existed at the last fetch.
     Tracking {
         name: String,
         ahead: u32,
@@ -176,7 +233,7 @@ pub enum Upstream {
     },
 }
 
-/// Why a worktree that looks stale needs a look before anyone deletes it.
+/// Why a worktree needs a look before anyone removes it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Concern {
@@ -193,8 +250,43 @@ pub enum Concern {
     Locked {
         reason: Option<String>,
     },
+    /// Files flagged assume-unchanged or skip-worktree, whose edits `git status` hides.
+    HiddenFromStatus {
+        files: u32,
+    },
+    /// Checked-out submodules, which `git worktree remove` refuses to remove.
+    Submodules {
+        paths: Vec<PathBuf>,
+    },
+    /// Other worktrees inside the folder.
+    WorktreesInside {
+        paths: Vec<PathBuf>,
+    },
+    /// Repositories inside the folder, relative to it.
+    ReposInside {
+        paths: Vec<PathBuf>,
+    },
+    /// The folder was not walked, so a repository inside it would go unseen.
+    NotWalked,
+    /// Entries inside the folder that the walk could not read.
+    Unread {
+        entries: u64,
+    },
+    /// Files in its record beyond git's standard ones.
+    RecordExtras {
+        names: Vec<String>,
+    },
+    /// Commits at a detached HEAD that no local branch or tag holds.
+    DetachedOnly {
+        commits: u32,
+    },
     /// Registered, but the folder is gone.
     FolderMissing,
+    /// Registered, its folder is gone, and a folder elsewhere links back to the record: it
+    /// was moved without `git worktree move`, and `git worktree repair` reconnects it.
+    MovedTo {
+        path: PathBuf,
+    },
     /// Registered, but the folder has no `.git` link back to the repo.
     NoGitLink,
     /// The folder's `.git` link points at some other record.
@@ -218,7 +310,10 @@ pub enum NotRead {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Lock {
+    /// None when git was given no reason, or the lock file could not be read.
     pub reason: Option<String>,
+    /// The lock file is there but could not be read. It still counts as a lock.
+    pub unreadable: bool,
 }
 
 /// What one scan found, with how long each step took.

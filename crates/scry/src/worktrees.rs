@@ -7,7 +7,7 @@ use anyhow::{Result, bail};
 use clap::Args;
 use scry_core::config::Config;
 use scry_core::paths::Paths;
-use scry_core::worktree::view::{WorktreesView, bytes};
+use scry_core::view::worktrees::{WorktreesView, bytes};
 use scry_core::worktree::{self, ScanOptions, Timings, WorktreeScan};
 use serde::Serialize;
 
@@ -19,7 +19,8 @@ pub struct WorktreesArgs {
     /// config file.
     #[arg(long = "root", value_name = "DIR")]
     roots: Vec<PathBuf>,
-    /// Skip sizing, which walks every file and takes most of the time.
+    /// Skip sizing, which walks every file and takes most of the time. The same walk looks
+    /// for repositories nested in each worktree, so without it none is called "can go".
     #[arg(long)]
     no_size: bool,
 }

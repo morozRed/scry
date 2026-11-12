@@ -3,12 +3,14 @@
 
 pub mod agents;
 pub mod ports;
+pub mod worktrees;
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::Snapshot;
 pub use agents::AgentRow;
 pub use ports::PortRow;
+pub use worktrees::{WorktreeRow, WorktreesView};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

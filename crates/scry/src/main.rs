@@ -91,6 +91,7 @@ fn main() -> Result<()> {
         let _ = e.print();
         std::process::exit(if e.use_stderr() { USAGE } else { 0 });
     });
+    raise_fd_limit();
     match cli.command {
         None if std::io::stdout().is_terminal() => tui::run(None),
         None => print_overview(&load(None)?, false),
@@ -114,6 +115,25 @@ fn main() -> Result<()> {
         Some(Command::Bench {
             what: BenchWhat::Worktrees(args),
         }) => worktrees::bench(args),
+    }
+}
+
+/// The size walk keeps a descriptor open for each queued folder's parent, and a deep tree
+/// walked by several threads can pass macOS's default soft limit of 256. The limit is the
+/// whole process's, and children such as git inherit it, so it is raised here, once.
+fn raise_fd_limit() {
+    let mut r = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+        return;
+    }
+    // OPEN_MAX, the most setrlimit accepts on macOS.
+    let want = r.rlim_max.min(10_240);
+    if r.rlim_cur < want {
+        r.rlim_cur = want;
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) };
     }
 }
 

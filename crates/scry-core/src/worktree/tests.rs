@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::view::{WorktreeRow, WorktreesView};
 use super::*;
+use crate::view::worktrees::{WorktreeRow, WorktreesView};
+
+mod loss;
 
 /// Runs git to build a fixture, away from the user's config and from any `GIT_*` variable.
-fn git(dir: &Path, args: &[&str]) -> String {
+pub(super) fn git(dir: &Path, args: &[&str]) -> String {
     let mut cmd = Command::new("git");
     for (key, _) in std::env::vars_os() {
         if key.as_bytes().starts_with(b"GIT_") {
@@ -50,7 +52,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn write(path: &Path, text: &str) {
+pub(super) fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
 }
@@ -379,9 +381,10 @@ fn can_go_only_with_proof_from_the_default_branch_or_a_live_upstream() {
     removable.sort();
     assert_eq!(removable, ["1a2b/app", "app-merged", "app-pushed"]);
     assert!(
-        row(&v, "app-pushed")
-            .sentence
-            .starts_with("app-pushed is clean and every commit is on origin/feat-pushed;"),
+        row(&v, "app-pushed").sentence.starts_with(
+            "app-pushed is clean and every commit is on origin/feat-pushed as of the last \
+             fetch, "
+        ),
         "{}",
         row(&v, "app-pushed").sentence
     );
@@ -511,9 +514,9 @@ fn the_view_explains_each_row_in_one_sentence() {
     let v = view(&f);
     let merged = &row(&v, "app-merged").sentence;
     assert!(
-        merged.starts_with(
-            "app-merged is merged into origin/main and clean; deleting it frees at least "
-        ),
+        merged
+            .starts_with("app-merged is clean and merged into origin/main as of the last fetch, ")
+            && merged.contains("; deleting it frees at least "),
         "{merged}"
     );
     assert_eq!(
@@ -699,6 +702,125 @@ fn never_reads_inside_desktop_documents_or_downloads() {
         "{:?}",
         v.rows
     );
+}
+
+/// Paths that reach a protected folder through a `..` after a folder that does not exist, and
+/// record files that are symlinks into one. None may be read, and none is called removable.
+#[test]
+fn never_follows_a_dangling_dotdot_or_a_symlinked_record_file_into_a_protected_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let code = home.join("code");
+    let documents = home.join("Documents");
+    fs::create_dir_all(&documents).unwrap();
+    let app = code.join("app");
+    new_repo(&base, &app);
+    let record = |name: &str| app.join(".git/worktrees").join(name);
+    let dangling = code.join("missing/../../Documents");
+
+    // A record whose gitdir file reaches Documents through `missing/..`.
+    let in_docs = documents.join("wt-dotdot");
+    git(
+        &app,
+        &["worktree", "add", "-q", "-b", "dotdot", s(&in_docs)],
+    );
+    write(
+        &record("wt-dotdot").join("gitdir"),
+        &format!("{}\n", s(&dangling.join("wt-dotdot/.git"))),
+    );
+    // A Codex worktree whose .git file does the same.
+    let proj = documents.join("proj");
+    new_repo(&base, &proj);
+    let codex = home.join(".codex/worktrees/ef56");
+    git(
+        &proj,
+        &["worktree", "add", "-q", "-b", "task", s(&codex.join("x"))],
+    );
+    write(
+        &codex.join("x/.git"),
+        &format!("gitdir: {}\n", s(&dangling.join("proj/.git/worktrees/x"))),
+    );
+    // Worktrees outside, whose record files are symlinks to copies inside Documents.
+    for (name, file) in [
+        ("link-gitdir", "gitdir"),
+        ("link-lock", "locked"),
+        ("link-head", "HEAD"),
+    ] {
+        let wt = add(&app, name, name);
+        if file == "locked" {
+            git(&app, &["worktree", "lock", s(&wt)]);
+        }
+        let real = record(name).join(file);
+        let copy = documents.join(format!("{name}-{file}"));
+        fs::rename(&real, &copy).unwrap();
+        std::os::unix::fs::symlink(&copy, &real).unwrap();
+    }
+
+    let scan = locked_away(&[&documents], || {
+        let roots = vec![code.clone(), dangling.clone()];
+        let mut scan = scan(&ScanOptions::new(&home, roots));
+        measure(&mut scan, &home);
+        scan
+    });
+    let v = WorktreesView::new(&scan, now(), &home);
+    assert!(
+        scan.warnings
+            .iter()
+            .any(|w| w.contains("missing/../../Documents was not read")),
+        "{:?}",
+        scan.warnings
+    );
+    for (name, word, why) in [
+        ("wt-dotdot", "not read", "a folder that does not exist"),
+        ("ef56/x", "not read", "cannot be resolved"),
+        ("link-gitdir", "not read", "its record's gitdir file"),
+        (
+            "link-lock",
+            "not read",
+            "its record holds a symlink (locked)",
+        ),
+        ("link-head", "not read", "its record holds a symlink (HEAD)"),
+    ] {
+        let r = row(&v, name);
+        assert_eq!(r.status.word(), word, "{name}: {r:?}");
+        assert!(says(r, why), "{name} should say {why:?}: {r:?}");
+    }
+}
+
+/// Documents is a symlink to a folder under `.claude/worktrees`, and another entry there is a
+/// symlink into Documents. Neither is entered.
+#[test]
+fn an_agent_folder_entry_that_is_or_leads_into_a_protected_folder_is_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let code = home.join("code");
+    let app = code.join("app");
+    new_repo(&base, &app);
+    let agents = app.join(".claude/worktrees");
+    let private = agents.join("private");
+    git(
+        &app,
+        &["worktree", "add", "-q", "-b", "private", s(&private)],
+    );
+    fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(&private, home.join("Documents")).unwrap();
+    let desktop = home.join("Desktop");
+    fs::create_dir_all(desktop.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(desktop.join("elsewhere"), agents.join("via-link")).unwrap();
+
+    let scan = locked_away(&[&private, &desktop], || {
+        let mut scan = scan(&ScanOptions::new(&home, vec![code.clone()]));
+        measure(&mut scan, &home);
+        scan
+    });
+    let v = WorktreesView::new(&scan, now(), &home);
+    for name in ["private", "via-link"] {
+        let r = row(&v, name);
+        assert_eq!(r.status.word(), "not read", "{name}: {r:?}");
+        assert!(says(r, "not read: protected folder"), "{name}: {r:?}");
+    }
 }
 
 #[test]

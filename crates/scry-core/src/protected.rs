@@ -2,11 +2,17 @@
 //! touches anything inside them, so Scry never looks inside one, not even to check that a
 //! path exists. Folders are compared by device and inode, so a symlink, a `..` or a name
 //! cased differently does not slip past.
+//!
+//! Known limit: git opens a repo's own files itself. An `include.path` or `includeIf` in its
+//! config can name a file inside a protected folder, and so can a symlink inside its git
+//! folder. Scry does not run git on a worktree whose record holds a symlink, but it cannot
+//! see every file git opens, so such a repo can still make macOS ask.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::io;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 
 pub const FOLDERS: [&str; 3] = ["Desktop", "Documents", "Downloads"];
@@ -29,6 +35,31 @@ pub enum Resolved {
     Outside(PathBuf),
     /// The path leads into this protected folder.
     Inside(PathBuf),
+    /// A `..` follows a component that does not exist. The kernel cannot open such a path,
+    /// and where it would lead cannot be checked, so it is not read.
+    Unresolvable,
+}
+
+impl Resolved {
+    pub fn outside(self) -> Option<PathBuf> {
+        match self {
+            Resolved::Outside(p) => Some(p),
+            Resolved::Inside(_) | Resolved::Unresolvable => None,
+        }
+    }
+}
+
+/// Reads a whole file without following a symlink in its last component, so a link planted
+/// where git keeps a small file cannot lead the read anywhere else. Earlier components must
+/// already be resolved.
+pub fn read_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut out = Vec::new();
+    io::Read::read_to_end(&mut f, &mut out)?;
+    Ok(out)
 }
 
 impl Protected {
@@ -72,15 +103,13 @@ impl Protected {
             }
             let next = out.join(&part);
             let Ok(meta) = fs::symlink_metadata(&next) else {
-                // Nothing is there, so the rest cannot lead anywhere else.
-                out = next;
-                for part in todo {
-                    if part == ".." {
-                        out.pop();
-                    } else {
-                        out.push(part);
-                    }
+                // Nothing is there, so the rest cannot lead anywhere else, unless a `..`
+                // climbs back out of it, which the kernel refuses to do.
+                if todo.iter().any(|p| p == "..") {
+                    return Resolved::Unresolvable;
                 }
+                out = next;
+                out.extend(todo);
                 return Resolved::Outside(out);
             };
             if meta.file_type().is_symlink() {
@@ -147,6 +176,15 @@ mod tests {
         assert_eq!(
             guard.resolve(&home.join("code/app/../app/missing/.git")),
             Resolved::Outside(home.join("code/app/missing/.git"))
+        );
+        // The kernel cannot climb out of a folder that does not exist, so neither does this.
+        assert_eq!(
+            guard.resolve(&home.join("code/missing/../../Desktop/proj")),
+            Resolved::Unresolvable
+        );
+        assert_eq!(
+            guard.resolve(&home.join("code/missing/x/../../app")),
+            Resolved::Unresolvable
         );
         assert_eq!(
             guard.resolve(&home.join("code/app")),

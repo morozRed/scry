@@ -1,7 +1,7 @@
 //! Runs the `git` CLI and parses what it prints into types, and reads the small files git
 //! keeps about worktrees. Nothing here writes to a repository.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -12,15 +12,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::protected::read_no_follow;
+
 pub struct Output {
     pub code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
 
-/// Runs `git -C dir args…`. Whatever git starts dies with it, and the call ends at `timeout`
-/// even if something still holds git's output open.
-pub fn run(dir: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
+/// Runs `git -C dir args…` in a process group of its own and kills that group once git exits,
+/// so the helpers git starts die with it. A child that moves to another group escapes that
+/// kill: if it holds git's output open, the call waits for it until `timeout`, then returns
+/// an error and leaves it running.
+pub fn run<S: AsRef<OsStr>>(dir: &Path, args: &[S], timeout: Duration) -> Result<Output> {
+    let shown = || {
+        let words: Vec<_> = args.iter().map(|a| a.as_ref().to_string_lossy()).collect();
+        words.join(" ")
+    };
     let mut cmd = Command::new("git");
     // Inside a git hook, GIT_DIR, GIT_INDEX_FILE and the like would aim every call at the
     // hook's repository.
@@ -55,8 +63,8 @@ pub fn run(dir: &Path, args: &[&str], timeout: Duration) -> Result<Output> {
     unsafe { libc::kill(-pid, libc::SIGKILL) };
     let status = child.wait()?;
     let [stdout, stderr] = read.map_err(|e| match e.kind() {
-        io::ErrorKind::TimedOut => anyhow!("git {} timed out after {timeout:?}", args.join(" ")),
-        _ => anyhow!("git {}: {e}", args.join(" ")),
+        io::ErrorKind::TimedOut => anyhow!("git {} timed out after {timeout:?}", shown()),
+        _ => anyhow!("git {}: {e}", shown()),
     })?;
     let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
     Ok(Output {
@@ -181,13 +189,26 @@ fn collect(pid: i32, pipes: &[OwnedFd; 2], deadline: Instant) -> io::Result<[Vec
 }
 
 /// Runs git and returns its stdout, or an error carrying git's first line of complaint.
-pub fn stdout(dir: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+pub fn stdout<S: AsRef<OsStr>>(dir: &Path, args: &[S], timeout: Duration) -> Result<String> {
     let out = run(dir, args, timeout)?;
     if out.code != Some(0) {
         let why = out.stderr.lines().next().unwrap_or("no message").trim();
-        bail!("git {} failed: {why}", args.join(" "));
+        let words: Vec<_> = args.iter().map(|a| a.as_ref().to_string_lossy()).collect();
+        bail!("git {} failed: {why}", words.join(" "));
     }
     Ok(out.stdout)
+}
+
+/// `--git-dir=<record> --work-tree=<folder>`, which aim a command at one linked worktree. Set
+/// this way, git reads neither the folder's `.git` file nor a `core.worktree` that would
+/// send it to another folder.
+pub fn worktree_args(record: &Path, folder: &Path) -> [OsString; 2] {
+    let arg = |flag: &str, p: &Path| {
+        let mut a = OsString::from(flag);
+        a.push(p.as_os_str());
+        a
+    };
+    [arg("--git-dir=", record), arg("--work-tree=", folder)]
 }
 
 /// The one `git status` call made per worktree. Flags override any config that would hide an
@@ -200,6 +221,47 @@ pub const STATUS: [&str; 6] = [
     "--untracked-files=normal",
     "--ignore-submodules=none",
 ];
+
+/// Lists the index with each entry's flags and mode, for `parse_index`.
+pub const LS_FILES: [&str; 4] = ["ls-files", "-s", "-v", "-z"];
+
+/// What a worktree's index holds beyond what `git status` reports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IndexFlags {
+    /// Paths flagged assume-unchanged or skip-worktree. `git status` does not compare them
+    /// with the folder, so an edit to one is invisible to it.
+    pub hidden: u32,
+    /// Paths of submodule entries (gitlinks).
+    pub gitlinks: Vec<String>,
+}
+
+/// Parses the output of `LS_FILES`: `<tag> <mode> <oid> <stage>\t<path>`, where tag `S` marks
+/// skip-worktree and a lowercase tag marks assume-unchanged.
+pub fn parse_index(z: &str) -> Result<IndexFlags> {
+    let mut out = IndexFlags::default();
+    let mut last_hidden: Option<&str> = None;
+    for record in z.split('\0').filter(|r| !r.is_empty()) {
+        let (meta, path) = record
+            .split_once('\t')
+            .ok_or_else(|| anyhow!("unexpected git ls-files record {record:?}"))?;
+        let mut f = meta.split(' ');
+        let (Some(tag), Some(mode), Some(_oid), Some(stage)) =
+            (f.next(), f.next(), f.next(), f.next())
+        else {
+            bail!("unexpected git ls-files record {record:?}");
+        };
+        let flagged = tag == "S" || tag.bytes().all(|b| b.is_ascii_lowercase());
+        // An unmerged path has one entry per stage; count it once.
+        if flagged && last_hidden != Some(path) {
+            out.hidden += 1;
+            last_hidden = Some(path);
+        }
+        if mode == "160000" && stage == "0" {
+            out.gitlinks.push(path.to_string());
+        }
+    }
+    Ok(out)
+}
 
 /// What one `git status` call says about a worktree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -296,8 +358,16 @@ pub fn parse_refs(text: &str) -> Vec<Ref> {
         .collect()
 }
 
-/// The arguments that list stash entries for `parse_stashes`, one record per NUL.
-pub const STASH_LIST: [&str; 5] = ["log", "-z", "-g", "--format=%P%x09%gs", "refs/stash"];
+/// The arguments that list stash entries for `parse_stashes`, one record per NUL. With no
+/// stash they print nothing, so they can run whether or not one existed earlier in a scan.
+pub const STASH_LIST: [&str; 6] = [
+    "log",
+    "-z",
+    "-g",
+    "--format=%P%x09%gs",
+    "--ignore-missing",
+    "refs/stash",
+];
 
 /// One stash entry: the commit it was made on and the branch its message names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -327,9 +397,10 @@ pub fn parse_stashes(z: &str) -> Vec<Stash> {
 }
 
 /// The target of a `.git` file, `gitdir: <path>`, relative to the file's folder unless
-/// absolute. Like git, only line endings are trimmed, so a path may hold any other byte.
+/// absolute. Like git, only line endings are trimmed, so a path may hold any other byte. A
+/// symlink in place of the file is not followed.
 pub fn read_gitdir_file(dot_git: &Path) -> io::Result<PathBuf> {
-    let mut text = std::fs::read(dot_git)?;
+    let mut text = read_no_follow(dot_git)?;
     while text.last().is_some_and(|b| matches!(b, b'\n' | b'\r')) {
         text.pop();
     }
@@ -347,13 +418,18 @@ pub fn read_gitdir_file(dot_git: &Path) -> io::Result<PathBuf> {
 }
 
 /// A path git stores in a file of a worktree's record, such as `gitdir` or `commondir`, with
-/// trailing whitespace trimmed as git does. It may be relative to the record.
-pub fn read_path_file(file: &Path) -> Option<PathBuf> {
-    let mut text = std::fs::read(file).ok()?;
+/// trailing whitespace trimmed as git does. It may be relative to the record. None when the
+/// file is absent or empty; an error when it is there but cannot be read, a symlink included.
+pub fn read_path_file(file: &Path) -> io::Result<Option<PathBuf>> {
+    let mut text = match read_no_follow(file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     while text.last().is_some_and(u8::is_ascii_whitespace) {
         text.pop();
     }
-    (!text.is_empty()).then(|| PathBuf::from(std::ffi::OsString::from_vec(text)))
+    Ok((!text.is_empty()).then(|| PathBuf::from(OsString::from_vec(text))))
 }
 
 #[cfg(test)]
@@ -430,6 +506,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_index_flags_and_gitlinks() {
+        let z = "H 100644 aaa 0\t.gitmodules\0h 100644 bbb 0\tlocal.conf\0\
+                 S 100644 ccc 0\tsparse/b.txt\0H 160000 ddd 0\tvendor/lib\0\
+                 M 100644 eee 1\tboth\0M 100644 fff 2\tboth\0";
+        assert_eq!(
+            parse_index(z).unwrap(),
+            IndexFlags {
+                hidden: 2,
+                gitlinks: vec!["vendor/lib".into()],
+            }
+        );
+        assert!(parse_index("H 100644\tx\0").is_err());
+        assert_eq!(parse_index("").unwrap(), IndexFlags::default());
+    }
+
+    #[test]
     fn reads_a_gitdir_file_whose_path_holds_a_newline() {
         let t = tempfile::tempdir().unwrap();
         let file = t.path().join(".git");
@@ -445,6 +537,22 @@ mod tests {
         );
         std::fs::write(&file, "nonsense\n").unwrap();
         assert!(read_gitdir_file(&file).is_err());
+    }
+
+    #[test]
+    fn does_not_follow_a_symlink_in_place_of_a_record_file() {
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("elsewhere");
+        std::fs::write(&real, "gitdir: /x/.git/worktrees/a\n").unwrap();
+        let link = t.path().join("gitdir");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(read_path_file(&link).is_err());
+        assert!(read_gitdir_file(&link).is_err());
+        assert_eq!(read_path_file(&t.path().join("absent")).unwrap(), None);
+        assert_eq!(
+            read_path_file(&real).unwrap(),
+            Some(PathBuf::from("gitdir: /x/.git/worktrees/a"))
+        );
     }
 
     #[test]
