@@ -22,7 +22,7 @@ use super::{
 };
 use crate::git::{self, Ref};
 use crate::protected::{FileId, Protected, Resolved, file_id, read_no_follow};
-use crate::size::Walker;
+use crate::size::{SubtreeSize, Walker};
 
 pub struct ScanOptions {
     pub home: PathBuf,
@@ -162,6 +162,7 @@ pub fn scan(opts: &ScanOptions) -> WorktreeScan {
         known: &known,
         links_back: &links_back,
         creators: &opts.creators,
+        timeout,
     };
     let mut worktrees: Vec<Worktree> = tasks
         .iter()
@@ -208,6 +209,7 @@ pub fn scan(opts: &ScanOptions) -> WorktreeScan {
             lock: None,
             size: None,
             created_at: None,
+            record: None,
         });
     }
 
@@ -233,7 +235,17 @@ pub fn measure(scan: &mut WorktreeScan, home: &Path) {
     let start = Instant::now();
     let roots: Vec<PathBuf> = scan.worktrees.iter().map(|w| w.path.clone()).collect();
     let sizes = Walker::new(home).exclude(roots.clone()).measure(&roots);
+    apply_sizes(scan, sizes.into_iter().map(Some).collect());
+    scan.timings.size_ms = ms(start);
+    scan.timings.total_ms += scan.timings.size_ms;
+}
+
+/// Takes in sizes measured elsewhere, such as from the size cache, one per worktree in
+/// order, and judges again each worktree that got one. A worktree whose size is `None`
+/// keeps its state, which is never "can go" before its folder was walked.
+pub fn apply_sizes(scan: &mut WorktreeScan, sizes: Vec<Option<SubtreeSize>>) {
     for (w, size) in scan.worktrees.iter_mut().zip(sizes) {
+        let Some(size) = size else { continue };
         if let Some(facts) = w.state.facts() {
             let mut facts = facts.clone();
             facts.per_worktree.repos_inside = match size.error {
@@ -247,8 +259,6 @@ pub fn measure(scan: &mut WorktreeScan, home: &Path) {
         }
         w.size = Some(size);
     }
-    scan.timings.size_ms = ms(start);
-    scan.timings.total_ms += scan.timings.size_ms;
 }
 
 fn ms(since: Instant) -> f64 {
@@ -1220,6 +1230,92 @@ struct Context<'a> {
     known: &'a [PathBuf],
     links_back: &'a HashMap<FileId, Vec<PathBuf>>,
     creators: &'a [Box<dyn CreatorSource>],
+    timeout: Duration,
+}
+
+/// Whether the record's index stages anything its HEAD lacks, from `git diff --cached`
+/// aimed at the record alone. A record without an index stages nothing. No config can hide
+/// a staged change from it: submodule ignores, external diff drivers and textconv are off.
+pub fn record_staged(record: &Path, timeout: Duration) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(record.join("index")) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+        Ok(m) if !m.is_file() => anyhow::bail!("its record's index is not a file"),
+        Ok(_) => {}
+    }
+    let args = [
+        git_dir(record),
+        "-c".into(),
+        "diff.ignoreSubmodules=none".into(),
+        "diff".into(),
+        "--cached".into(),
+        "--quiet".into(),
+        // Over `submodule.<name>.ignore` too, which the config key above does not reach.
+        "--ignore-submodules=none".into(),
+        "--no-ext-diff".into(),
+        "--no-textconv".into(),
+        "HEAD".into(),
+        "--".into(),
+    ];
+    let out = git::run(record, &args, timeout)?;
+    match out.code {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => anyhow::bail!(
+            "git diff --cached on its record failed: {}",
+            out.stderr.lines().next().unwrap_or("no message").trim()
+        ),
+    }
+}
+
+/// Commits at `oid` that no local branch or tag holds, read through the record.
+pub fn unheld(record: &Path, oid: &str, timeout: Duration) -> anyhow::Result<u32> {
+    let args = [
+        git_dir(record),
+        "rev-list".into(),
+        "--count".into(),
+        oid.into(),
+        "--not".into(),
+        "--branches".into(),
+        "--tags".into(),
+    ];
+    let out = git::stdout(record, &args, timeout)?;
+    Ok(out.trim().parse()?)
+}
+
+fn git_dir(record: &Path) -> std::ffi::OsString {
+    let mut a = std::ffi::OsString::from("--git-dir=");
+    a.push(record.as_os_str());
+    a
+}
+
+/// What pruning a missing worktree's record would drop besides the record: staged changes,
+/// and on a detached HEAD the commits no local branch or tag holds. A record git would be
+/// led astray by is not read.
+fn missing_checks(rec: &Record, timeout: Duration) -> Result<(bool, u32), String> {
+    match &rec.blocked {
+        Some(Blocked::Protected(folder)) => {
+            return Err(format!(
+                "its record leads into protected folder {}",
+                folder.display()
+            ));
+        }
+        Some(Blocked::Unsafe(e)) => return Err(e.clone()),
+        None => {}
+    }
+    if !rec.symlinks.is_empty() {
+        return Err(format!(
+            "its record holds a symlink ({}), which git would follow",
+            rec.symlinks.join(", ")
+        ));
+    }
+    let err = |e: anyhow::Error| e.to_string();
+    let staged = record_staged(&rec.admin, timeout).map_err(err)?;
+    let detached_only = match &rec.head {
+        RecordHead::Detached(oid) => unheld(&rec.admin, oid, timeout).map_err(err)?,
+        _ => 0,
+    };
+    Ok((staged, detached_only))
 }
 
 fn worktree(
@@ -1266,21 +1362,27 @@ fn worktree(
         ),
         Look::Missing => match count_error.filter(|_| detached) {
             Some(e) => (shown, record_head, not_read(e)),
-            None => {
-                // The record's folder is gone, so any folder that links back was moved there.
-                let moved_to = fs::metadata(&rec.admin)
-                    .ok()
-                    .and_then(|m| ctx.links_back.get(&file_id(&m)))
-                    .and_then(|dirs| dirs.first())
-                    .cloned();
-                let reading = Reading::Missing {
-                    detached,
-                    only_here,
-                    record_extras: rec.extras.clone(),
-                    moved_to,
-                };
-                (shown, record_head, judge(reading, lock))
-            }
+            None => match missing_checks(rec, ctx.timeout) {
+                Err(e) => (shown, record_head, not_read(e)),
+                Ok((staged, detached_only)) => {
+                    // The record's folder is gone, so any folder that links back was moved
+                    // there.
+                    let moved_to = fs::metadata(&rec.admin)
+                        .ok()
+                        .and_then(|m| ctx.links_back.get(&file_id(&m)))
+                        .and_then(|dirs| dirs.first())
+                        .cloned();
+                    let reading = Reading::Missing {
+                        detached,
+                        only_here,
+                        detached_only,
+                        staged,
+                        record_extras: rec.extras.clone(),
+                        moved_to,
+                    };
+                    (shown, record_head, judge(reading, lock))
+                }
+            },
         },
         Look::NoGitLink(path) => (
             path,
@@ -1348,6 +1450,7 @@ fn worktree(
         lock: rec.lock.clone(),
         size: None,
         created_at: rec.created_at,
+        record: Some(rec.admin.clone()),
     }
 }
 
@@ -1511,6 +1614,7 @@ mod tests {
             known: &known,
             links_back: &HashMap::new(),
             creators: &[],
+            timeout,
         };
         let w = worktree(&repo, rec, look, &facts, &ctx);
         let mut scan = WorktreeScan {

@@ -354,6 +354,11 @@ pub struct DiskSample {
     pub free_bytes: u64,
     /// What an unprivileged process can still write.
     pub avail_bytes: u64,
+    /// What Finder calls available: free space plus what macOS purges for an important
+    /// write. The Disk view shows this, and the forecast follows it. None in samples recorded
+    /// before Scry kept it.
+    #[serde(default)]
+    pub important_bytes: Option<u64>,
 }
 
 impl Process {

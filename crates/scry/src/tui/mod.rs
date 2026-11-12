@@ -31,11 +31,15 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::{DefaultTerminal, Terminal};
 use scry_core::config::Config;
+use scry_core::disk::cache::SizeCache;
+use scry_core::disk::clean::{self, Context, Done, Plan, Refusal};
+use scry_core::disk::{self, Layout, catalog};
 use scry_core::engine::Labels;
 use scry_core::live::Collector;
 use scry_core::paths::Paths;
-use scry_core::view::{Board, Load, Tab, Tone, WorktreeList};
-use scry_core::worktree::{self, ScanOptions};
+use scry_core::store::Store;
+use scry_core::view::{Board, DiskList, Load, Tab, Tone, WorktreeList};
+use scry_core::worktree::{self, ScanOptions, WorktreeScan};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
@@ -46,6 +50,11 @@ use tty::LateReply;
 
 /// How long "Refreshed." stays in the footer after `r`.
 const REFRESHED_FOR: Duration = Duration::from_millis(1500);
+/// "Cleaning up…" stays until the outcome replaces it; a worktree's label check runs git
+/// and walks the folder.
+const CLEANING_FOR: Duration = Duration::from_secs(120);
+/// How long a cleanup's outcome stays, long enough to read the Trash's size.
+const DONE_FOR: Duration = Duration::from_secs(10);
 const INPUT_POLL: Duration = Duration::from_millis(250);
 const FRAME: Duration = Duration::from_millis(16);
 const SIGNAL_GRACE: Duration = Duration::from_secs(1);
@@ -86,6 +95,9 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     let theme = Theme::new(SHIPPED, colors);
     let mut motion = Motion::new(theme.motion);
     let mut app = App::new(board, source, theme);
+    if live.is_some() {
+        app.writer = clean::writer_running;
+    }
 
     let (tx, rx) = mpsc::channel();
     let workers = live.map(|l| l.spawn(tx));
@@ -108,8 +120,13 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
 struct Live {
     /// `None` refreshes only on `r`.
     every: Option<Duration>,
+    storage: Storage,
+}
+
+/// What the worktree and disk reader needs.
+struct Storage {
     worktrees: ScanOptions,
-    config: PathBuf,
+    paths: Paths,
 }
 
 impl Live {
@@ -119,23 +136,35 @@ impl Live {
         let secs = config.tui.refresh_secs;
         Ok(Live {
             every: (secs > 0).then(|| Duration::from_secs(secs)),
-            worktrees: ScanOptions::new(&paths.user_home, config.code_roots),
-            config: paths.config,
+            storage: Storage {
+                worktrees: ScanOptions::new(&paths.user_home, config.code_roots),
+                paths,
+            },
         })
     }
 
-    /// Starts the two readers off the UI thread: process snapshots, quick and on a timer,
-    /// and worktrees, slow and only when asked.
+    /// Starts the readers off the UI thread: process snapshots, quick and on a timer;
+    /// worktrees and the disk, slower and only when asked; and cleanups, one at a time.
     fn spawn(self, tx: mpsc::Sender<Update>) -> Workers {
         let (now, asks) = mpsc::channel();
         let every = self.every;
         let to = tx.clone();
         std::thread::spawn(move || read_processes(&to, &asks, every));
         let (worktrees, asks) = mpsc::channel();
-        std::thread::spawn(move || read_worktrees(&tx, &asks, &self.worktrees, &self.config));
+        let to = tx.clone();
+        let storage = self.storage;
+        let home = storage.paths.user_home.clone();
+        let paths = storage.paths.clone();
+        std::thread::spawn(move || read_storage(&to, &asks, &storage));
+        let (clean, jobs) = mpsc::channel();
+        let reread = worktrees.clone();
+        std::thread::spawn(move || {
+            run_cleanups(&tx, &jobs, &reread, &home, &paths);
+        });
         Workers {
             now,
             worktrees,
+            clean,
             every,
         }
     }
@@ -147,24 +176,31 @@ enum Update {
     Board(Box<Board>),
     Failed(String),
     Worktrees(Load<WorktreeList>),
+    Disk(Box<Load<DiskList>>),
+    /// The disk reading is done, sizes included.
+    StorageDone,
+    Cleaned(Result<Done, Refusal>),
 }
 
 /// Where the UI thread asks the readers for a reading.
 struct Workers {
     now: mpsc::Sender<()>,
+    /// Worktrees and the disk, read together.
     worktrees: mpsc::Sender<()>,
+    clean: mpsc::Sender<(Plan, Option<String>)>,
     every: Option<Duration>,
 }
 
 impl Workers {
-    /// Coming back to the worktree view reads it again when its last reading is this old.
-    /// Sizing walked 1.6 million entries in 15 s and 38 s of CPU across cores on the
-    /// reference Mac, so it never runs on a timer while the view sits open; `r` reads at once.
-    const WORKTREES_STALE: Duration = Duration::from_secs(600);
+    /// Coming back to Disk or Worktrees reads them again when the last reading is this old.
+    /// Sizes come from the cache and only what changed is walked, but a cache that churns
+    /// all the time (a browser's) still costs a walk, so it never runs on a timer while the
+    /// view sits open; `r` reads at once.
+    const WORKTREES_STALE: Duration = Duration::from_secs(120);
 
     /// `opened` says the view was just switched to.
     fn worktrees_due(&self, app: &App, opened: bool, now: Instant) -> bool {
-        app.tab == Tab::Worktrees
+        matches!(app.tab, Tab::Worktrees | Tab::Disk)
             && app.fresh.worktrees.is_none()
             && match app.fresh.worktrees_at {
                 None => true,
@@ -203,32 +239,95 @@ fn read_processes(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, every: O
     }
 }
 
-/// Git state first, then sizes, which take seconds: the list shows before it is measured.
-fn read_worktrees(
-    tx: &mpsc::Sender<Update>,
-    asks: &mpsc::Receiver<()>,
-    opts: &ScanOptions,
-    config: &Path,
-) {
+/// Worktrees and the disk, from the size cache first: the catalog's items at once, the
+/// worktrees once git has read them, then the sizes that changed, walked again.
+fn read_storage(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, s: &Storage) {
+    let cache = SizeCache::open(&s.paths);
+    let home = &s.worktrees.home;
     while asks.recv().is_ok() {
         while asks.try_recv().is_ok() {}
-        let list = |scan: &worktree::WorktreeScan, sizing| {
-            Update::Worktrees(Load::Ready(WorktreeList::new(
-                scan,
-                unix_now(),
-                &opts.home,
-                sizing,
-                config,
-            )))
+        let now = unix_now();
+        // Each reading offers what the config allows now.
+        let destructive = clean::destructive_now(&s.paths);
+        let disk = |items: &[disk::Item], pending| {
+            let list = disk::view(items, &cache, &s.paths, destructive, pending);
+            Update::Disk(Box::new(Load::Ready(list)))
         };
-        let mut scan = worktree::scan(opts);
-        if tx.send(list(&scan, true)).is_err() {
+        let worktrees = |scan: &WorktreeScan, sizing| {
+            let list = WorktreeList::new(scan, now, home, sizing, &s.paths.config);
+            Update::Worktrees(Load::Ready(list))
+        };
+        let split = cache.split();
+        let found = catalog::locate(home, &s.worktrees.roots, &[]);
+        let mut layout = Layout::new(&found, None, home, now, &split);
+        let look = cache.look(&layout.parts, home);
+        layout.fill(&look.cached, &look.changed());
+        if tx.send(disk(&layout.items, true)).is_err() {
             return;
         }
-        worktree::measure(&mut scan, &opts.home);
-        if tx.send(list(&scan, false)).is_err() {
+
+        let mut scan = worktree::scan(&s.worktrees);
+        let mut layout = Layout::new(&found, Some(&scan), home, now, &split);
+        let look = cache.look(&layout.parts, home);
+        layout.fill(&look.cached, &look.changed());
+        let cached = layout.worktree_sizes(&scan);
+        worktree::apply_sizes(&mut scan, cached);
+        layout.relabel(&scan, home, now);
+        let sizing = look.stale.iter().any(|&st| st);
+        if tx.send(worktrees(&scan, sizing)).is_err()
+            || tx.send(disk(&layout.items, false)).is_err()
+        {
             return;
         }
+
+        if sizing {
+            let (sizes, _) = cache.measure(&layout.parts, &look, home, &layout.exclude);
+            let sizes: Vec<_> = sizes.into_iter().map(Some).collect();
+            layout.fill(&sizes, &look.held);
+            let measured = layout.worktree_sizes(&scan);
+            worktree::apply_sizes(&mut scan, measured);
+            layout.relabel(&scan, home, now);
+            if tx.send(worktrees(&scan, false)).is_err()
+                || tx.send(disk(&layout.items, false)).is_err()
+            {
+                return;
+            }
+        }
+        if tx.send(Update::StorageDone).is_err() {
+            return;
+        }
+    }
+}
+
+/// Runs each confirmed cleanup, which checks its target again first, then asks for a new
+/// reading so the lists show what is left. `destructive` is read from the config again for
+/// each one, and a store that cannot be opened refuses every one.
+fn run_cleanups(
+    tx: &mpsc::Sender<Update>,
+    jobs: &mpsc::Receiver<(Plan, Option<String>)>,
+    reread: &mpsc::Sender<()>,
+    home: &Path,
+    paths: &Paths,
+) {
+    let store = paths
+        .ensure_state()
+        .and_then(|()| Store::open(&paths.db()))
+        .ok();
+    let destructive = || clean::destructive_now(paths);
+    while let Ok((plan, typed)) = jobs.recv() {
+        let ctx = Context {
+            home,
+            store: store.as_ref(),
+            actor: "tui",
+            destructive: &destructive,
+            label: &clean::relabel,
+            moment: None,
+        };
+        let result = clean::execute(&plan, typed.as_deref(), &ctx);
+        if tx.send(Update::Cleaned(result)).is_err() {
+            return;
+        }
+        let _ = reread.send(());
     }
 }
 
@@ -321,7 +420,7 @@ fn event_loop(
         }
         let tab = app.tab;
         while let Some(key) = keys.pop_front() {
-            let had_sheet = matches!(app.mode, Mode::Sheet(_));
+            let had_sheet = matches!(app.mode, Mode::Sheet(_) | Mode::Clean(_));
             match app.on_key(key) {
                 Action::Quit => return Ok(()),
                 Action::Suspend => suspend(terminal)?,
@@ -329,7 +428,9 @@ fn event_loop(
                     Some(w) => {
                         app.fresh.asked = true;
                         let _ = w.now.send(());
-                        if app.tab == Tab::Worktrees && app.fresh.worktrees.is_none() {
+                        if matches!(app.tab, Tab::Worktrees | Tab::Disk)
+                            && app.fresh.worktrees.is_none()
+                        {
                             app.fresh.worktrees = Some(now);
                             let _ = w.worktrees.send(());
                         }
@@ -342,11 +443,21 @@ fn event_loop(
                         Err(e) => app.notify(format!("Refresh failed: {e:#}"), Tone::Danger),
                     },
                 },
+                Action::Clean(job) => match workers {
+                    Some(w) => {
+                        let _ = w.clean.send(*job);
+                        app.notify_for("Cleaning up…", Tone::Quiet, CLEANING_FOR);
+                    }
+                    None => app.notify(
+                        "Nothing was touched: this is a recorded fixture.",
+                        Tone::Info,
+                    ),
+                },
                 Action::Redraw => {}
                 Action::None => continue,
             }
             dirty = true;
-            if !had_sheet && matches!(app.mode, Mode::Sheet(_)) {
+            if !had_sheet && matches!(app.mode, Mode::Sheet(_) | Mode::Clean(_)) {
                 motion.sheet_opened();
             }
         }
@@ -406,6 +517,7 @@ fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
         }
         Update::Board(mut board) => {
             board.worktrees = app.board.worktrees.clone();
+            board.disk = app.board.disk.clone();
             let changed = !app.looks_the_same(&board);
             let glow = app.replace_board(*board);
             if changed {
@@ -420,13 +532,37 @@ fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
             finish_scan(app, Some(why))
         }
         Update::Worktrees(list) => {
-            if list.ready().is_none_or(|l| !l.sizing) {
-                app.fresh.worktrees = None;
-                app.fresh.worktrees_at = Some(now);
-            }
             let mut board = app.board.clone();
             board.worktrees = list;
             motion.rows_changed(app.replace_board(board));
+            true
+        }
+        Update::Disk(list) => {
+            let mut board = app.board.clone();
+            board.disk = *list;
+            motion.rows_changed(app.replace_board(board));
+            true
+        }
+        Update::StorageDone => {
+            app.fresh.worktrees = None;
+            app.fresh.worktrees_at = Some(now);
+            true
+        }
+        Update::Cleaned(Ok(done)) => {
+            app.notify_for(done.short(), Tone::Ok, DONE_FOR);
+            app.fresh.worktrees = Some(now);
+            true
+        }
+        Update::Cleaned(Err(refusal)) => {
+            let tone = if refusal.changed() {
+                Tone::Danger
+            } else {
+                Tone::Warn
+            };
+            app.notify_for(refusal.to_string(), tone, DONE_FOR);
+            if refusal.changed() {
+                app.fresh.worktrees = Some(now);
+            }
             true
         }
     }

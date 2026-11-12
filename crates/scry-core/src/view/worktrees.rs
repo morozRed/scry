@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Detail, Fact, State, human_bytes};
+use super::{Detail, Fact, State, disk_bytes};
 use crate::worktree::{
     Changes, Concern, Finished, GitFacts, Head, KeptBy, Merge, NotRead, ReposInside, Upstream,
     Worktree, WorktreeScan, WorktreeState,
@@ -222,6 +222,9 @@ pub struct WorktreeItem {
     pub creator: String,
     pub last_commit: Option<String>,
     pub detail: Detail,
+    /// Its folder is gone, so it has no size to wait for.
+    #[serde(default)]
+    pub gone: bool,
 }
 
 impl WorktreeList {
@@ -251,6 +254,7 @@ fn item(r: &WorktreeRow, sizing: bool) -> WorktreeItem {
         "size",
         match r.allocated {
             Some(b) => bytes(b),
+            None if folder_gone(&r.worktree) => "folder is gone".into(),
             None if sizing => "measuring…".into(),
             None => "not measured".into(),
         },
@@ -269,6 +273,7 @@ fn item(r: &WorktreeRow, sizing: bool) -> WorktreeItem {
         frees: r.reclaimable,
         creator: r.creator.clone(),
         last_commit: r.last_commit.clone(),
+        gone: folder_gone(&r.worktree),
         detail: Detail {
             title: format!("{} · {}", r.name, r.repo),
             facts,
@@ -283,10 +288,13 @@ fn sized(w: &Worktree) -> Option<&crate::size::SubtreeSize> {
     w.size.as_ref().filter(|s| s.error.is_none())
 }
 
-fn folder_gone(w: &Worktree) -> bool {
+/// Registered, and its folder is not there.
+pub fn folder_gone(w: &Worktree) -> bool {
     match &w.state {
         WorktreeState::CanPrune(_) => true,
-        WorktreeState::NeedsLook { concerns, .. } => concerns.contains(&Concern::FolderMissing),
+        WorktreeState::NeedsLook { concerns, .. } => concerns
+            .iter()
+            .any(|c| matches!(c, Concern::FolderMissing | Concern::MovedTo { .. })),
         _ => false,
     }
 }
@@ -336,8 +344,8 @@ fn sentence(w: &Worktree, now: i64, home: &Path) -> String {
             }
         }
         WorktreeState::CanPrune(_) => format!(
-            "{name} is registered in {} but its folder is gone; `git worktree prune` removes \
-             only the record and frees almost nothing.",
+            "{name} is registered in {} but its folder is gone; pruning removes only its own \
+             record and frees almost nothing.",
             w.repo_name()
         ),
         WorktreeState::NeedsLook { concerns, .. } => {
@@ -478,6 +486,9 @@ fn concern(w: &Worktree, c: &Concern, home: &Path) -> String {
             "its detached HEAD holds {} that no branch or tag holds",
             count(*commits as usize, "commit")
         ),
+        Concern::Staged => {
+            "its record's index holds staged changes that pruning the record would drop".into()
+        }
         Concern::FolderMissing => "its folder is gone".into(),
         Concern::MovedTo { path } => {
             let to = tilde(path, home);
@@ -789,9 +800,9 @@ fn count(n: usize, noun: &str) -> String {
     }
 }
 
-/// `1.2 GB`, from the same binary units as every size in Scry.
+/// `1.2 GB` in decimal units, as Finder counts disk space.
 pub fn bytes(b: u64) -> String {
-    let s = human_bytes(b);
+    let s = disk_bytes(b);
     let (num, unit) = s.split_at(s.len() - 1);
     if unit == "B" {
         format!("{num} B")

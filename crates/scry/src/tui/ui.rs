@@ -65,6 +65,21 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
     let title = app.tab.title();
     let mut count = None;
     let rows = app.rows();
+    // Overlays cover the whole body; the list and its states sit under the band.
+    let whole = body;
+    let body = match views::band(view, &app.board) {
+        Some(lines) => {
+            let [band, _, rest] = Layout::vertical([
+                Constraint::Length(lines.len() as u16),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .areas(body);
+            chrome::band(f, band, theme, &lines);
+            rest
+        }
+        None => body,
+    };
     match &rows {
         Load::Ready(rows) if !rows.is_empty() => {
             let beside = body.width >= BESIDE_FROM;
@@ -145,18 +160,23 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
         Mode::Normal => normal_hints(app, view, &rows),
         Mode::Filter => vec![("⏎", "keep"), ("esc", "clear"), ("↑/↓", "move")],
         Mode::Sheet(s) => vec![("⏎", overlay::confirm_label(s.kind)), ("esc", "cancel")],
+        Mode::Clean(s) => vec![("⏎", overlay::clean_label(s)), ("esc", "cancel")],
         Mode::Help => vec![("esc", "close")],
     };
     chrome::footer(f, footer, theme, left, &hints);
 
     match &app.mode {
         Mode::Help => {
-            overlay::scrim(f, body, theme);
-            overlay::help(f, body, theme);
+            overlay::scrim(f, whole, theme);
+            overlay::help(f, whole, theme);
         }
         Mode::Sheet(sheet) => {
-            overlay::scrim(f, body, theme);
-            painted.sheet = Some(overlay::sheet(f, body, theme, sheet));
+            overlay::scrim(f, whole, theme);
+            painted.sheet = Some(overlay::sheet(f, whole, theme, sheet));
+        }
+        Mode::Clean(sheet) => {
+            overlay::scrim(f, whole, theme);
+            painted.sheet = Some(overlay::clean_sheet(f, whole, theme, sheet));
         }
         _ => {}
     }

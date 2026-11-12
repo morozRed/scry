@@ -5,10 +5,13 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Row, Table, Wrap};
-use scry_core::view::{human_age, human_bytes};
+use scry_core::view::{Tone, human_age, human_bytes};
+
+use scry_core::disk::clean::Action;
+use scry_core::view::worktrees::bytes;
 
 use super::wrapped_lines;
-use crate::tui::app::{Sheet, SheetKind};
+use crate::tui::app::{CleanSheet, Sheet, SheetKind};
 use crate::tui::theme::{Chrome, Theme};
 
 /// A sheet that would leave fewer rows than this of the list above it covers the body, so
@@ -183,7 +186,132 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
     area
 }
 
-const KEYS: [(&str, &str, &str); 14] = [
+/// The key that confirms a cleanup, worded for what it does.
+pub fn clean_label(sheet: &CleanSheet) -> &'static str {
+    match sheet.plan.action {
+        Action::Trash => "move to Trash",
+        Action::Delete => "delete",
+        Action::Prune => "prune",
+    }
+}
+
+/// The cleanup's confirmation: what happens, the exact folder and its bytes, and for a
+/// delete the name to type. Rises from the bottom like the stop sheet.
+pub fn clean_sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &CleanSheet) -> Rect {
+    let p = &sheet.plan;
+    let (title, what) = match p.action {
+        Action::Trash if p.repo.is_some() => (
+            format!("Move the worktree {} to the Trash?", p.name),
+            "Only its folder moves. git keeps its record, so Put Back in Finder gives a working \
+             checkout; until then it shows as can prune. Space returns only when the Trash is \
+             emptied.",
+        ),
+        Action::Trash => (
+            format!("Move {} to the Trash?", p.name),
+            "Put Back in Finder restores it. Space returns only when the Trash is emptied.",
+        ),
+        Action::Delete => (
+            format!("Delete {} for good?", p.name),
+            "It does not go to the Trash. Its tool fills it again when it needs it.",
+        ),
+        Action::Prune => (
+            format!("Remove git's record of {}?", p.name),
+            "Its folder is already gone. Only this worktree's record goes, with its HEAD, index \
+             and reflog; its branch and every other worktree's record stay. A folder of it in \
+             the Trash would then come back without its link to git.",
+        ),
+    };
+    let mut text = vec![
+        Line::styled(title, theme.strong),
+        Line::styled(what, theme.muted),
+    ];
+    if let Some(w) = &sheet.warning {
+        text.push(Line::styled(w.clone(), theme.tone(Tone::Warn)));
+    }
+    text.push(Line::raw(""));
+    let row = |label: &str, value: String, style| {
+        Line::from(vec![
+            Span::styled(format!("{label:<8}"), theme.heading),
+            Span::styled(value, style),
+        ])
+    };
+    text.push(row("path", sheet.shown.clone(), theme.text));
+    if p.action != Action::Prune {
+        text.push(row("size", bytes(p.allocated), theme.text));
+        text.push(row(
+            "frees",
+            format!(
+                "at least {}{}",
+                bytes(p.reclaimable),
+                if p.action == Action::Trash {
+                    " once the Trash is emptied"
+                } else {
+                    ""
+                }
+            ),
+            theme.text,
+        ));
+    }
+    if let Some(name) = p.repo.as_ref().and_then(|r| r.file_name()) {
+        text.push(row("repo", name.to_string_lossy().into_owned(), theme.text));
+    }
+    if let (Action::Prune, Some(record)) = (p.action, &p.record) {
+        let name = record.file_name().map(|n| n.to_string_lossy().into_owned());
+        text.push(row(
+            "record",
+            format!(".git/worktrees/{}", name.unwrap_or_default()),
+            theme.text,
+        ));
+    }
+    if let Some(word) = &p.word {
+        text.push(Line::raw(""));
+        text.push(Line::from(vec![
+            Span::styled("Type ", theme.muted),
+            Span::styled(word.clone(), theme.strong),
+            Span::styled(" to delete it: ", theme.muted),
+            Span::styled(sheet.typed.clone(), theme.text),
+            Span::styled("▏", theme.accent),
+        ]));
+    }
+
+    let padding = Padding::new(2, 2, 1, 1);
+    let probe = card(theme, Borders::TOP).padding(padding).inner(body);
+    let lines: u16 = text
+        .iter()
+        .map(|l| wrapped_lines(&l.to_string(), probe.width))
+        .sum();
+    let mut height = ((body.height - probe.height) + lines).min(body.height);
+    if body.height - height < PEEK_MIN {
+        height = body.height;
+    }
+    let edge = if height == body.height {
+        Borders::NONE
+    } else {
+        Borders::TOP
+    };
+    let area = Rect {
+        y: body.bottom() - height,
+        height,
+        ..body
+    };
+    let above = area.y.saturating_sub(1).max(body.y);
+    let gap = Rect {
+        y: above,
+        height: area.y - above,
+        ..area
+    };
+    f.render_widget(Clear, gap);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: true })
+            .block(card(theme, edge).padding(padding)),
+        area,
+    );
+    area
+}
+
+const KEYS: [(&str, &str, &str); 15] = [
     ("Move", "j k ↑ ↓", "up and down, ctrl-d ctrl-u by page"),
     ("", "g G", "first and last row"),
     ("", "⏎", "fold a session, or go to the row"),
@@ -194,6 +322,7 @@ const KEYS: [(&str, &str, &str); 14] = [
     ("", "s  S", "sort by the next column, reverse"),
     ("Act", "x", "stop the selected process"),
     ("", "X", "reap leftovers"),
+    ("", "t", "clean up a disk item or worktree"),
     ("", "r", "refresh now; auto every refresh_secs (5 s)"),
     ("App", "?", "this help"),
     ("", "ctrl-z", "suspend to the shell"),

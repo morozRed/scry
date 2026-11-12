@@ -70,6 +70,8 @@ fn main() -> anyhow::Result<()> {
             ("sheet-long-end-{p}", &long, "3XG", (80, 24)),
             ("sheet-long-{p}-150x40", &long, "3X", (150, 40)),
             ("filter-{p}", &design, "3/vite", (80, 24)),
+            ("disk-delete-{p}", &design, "4jtXcode Deriv", (80, 24)),
+            ("disk-trash-{p}", &design, "4jjjjjjjjjjjjjt", (120, 40)),
             ("help-{p}", &design, "3?", (80, 24)),
         ] {
             let name = name.replace("{p}", p);

@@ -16,7 +16,7 @@ use crate::view::worktrees::{WorktreeRow, WorktreesView};
 mod loss;
 
 /// Runs git to build a fixture, away from the user's config and from any `GIT_*` variable.
-pub(super) fn git(dir: &Path, args: &[&str]) -> String {
+pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
     let mut cmd = Command::new("git");
     for (key, _) in std::env::vars_os() {
         if key.as_bytes().starts_with(b"GIT_") {
@@ -52,7 +52,7 @@ pub(super) fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-pub(super) fn write(path: &Path, text: &str) {
+pub(crate) fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
 }
@@ -71,14 +71,14 @@ fn s(p: &Path) -> &str {
     p.to_str().unwrap()
 }
 
-pub(super) fn commit(dir: &Path, file: &str) {
+pub(crate) fn commit(dir: &Path, file: &str) {
     write(&dir.join(file), &format!("{file}\n"));
     git(dir, &["add", file]);
     git(dir, &["commit", "-qm", file]);
 }
 
 /// A clone at `dir` of a bare remote that holds one commit on `main`.
-pub(super) fn new_repo(base: &Path, dir: &Path) {
+pub(crate) fn new_repo(base: &Path, dir: &Path) {
     let name = dir
         .file_name()
         .unwrap()
@@ -97,7 +97,7 @@ pub(super) fn new_repo(base: &Path, dir: &Path) {
 }
 
 /// A worktree of `repo` on a new branch, in the folder beside it called `name`.
-pub(super) fn add(repo: &Path, branch: &str, name: &str) -> PathBuf {
+pub(crate) fn add(repo: &Path, branch: &str, name: &str) -> PathBuf {
     let path = repo.parent().unwrap().join(name);
     git(repo, &["worktree", "add", "-q", "-b", branch, s(&path)]);
     path
@@ -430,8 +430,8 @@ fn a_missing_folder_can_be_pruned_and_frees_nothing() {
     assert_eq!(r.reclaimable, None);
     assert_eq!(
         r.sentence,
-        "app-orphan is registered in app but its folder is gone; `git worktree prune` removes \
-         only the record and frees almost nothing."
+        "app-orphan is registered in app but its folder is gone; pruning removes only its own \
+         record and frees almost nothing."
     );
     assert!(
         says(
@@ -1079,4 +1079,24 @@ fn scan_inside_a_hook() {
     assert!(row(&v, "app-merged").status.removable(), "{:?}", v.rows);
     assert_eq!(row(&v, "app-dirty").status.word(), "dirty");
     println!("scanned inside a hook");
+}
+
+#[test]
+fn config_cannot_hide_a_staged_submodule_change_from_the_prune_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let app = base.join("code/app");
+    new_repo(&base, &app);
+    let wt = add(&app, "feat", "wt");
+    let head = git(&wt, &["rev-parse", "HEAD"]).trim().to_string();
+    // A submodule pointer staged in the worktree's index and never committed.
+    let entry = format!("160000,{head},sub");
+    git(&wt, &["update-index", "--add", "--cacheinfo", &entry]);
+    // The repository's config asks git diff to ignore submodules.
+    git(&app, &["config", "diff.ignoreSubmodules", "all"]);
+    let record = app.join(".git/worktrees/wt");
+    assert!(
+        record_staged(&record, std::time::Duration::from_secs(20)).unwrap(),
+        "the staged pointer is seen whatever the config says"
+    );
 }

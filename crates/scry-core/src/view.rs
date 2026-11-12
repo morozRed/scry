@@ -2,6 +2,7 @@
 //! same values later, so nothing here knows about terminals.
 
 pub mod agents;
+pub mod disk;
 pub mod ports;
 pub mod worktrees;
 
@@ -13,6 +14,7 @@ use crate::attribution::{AgentState, Known, Lineage, Policy};
 use crate::home::Home;
 use crate::model::Snapshot;
 pub use agents::AgentRow;
+pub use disk::{DiskItem, DiskList};
 pub use ports::{PortRow, PortsView};
 pub use worktrees::{WorktreeItem, WorktreeList, WorktreeRow, WorktreesView};
 
@@ -64,6 +66,9 @@ pub struct Board {
     /// boards made from snapshots.
     #[serde(default)]
     pub worktrees: Load<WorktreeList>,
+    /// Read with the worktrees, by the same reader.
+    #[serde(default)]
+    pub disk: Load<DiskList>,
 }
 
 impl Board {
@@ -76,6 +81,7 @@ impl Board {
             ports: Load::Ready(PortsView::build(s, Home::from_env().as_ref()).rows),
             agents: Load::Unavailable("Agent sessions are not tracked yet.".into()),
             worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
+            disk: Load::Unavailable("A process snapshot holds no disk reading.".into()),
         }
     }
 
@@ -107,6 +113,7 @@ impl Board {
             ports: Load::Ready(ports),
             agents: Load::Ready(agents),
             worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
+            disk: Load::Unavailable("A process snapshot holds no disk reading.".into()),
         }
     }
 
@@ -555,6 +562,7 @@ impl Overview {
     }
 }
 
+/// Memory in binary units, as Activity Monitor counts it: `1.5G` is 1.5 × 1024³ bytes.
 pub fn human_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut v = b as f64;
@@ -564,6 +572,28 @@ pub fn human_bytes(b: u64) -> String {
         i += 1;
     }
     if i == 0 || v >= 10.0 {
+        format!("{v:.0}{}", UNITS[i])
+    } else {
+        format!("{v:.1}{}", UNITS[i])
+    }
+}
+
+/// Disk space in decimal units, as Finder counts it: `412G` is 412 × 1000³ bytes.
+pub fn disk_bytes(b: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let step = 1000.0;
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= step && i < UNITS.len() - 1 {
+        v /= step;
+        i += 1;
+    }
+    // Rounding can carry into the next unit: 999.6 MB reads as 1.0 GB, not 1000 MB.
+    if i < UNITS.len() - 1 && v.round() >= step {
+        v /= step;
+        i += 1;
+    }
+    if i == 0 || v >= 9.95 {
         format!("{v:.0}{}", UNITS[i])
     } else {
         format!("{v:.1}{}", UNITS[i])
@@ -591,6 +621,18 @@ mod tests {
         assert_eq!(human_bytes(412 * 1024 * 1024), "412M");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024 / 2), "1.5G");
         assert_eq!(human_bytes(22 * 1024 * 1024), "22M");
+    }
+
+    #[test]
+    fn disk_bytes_reads_like_finder() {
+        assert_eq!(disk_bytes(512), "512B");
+        assert_eq!(disk_bytes(1500), "1.5K");
+        assert_eq!(disk_bytes(412_000_000_000), "412G");
+        assert_eq!(disk_bytes(1_500_000_000), "1.5G");
+        // 1 GiB is 1.07 GB on a Mac.
+        assert_eq!(disk_bytes(1 << 30), "1.1G");
+        assert_eq!(disk_bytes(999_700_000), "1.0G");
+        assert_eq!(disk_bytes(9_960_000), "10M");
     }
 
     #[test]
