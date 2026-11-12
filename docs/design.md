@@ -48,16 +48,35 @@ keeps 3.7:1 or more on the tint, so the state colours stay readable on the selec
 **In dark mode A and B are close.** Tinted is calmer: bands instead of rules, and a softer
 selection.
 
-**Tinted still follows the terminal.** At startup Scry asks the terminal for its foreground
-and background (OSC 10 and 11) and then for its device attributes (DA1). Terminals answer in
-order and every terminal answers DA1, so Scry reads until that answer arrives, for at most a
-second; a local terminal answers in a few milliseconds. Nothing of the reply is left over to
-be read as keys, and if a reply still comes after the second it is recognised and dropped.
-The neutrals (text, muted, faint, rules, bands, selection) are mixed from the two colours the
-terminal reports, so a Solarized or a pure black terminal gets matching greys. Each is then
-pushed further from the background until it reaches its minimum contrast on the background,
-the bands and the selection: 6:1 for text, 4.5:1 for muted labels, 3:1 for faint marks. Only
-the five state hues are fixed, one set for light backgrounds and one for dark.
+**Tinted still follows the terminal.** Scry asks the terminal for its foreground and
+background (OSC 10 and 11), then for its device attributes (DA1), only where the answer is
+known to come at once: a local session (neither `SSH_CONNECTION` nor `SSH_TTY` set) in
+Ghostty, iTerm2, Terminal, WezTerm or kitty, recognised by `TERM_PROGRAM`, or by `TERM` for
+Ghostty and kitty. The list is a table in `theme.rs`. `SCRY_COLOR_QUERY=1` asks anywhere and
+`SCRY_COLOR_QUERY=0` never asks. The question goes out after raw mode is on and before the
+first key is read, through Scry's own non-blocking open of the terminal, and Scry reads until
+the DA1 answer, which comes after the colours, for at most a second. Keys typed meanwhile
+are handed to the event loop in order, and nothing is flushed. Only when the second passes
+before the DA1 answer can the rest of an answer still come. For the next two seconds Scry
+then picks it out of the keys, starting from where the cut answer stood. It holds keys that
+could be part of an answer, and lets them through if the answer breaks off.
+
+Everywhere else Scry asks nothing: inside tmux, which answers DA1 at once and sends no
+colours, over ssh, and in a terminal not on the list. Light or dark then comes from
+`COLORFGBG` when it is set, else from the macOS appearance (read from the global
+preferences through CoreFoundation, without starting a process), else dark. The neutrals are
+mixed from a stand-in pair: white and black for light, `#1c1c1c` and `#d0d0d0` for dark. A
+terminal whose theme is the other way round from the guess, a light profile in dark mode
+say, gets greys tuned for the wrong side; `SCRY_COLOR_QUERY=1` puts that right in a terminal
+that answers.
+
+The neutrals (text, muted, faint, rules, bands, raised surfaces) are mixed from the two
+colours, so a Solarized or a pure black terminal gets matching greys. Each is then pushed
+further from the background until it reaches its minimum contrast on the background, the
+bands, the overlays and the selection: 6:1 for text, 4.5:1 for muted labels, 3:1 for faint
+marks. The accent and the four state hues are fixed, one set for light backgrounds and one
+for dark. The selection is the background mixed with that accent until it stands 1.3:1
+apart.
 
 ![Solarized light, a low-contrast theme](screens/agents-solarized-light-80x24.svg)
 
@@ -68,18 +87,16 @@ an error. Panels was removed from the code after the spike; its pictures come fr
 
 This departs on purpose from one line in PLAN.md section 2 ("the palette is the terminal's
 own 16 ANSI colours"). The goal behind that line, following the user's theme in light and
-dark, holds. When Scry cannot be sure of the colours it falls back to exactly that principle,
-below.
+dark, holds. Without truecolor Scry falls back to exactly that principle, below.
 
 ## How it degrades
 
 | Terminal | What Scry draws |
 |---|---|
-| `COLORTERM=truecolor` or `24bit`, and the terminal answers the colour query | Tinted |
-| `COLORTERM` unset or anything else; no answer within a second (tmux without passthrough, for one); or an ssh session (`SSH_CONNECTION` set), where a reply can be slow, unless `SCRY_COLOR_QUERY=1` | Native: the 16 ANSI colours, so the user's theme picks every hue |
+| `COLORTERM=truecolor` or `24bit`, a local terminal on the list (or `SCRY_COLOR_QUERY=1`), and it reports its colours | Tinted, from those colours |
+| `COLORTERM=truecolor` or `24bit` anywhere else: tmux, ssh, VS Code, a terminal not on the list, or one that sends no colours | Tinted, from the light or dark stand-in pair |
+| `COLORTERM` unset or anything else | Native: the 16 ANSI colours, so the user's theme picks every hue. Nothing is asked |
 | `NO_COLOR` set | No colour at all: bold, dim and reverse video. Every state is still a glyph and a word |
-
-`SCRY_COLOR_QUERY=0` turns the query off everywhere.
 
 ![Tinted falling back to ANSI, light](screens/ansi-light.svg)
 ![Tinted falling back to ANSI, dark](screens/ansi-dark.svg)
@@ -122,6 +139,9 @@ A reap sheet longer than the screen, at 80×24, at the top and scrolled to the e
 |---|---|
 | ![](screens/sheet-long-light.svg) | ![](screens/sheet-long-end-dark.svg) |
 
+The same sheet [at 150×40](screens/sheet-long-dark-150x40.svg), and
+[in the ANSI look](screens/ansi-sheet-long-dark.svg), where it sits under the one rule.
+
 ## The design system
 
 ### Tokens
@@ -131,16 +151,17 @@ Components ask the theme for a role, never for a colour. A look is one construct
 
 | Token | Used for |
 |---|---|
-| `text`, `strong` | Body text; titles and session names |
-| `muted` | Labels, context, evidence words, fold counts, the data source |
-| `faint` | Tree guides and separators only: nothing you need to read |
-| `accent` | The name, the sparkline, the sort arrow |
+| `text`, `strong` | Body text; titles, session names and command names |
+| `muted` | Labels, context, evidence words, fold counts, the data source, the sparkline |
+| `faint` | Tree guides, separators and whatever an overlay covers: nothing you need to read |
+| `accent` | The name, the sort arrow |
 | `heading` | Column titles |
 | `ok`, `info`, `warn`, `danger` | State glyphs and words |
 | `selection`, `cursor` | The selected row's tint, and the bar left of it |
-| `surface` | Bands behind the header, detail pane, footer, sheet and help |
-| `border` | Rules and the sheet's top edge |
-| `key`, `matched`, `tab_active` | Keys in hints, filter hits, the open tab |
+| `surface` | Bands behind the header and the detail pane |
+| `raised` | The sheet and the help card, a step further from the background than the bands |
+| `border` | Rules, and the edges of overlays in the ANSI look |
+| `key`, `matched`, `tab_active` | Keys in hints, filter hits (the accent, underlined), the open tab |
 | `chrome` | `Rules` (Native) or `Bands` (Tinted) |
 | `motion` | The background, foreground and glow colours fades run between; truecolor only |
 
@@ -162,21 +183,35 @@ the glyph, so nothing depends on colour alone.
 All in `crates/scry/src/tui/kit/`:
 
 - `chrome`: the header (the name, then a slot for the pulse strip that drops segments from
-  the right when space runs out), the tab bar with attention counts, the footer (a toast or
-  the filter on the left, then the keys that do something on this view as it is), rules.
+  the right when space runs out), the tab bar with attention counts, the footer, rules. The
+  footer sits on the plain background, under the detail band rather than in it. Its left
+  side shows the filter while it is typed, else a toast, else the filter that is applied,
+  and then the keys that do something on this view as it is.
 - `table`: a flattened tree as a table. Columns align across depths; the first column
   carries the tree glyphs (`▾ ▸ ├ └ │`) and a fold count, and any cell shows the characters
   the filter matched. Numbers align right, cut text ends in `…`, and columns hide below a set
-  width. Every sortable column keeps room for ` ↓` or ` ↑` after its title, so the arrow never
-  cuts it. Widths count display columns and cuts fall between graphemes, so CJK, accents and
-  emoji line up. The list never stays scrolled past rows that would fit.
-- `detail`: the selected row in one sentence, then the evidence. Below the list under 150
-  columns, with facts on the title line; beside it from 150, with one fact per line.
+  width. Text columns are as wide as their longest cell, up to 48 columns, and the spare width
+  stays at the right, so a name sits next to its numbers. Widths and number alignment come
+  from every row of the view, so a filter or a fold never moves a column. Every sortable
+  column keeps room for ` ↓` or ` ↑` after its title, so the arrow never cuts it. Widths count
+  display columns and cuts fall between graphemes, so CJK, accents and emoji line up. The list
+  never stays scrolled past rows that would fit.
+- `detail`: the selected row in one sentence, then the evidence. Under 150 columns it sits
+  right under the list with facts on the title line, as tall as the tallest detail in the
+  view (at most 7 rows, 5 on a short screen), so it keeps its height while the cursor moves.
+  From 150 it is beside the list, with one fact per line.
 - `overlay`: the confirmation sheet, which rises from the bottom and lists every target with
-  pid, age, command, session, evidence and the memory it frees; and the help card. When the
-  targets do not fit, the sheet scrolls with `j k`, its last line says how many are above and
-  below, and the title and total stay in view.
-- `states`: empty, loading, unavailable and failed, each a glyph and a sentence.
+  pid, age, command, session, evidence and the memory it frees; and the help card. Both sit
+  on the `raised` surface, and what they cover fades to the faint ink. In the tinted look the
+  fill is the edge, because a line drawn through the edge cells leaves half a cell of fill
+  outside it; the help card keeps a margin of plain background around it. When the targets do
+  not fit, the sheet scrolls with `j k`, its last line says how many are above and below, and
+  the title and total stay in view. It keeps its place through a resize. A sheet that would
+  leave fewer than four rows of the list above it covers the whole body. Only the command
+  name in each row is bold.
+- `states`: empty, loading, unavailable and failed, each a glyph and a sentence. ✓ is kept
+  for an all-clear, a view that read its source and found nothing to show. No rows matching
+  the filter, and an Overview whose sources are not collected yet, get a neutral ○.
 
 ### Modes
 
@@ -189,7 +224,11 @@ The keys mean different things in each mode, so the mode is one value, not a set
 | Sheet | `⏎` confirm, `j k` scroll, `esc` cancel |
 | Help | `esc ? q` close |
 
-Only `q` and ctrl-c quit, so one `esc` too many never closes Scry.
+Only `q` and ctrl-c quit, so one `esc` too many never closes Scry. In the filter, alt chords
+are ignored rather than typed. SIGTERM and SIGINT put the terminal back and exit with 128 plus
+the signal, 143 for SIGTERM, as shells report a process that a signal ended. SIGHUP does the
+same at once. Every change of terminal modes takes a lock that the signal handler holds from
+its restore until the exit, so no mode change can undo the restore.
 
 The filter is fuzzy with smart case. Each word of it matches inside one column on screen, so
 letters scattered across a row never make a match, and the matched characters are
@@ -198,7 +237,9 @@ session kept above it for context. Folds are off while a filter is applied, and 
 rather than changing a fold you cannot see.
 
 `s` walks the columns on screen only. When a resize hides the sorted column, the list goes
-back to its natural order until the column returns.
+back to its natural order until the column returns. STATE sorts by what it asks of you:
+full, then leftover, stale and filling, then kept, the quiet states and live last. Rows
+without a value come last whichever way a column sorts.
 
 Stopping and reaping are not wired to signals yet; confirming a sheet says so.
 
@@ -244,7 +285,7 @@ replace the rows function in `views/disk.rs`.
 cargo run -p scry --example shots                 # SVGs into docs/screens
 scripts/shots.sh                                  # the same, plus PNGs into target/shots
 cargo run --release -p scry --example frames      # frame times per view at 120×40
-scripts/pty-late-reply.py target/debug/scry       # a terminal that answers late
+scripts/pty-late-reply.py target/debug/scry       # the colour query against a played terminal
 ```
 
 The shots example draws frames through ratatui's `TestBackend` and writes each cell's
@@ -254,4 +295,7 @@ monospace stack (`ui-monospace, SF Mono, Menlo, Consolas, Liberation Mono`) so G
 it with a local font. PNGs come from `rsvg-convert` (`brew install librsvg`).
 
 `scripts/pty-smoke.sh` runs `pty-late-reply.py` after its own checks. It plays a terminal on
-a bare pty, because tmux answers the colour query itself.
+a bare pty, because tmux answers DA1 at once and sends no colours, and Scry does not ask
+inside tmux anyway. It answers 400 ms late, 1.5 s late, 1.5 s late with the ESC in a read of
+its own, and across the one-second deadline; types a key while Scry waits; checks that a
+terminal not on the list is not asked; and sends SIGTERM during the question.
