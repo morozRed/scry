@@ -233,7 +233,7 @@ impl State {
     }
 }
 
-/// How a process was tied to a session (PLAN.md section 5).
+/// How a process was tied to a session (docs/architecture.md).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Evidence {

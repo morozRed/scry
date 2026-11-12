@@ -24,6 +24,7 @@ pub struct DiskArgs {
     /// How many items to list.
     #[arg(long, default_value_t = 15)]
     top: usize,
+    /// Print JSON instead of a table.
     #[arg(long)]
     json: bool,
 }
@@ -41,6 +42,7 @@ pub struct CleanArgs {
     /// The item's name, which a delete needs typed.
     #[arg(long, value_name = "NAME")]
     confirm: Option<String>,
+    /// Print JSON instead of text, refusals included.
     #[arg(long)]
     json: bool,
 }

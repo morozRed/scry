@@ -13,6 +13,7 @@ use serde::Serialize;
 
 #[derive(Args)]
 pub struct WorktreesArgs {
+    /// Print JSON instead of a table.
     #[arg(long)]
     json: bool,
     /// A folder to look for repos in. Repeat for more. Defaults to `code_roots` from the

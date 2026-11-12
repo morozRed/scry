@@ -1,4 +1,4 @@
-//! PLAN.md M4's exit tests, end to end through the `scry` binary.
+//! Reap end to end through the `scry` binary: it stops a leftover tree and nothing else.
 //!
 //! A fixture agent spawns a child that ignores SIGHUP; the child spawns a grandchild; then
 //! the agent exits. Both are leftovers with `stamp` evidence. The fixture agent is this test

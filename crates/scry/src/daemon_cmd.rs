@@ -22,6 +22,7 @@ pub enum Action {
     Uninstall,
     /// Say whether the daemon is installed, loaded and running, and how fresh its samples are.
     Status {
+        /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
     },
