@@ -27,6 +27,15 @@ pub fn view(tab: Tab) -> &'static ViewDef {
         .expect("every tab is registered in VIEWS")
 }
 
+/// What an empty list says: a title, and a hint about what would fill it. Worktrees names
+/// the folders it searched, which only the board knows.
+pub fn empty(view: &ViewDef, board: &Board) -> (String, String) {
+    match view.tab {
+        Tab::Worktrees => worktrees::empty(board),
+        _ => (view.empty.0.into(), view.empty.1.into()),
+    }
+}
+
 pub struct ViewDef {
     pub tab: Tab,
     pub columns: &'static [Column],

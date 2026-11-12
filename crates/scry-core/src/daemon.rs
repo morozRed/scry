@@ -611,6 +611,7 @@ mod tests {
             daemon: DaemonConfig {
                 sample_interval_secs: interval,
             },
+            tui: Default::default(),
             fingerprint: fingerprint.into(),
         }
     }

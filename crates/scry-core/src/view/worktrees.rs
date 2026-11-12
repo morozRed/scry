@@ -1,12 +1,14 @@
 //! The Worktrees view model: one row per worktree with a status word, the sentence that
 //! explains it and the evidence behind it, from a `worktree` scan. Skins only draw this.
+//! `WorktreesView` is what `scry worktrees` prints; `WorktreeList` is the same rows as plain
+//! data for a `Board`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use super::human_bytes;
+use super::{Detail, Fact, State, human_bytes};
 use crate::worktree::{
     Changes, Concern, Finished, GitFacts, Head, KeptBy, Merge, NotRead, ReposInside, Upstream,
     Worktree, WorktreeScan, WorktreeState,
@@ -48,6 +50,18 @@ impl Status {
     /// moves folders to the Trash, so an ignored file the checks do not cover can be put back.
     pub fn removable(self) -> bool {
         self == Status::CanGo
+    }
+
+    pub fn state(self) -> State {
+        match self {
+            Status::CanGo => State::CanGo,
+            Status::CanPrune => State::CanPrune,
+            Status::NeedsLook => State::NeedsLook,
+            Status::Dirty => State::Dirty,
+            Status::Locked => State::Locked,
+            Status::Active => State::Active,
+            Status::NotRead => State::NotRead,
+        }
     }
 
     pub fn of(w: &Worktree) -> Status {
@@ -176,6 +190,91 @@ impl WorktreesView {
             unsized_can_go,
             skipped,
         }
+    }
+}
+
+/// The Worktrees view as a skin draws it: plain rows, the folders searched, and whether the
+/// sizes are still being measured.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeList {
+    pub rows: Vec<WorktreeItem>,
+    /// The folders searched, home written as `~`.
+    pub roots: Vec<String>,
+    /// Repositories read.
+    pub repos: usize,
+    /// True while the sizes are measured; every row's `size` is `None` until then.
+    pub sizing: bool,
+    /// The config file that sets the roots, home written as `~`.
+    pub config: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeItem {
+    /// The path, home written as `~`.
+    pub id: String,
+    pub name: String,
+    pub repo: String,
+    pub branch: String,
+    pub state: State,
+    pub size: Option<u64>,
+    /// At least this many bytes come back at once on delete.
+    pub frees: Option<u64>,
+    pub creator: String,
+    pub last_commit: Option<String>,
+    pub detail: Detail,
+}
+
+impl WorktreeList {
+    /// `sizing` says `measure` has not run on `scan` yet.
+    pub fn new(scan: &WorktreeScan, now: i64, home: &Path, sizing: bool, config: &Path) -> Self {
+        let view = WorktreesView::new(scan, now, home);
+        WorktreeList {
+            rows: view.rows.iter().map(|r| item(r, sizing)).collect(),
+            roots: scan.roots.iter().map(|r| tilde(r, home)).collect(),
+            repos: scan.repos,
+            sizing,
+            config: tilde(config, home),
+        }
+    }
+}
+
+fn item(r: &WorktreeRow, sizing: bool) -> WorktreeItem {
+    let fact = |label: &str, value: String| Fact {
+        label: label.into(),
+        value,
+    };
+    let mut facts = Vec::new();
+    if !r.branch.is_empty() {
+        facts.push(fact("branch", r.branch.clone()));
+    }
+    facts.push(fact(
+        "size",
+        match r.allocated {
+            Some(b) => bytes(b),
+            None if sizing => "measuring…".into(),
+            None => "not measured".into(),
+        },
+    ));
+    facts.push(fact("creator", r.creator.clone()));
+    if let Some(age) = &r.last_commit {
+        facts.push(fact("last commit", format!("{age} ago")));
+    }
+    WorktreeItem {
+        id: r.path.clone(),
+        name: r.name.clone(),
+        repo: r.repo.clone(),
+        branch: r.branch.clone(),
+        state: r.status.state(),
+        size: r.allocated,
+        frees: r.reclaimable,
+        creator: r.creator.clone(),
+        last_commit: r.last_commit.clone(),
+        detail: Detail {
+            title: format!("{} · {}", r.name, r.repo),
+            facts,
+            sentence: r.sentence.clone(),
+            evidence: r.evidence.clone(),
+        },
     }
 }
 

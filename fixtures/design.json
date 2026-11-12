@@ -886,5 +886,289 @@
         }
       }
     ]
+  },
+  "worktrees": {
+    "state": "ready",
+    "value": {
+      "rows": [
+        {
+          "id": "~/sources/acme/.claude/worktrees/wt-auth",
+          "name": "wt-auth",
+          "repo": "acme",
+          "branch": "feat/auth",
+          "state": "can_go",
+          "size": 1350565888,
+          "frees": 956301312,
+          "creator": "Claude Code",
+          "last_commit": "3d",
+          "detail": {
+            "title": "wt-auth · acme",
+            "facts": [
+              {
+                "label": "branch",
+                "value": "feat/auth"
+              },
+              {
+                "label": "size",
+                "value": "1.3 GB"
+              },
+              {
+                "label": "creator",
+                "value": "Claude Code"
+              },
+              {
+                "label": "last commit",
+                "value": "3d ago"
+              }
+            ],
+            "sentence": "wt-auth is clean and merged into main; deleting it frees at least 912 MB.",
+            "evidence": [
+              "path ~/sources/acme/.claude/worktrees/wt-auth",
+              "branch feat/auth at 4be19c0",
+              "nothing to lose: a valid, unlocked worktree; git status lists nothing and nothing is hidden from it; no submodule, worktree or repository sits inside it; its record holds only git's standard files and known agent bookkeeping. Ignored files are not checked",
+              "finished: main holds every commit of HEAD, and no stash entry names its branch",
+              "probably made by Claude Code: path .claude/worktrees/*"
+            ]
+          }
+        },
+        {
+          "id": "~/sources/acme/.claude/worktrees/agent-7f3a9c2e",
+          "name": "agent-7f3a9c2e",
+          "repo": "acme",
+          "branch": "worktree-agent-7f3a9c2e",
+          "state": "can_go",
+          "size": 451936256,
+          "frees": 421527552,
+          "creator": "Claude Code",
+          "last_commit": "2d",
+          "detail": {
+            "title": "agent-7f3a9c2e · acme",
+            "facts": [
+              {
+                "label": "branch",
+                "value": "worktree-agent-7f3a9c2e"
+              },
+              {
+                "label": "size",
+                "value": "431 MB"
+              },
+              {
+                "label": "creator",
+                "value": "Claude Code"
+              },
+              {
+                "label": "last commit",
+                "value": "2d ago"
+              }
+            ],
+            "sentence": "agent-7f3a9c2e is clean and every commit is on origin/worktree-agent-7f3a9c2e as of the last fetch or push (last fetch 2 days ago); deleting it frees at least 402 MB.",
+            "evidence": [
+              "path ~/sources/acme/.claude/worktrees/agent-7f3a9c2e",
+              "branch worktree-agent-7f3a9c2e at 91d0a7e",
+              "nothing to lose: a valid, unlocked worktree; git status lists nothing and nothing is hidden from it; no submodule, worktree or repository sits inside it; its record holds only git's standard files and known agent bookkeeping. Ignored files are not checked",
+              "probably made by Claude Code: path .claude/worktrees/agent-*"
+            ]
+          }
+        },
+        {
+          "id": "~/.codex/worktrees/2c41/billing-api",
+          "name": "2c41/billing-api",
+          "repo": "billing-api",
+          "branch": "fix/rounding",
+          "state": "can_prune",
+          "size": null,
+          "frees": null,
+          "creator": "Codex",
+          "last_commit": null,
+          "detail": {
+            "title": "2c41/billing-api · billing-api",
+            "facts": [
+              {
+                "label": "branch",
+                "value": "fix/rounding"
+              },
+              {
+                "label": "size",
+                "value": "not measured"
+              },
+              {
+                "label": "creator",
+                "value": "Codex"
+              }
+            ],
+            "sentence": "2c41/billing-api is registered in billing-api but its folder is gone; `git worktree prune` removes only the record and frees almost nothing.",
+            "evidence": [
+              "path ~/.codex/worktrees/2c41/billing-api",
+              "branch fix/rounding at 0c33e81",
+              "the folder does not exist",
+              "probably made by Codex: path ~/.codex/worktrees/*"
+            ]
+          }
+        },
+        {
+          "id": "~/work/acme-wt-search",
+          "name": "wt-search",
+          "repo": "acme",
+          "branch": "spike/search",
+          "state": "needs_look",
+          "size": 2363490304,
+          "frees": 1814036480,
+          "creator": "unknown",
+          "last_commit": "2w",
+          "detail": {
+            "title": "wt-search · acme",
+            "facts": [
+              {
+                "label": "branch",
+                "value": "spike/search"
+              },
+              {
+                "label": "size",
+                "value": "2.2 GB"
+              },
+              {
+                "label": "creator",
+                "value": "unknown"
+              },
+              {
+                "label": "last commit",
+                "value": "2w ago"
+              }
+            ],
+            "sentence": "wt-search needs a look: 2 stash entries name its branch.",
+            "evidence": [
+              "path ~/work/acme-wt-search",
+              "branch spike/search at 5a2f6d4",
+              "stash@{0} and stash@{1} name spike/search",
+              "made by an unknown tool: no agent's record file, path or lock reason matched"
+            ]
+          }
+        },
+        {
+          "id": "~/sources/acme/.claude/worktrees/wt-ui",
+          "name": "wt-ui",
+          "repo": "acme",
+          "branch": "feat/settings-ui",
+          "state": "dirty",
+          "size": 1052770304,
+          "frees": 639631360,
+          "creator": "Claude Code",
+          "last_commit": "2h",
+          "detail": {
+            "title": "wt-ui · acme",
+            "facts": [
+              {
+                "label": "branch",
+                "value": "feat/settings-ui"
+              },
+              {
+                "label": "size",
+                "value": "1004 MB"
+              },
+              {
+                "label": "creator",
+                "value": "Claude Code"
+              },
+              {
+                "label": "last commit",
+                "value": "2h ago"
+              }
+            ],
+            "sentence": "wt-ui has 3 changed files and 1 untracked file; deleting it would lose them.",
+            "evidence": [
+              "path ~/sources/acme/.claude/worktrees/wt-ui",
+              "branch feat/settings-ui at e81b2c9",
+              "git status lists 3 changed and 1 untracked",
+              "probably made by Claude Code: path .claude/worktrees/*"
+            ]
+          }
+        },
+        {
+          "id": "~/.codex/worktrees/a91c/billing-api",
+          "name": "a91c/billing-api",
+          "repo": "billing-api",
+          "branch": "codex/refactor-ledger",
+          "state": "active",
+          "size": 686817280,
+          "frees": 102760448,
+          "creator": "Codex",
+          "last_commit": "5h",
+          "detail": {
+            "title": "a91c/billing-api · billing-api",
+            "facts": [
+              {
+                "label": "branch",
+                "value": "codex/refactor-ledger"
+              },
+              {
+                "label": "size",
+                "value": "655 MB"
+              },
+              {
+                "label": "creator",
+                "value": "Codex"
+              },
+              {
+                "label": "last commit",
+                "value": "5h ago"
+              }
+            ],
+            "sentence": "a91c/billing-api has 4 commits not pushed to origin/codex/refactor-ledger; its last commit was 5 hours ago.",
+            "evidence": [
+              "path ~/.codex/worktrees/a91c/billing-api",
+              "branch codex/refactor-ledger at 77c4f10",
+              "4 commits ahead of origin/codex/refactor-ledger",
+              "probably made by Codex: path ~/.codex/worktrees/*"
+            ]
+          }
+        },
+        {
+          "id": "~/work/acme-wt-release",
+          "name": "wt-release",
+          "repo": "acme",
+          "branch": "release/2.4",
+          "state": "locked",
+          "size": 1505755136,
+          "frees": 1155530752,
+          "creator": "unknown",
+          "last_commit": "3w",
+          "detail": {
+            "title": "wt-release · acme",
+            "facts": [
+              {
+                "label": "branch",
+                "value": "release/2.4"
+              },
+              {
+                "label": "size",
+                "value": "1.4 GB"
+              },
+              {
+                "label": "creator",
+                "value": "unknown"
+              },
+              {
+                "label": "last commit",
+                "value": "3w ago"
+              }
+            ],
+            "sentence": "wt-release is locked (\"kept for hotfixes\"); git keeps it until it is unlocked.",
+            "evidence": [
+              "path ~/work/acme-wt-release",
+              "branch release/2.4 at 2d8e5b1",
+              "locked: kept for hotfixes",
+              "made by an unknown tool: no agent's record file, path or lock reason matched"
+            ]
+          }
+        }
+      ],
+      "roots": [
+        "~/sources",
+        "~/work"
+      ],
+      "repos": 14,
+      "sizing": false,
+      "config": "~/.config/scry/config.toml"
+    }
   }
 }

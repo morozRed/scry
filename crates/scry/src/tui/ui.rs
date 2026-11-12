@@ -1,5 +1,7 @@
 //! Lays out one frame from the app state. Pure apart from the table's scroll offset.
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -50,7 +52,10 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
         Constraint::Length(1),
     ])
     .areas(area);
-    chrome::header(f, header, theme, &app.board, &app.source.label());
+    let source = app
+        .freshness(Instant::now())
+        .unwrap_or_else(|| app.source.label());
+    chrome::header(f, header, theme, &app.board, &source);
     let badges = Tab::ALL.map(|t| (views::view(t).badge)(&app.board));
     chrome::tabs(f, tabs, theme, app.tab, badges);
     if rules {
@@ -120,10 +125,11 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
             }
         }
         other => {
+            let empty = views::empty(view, &app.board);
             let status = match other {
                 Load::Ready(_) => Status::Clear {
-                    title: view.empty.0,
-                    hint: view.empty.1,
+                    title: &empty.0,
+                    hint: &empty.1,
                 },
                 Load::Loading => Status::Loading,
                 Load::Unavailable(why) => Status::Unavailable(why),
@@ -175,6 +181,9 @@ fn normal_hints(
         }
         Load::Failed(_) => hints.push(("r", "retry")),
         _ => {}
+    }
+    if !matches!(rows, Load::Failed(_)) {
+        hints.push(("r", "refresh"));
     }
     hints.extend([("?", "help"), ("q", "quit")]);
     hints

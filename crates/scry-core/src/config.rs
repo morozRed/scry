@@ -7,6 +7,9 @@
 //!
 //! [daemon]
 //! sample_interval_secs = 600               # disk sampling period
+//!
+//! [tui]
+//! refresh_secs = 2                         # 1 to 60; 0 refreshes only on `r`
 //! ```
 
 use std::fmt;
@@ -18,6 +21,8 @@ use crate::paths::{Paths, fnv1a};
 
 pub const DEFAULT_CODE_ROOTS: [&str; 4] = ["~/sources", "~/code", "~/src", "~/Developer"];
 pub const DEFAULT_SAMPLE_INTERVAL_SECS: u64 = 600;
+pub const DEFAULT_REFRESH_SECS: u64 = 2;
+pub const MAX_REFRESH_SECS: u64 = 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
@@ -28,6 +33,7 @@ pub struct Config {
     /// Process names or executable paths that no rule ever selects.
     pub keep: Vec<String>,
     pub daemon: DaemonConfig,
+    pub tui: TuiConfig,
     /// Hex hash of the settings in the file, so a daemon started with other settings can be
     /// told apart. Comments, spacing and key order do not change it.
     pub fingerprint: String,
@@ -36,6 +42,20 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub sample_interval_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TuiConfig {
+    /// Seconds between live refreshes; 0 refreshes only when asked.
+    pub refresh_secs: u64,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        TuiConfig {
+            refresh_secs: DEFAULT_REFRESH_SECS,
+        }
+    }
 }
 
 /// Where a loaded config came from.
@@ -71,6 +91,33 @@ struct FileConfig {
     keep: Option<Vec<String>>,
     #[serde(default)]
     daemon: FileDaemon,
+    /// Left out of the fingerprint: the daemon does not read it, so changing it must not
+    /// ask for a daemon restart.
+    #[serde(default, skip_serializing)]
+    tui: FileTui,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileTui {
+    refresh_secs: Option<Refresh>,
+}
+
+#[derive(Deserialize)]
+#[serde(try_from = "u64")]
+struct Refresh(u64);
+
+impl TryFrom<u64> for Refresh {
+    type Error = String;
+    fn try_from(secs: u64) -> Result<Self, Self::Error> {
+        if secs > MAX_REFRESH_SECS {
+            Err(format!(
+                "refresh_secs must be 0 (refresh only on `r`) or 1 to {MAX_REFRESH_SECS}"
+            ))
+        } else {
+            Ok(Refresh(secs))
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Default)]
@@ -139,6 +186,9 @@ impl Config {
                     .sample_interval_secs
                     .map_or(DEFAULT_SAMPLE_INTERVAL_SECS, |i| i.0),
             },
+            tui: TuiConfig {
+                refresh_secs: file.tui.refresh_secs.map_or(DEFAULT_REFRESH_SECS, |r| r.0),
+            },
             fingerprint,
         })
     }
@@ -162,6 +212,32 @@ mod tests {
         assert!(!c.destructive);
         assert!(c.keep.is_empty());
         assert_eq!(c.daemon.sample_interval_secs, 600);
+        assert_eq!(c.tui.refresh_secs, 2);
+    }
+
+    #[test]
+    fn refresh_secs_takes_0_to_60_and_leaves_the_fingerprint_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let parse = |text: &str| Config::parse(text, &p, Path::new("/x/config.toml"));
+        assert_eq!(parse("").unwrap().tui.refresh_secs, 2);
+        assert_eq!(parse("[tui]\n").unwrap().tui.refresh_secs, 2);
+        for secs in [0, 1, 5, 60] {
+            let c = parse(&format!("[tui]\nrefresh_secs = {secs}\n")).unwrap();
+            assert_eq!(c.tui.refresh_secs, secs);
+            assert_eq!(c.fingerprint, parse("").unwrap().fingerprint);
+        }
+        for bad in ["61", "3600", "-1", "\"2\"", "1.5"] {
+            let e = parse(&format!("[tui]\nrefresh_secs = {bad}\n")).unwrap_err();
+            assert_eq!(e.line, Some(2), "{bad}: {e}");
+        }
+        let e = parse("[tui]\nrefresh_secs = 61\n").unwrap_err();
+        assert!(
+            e.to_string().contains("0 (refresh only on `r`) or 1 to 60"),
+            "{e}"
+        );
+        let e = parse("[tui]\nrefresh = 2\n").unwrap_err();
+        assert!(e.to_string().contains("refresh"), "{e}");
     }
 
     #[test]

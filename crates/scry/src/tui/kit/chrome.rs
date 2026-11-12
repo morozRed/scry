@@ -7,6 +7,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use scry_core::view::{Board, Pulse, Tab, Tone, human_bytes};
 
+use unicode_width::UnicodeWidthStr;
+
 use super::{fill, width};
 use crate::tui::theme::{Chrome, Theme, glyph};
 
@@ -143,11 +145,21 @@ pub fn footer(f: &mut Frame, area: Rect, theme: &Theme, left: Vec<Span>, hints: 
         spans.push(Span::raw("    "));
     }
     let room = area.width as usize;
+    // Hints sit three columns apart, or two when that keeps the last of them on screen.
+    let all = hints
+        .iter()
+        .map(|(key, what)| key.width() + 1 + what.width() + 3)
+        .sum::<usize>();
+    let gap = if width(&spans) + all <= room + 3 {
+        "   "
+    } else {
+        "  "
+    };
     for (key, what) in hints {
         let hint = [
             Span::styled(key.to_string(), theme.key),
             Span::styled(format!(" {what}"), theme.muted),
-            Span::raw("   "),
+            Span::raw(gap),
         ];
         if width(&spans) + width(&hint[..2]) > room {
             break;
