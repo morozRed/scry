@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <title>Scry</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e2128"/>
+      <stop offset="1" stop-color="#121418"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="216" fill="url(#tile)"/>
+  <!-- The orb you look into. -->
+  <circle cx="512" cy="512" r="296" fill="none" stroke="#d6d9de" stroke-width="40"/>
+  <!-- A session and the processes it started; one was left running. -->
+  <path d="M512 392 V488 L424 616 M512 488 L600 616" fill="none" stroke="#7daeff"
+        stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="512" cy="384" r="52" fill="#7daeff"/>
+  <circle cx="420" cy="628" r="52" fill="#7daeff"/>
+  <circle cx="604" cy="628" r="52" fill="#e5b567"/>
+</svg>

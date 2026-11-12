@@ -1,3 +1,5 @@
+<img src="docs/assets/icon/scry.svg" width="96" alt="Scry's icon: an orb holding an agent session and the processes it started, one of them left running">
+
 # Scry
 
 **See what your coding agents left running on your Mac.**

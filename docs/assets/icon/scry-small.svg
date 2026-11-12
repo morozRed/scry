@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <title>Scry</title>
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="#16181d"/>
+  <!-- At 32 px and under the orb is left out, so the lineage stays legible. -->
+  <path d="M512 330 V490 L340 720 M512 490 L684 720" fill="none" stroke="#7daeff"
+        stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="512" cy="300" r="118" fill="#7daeff"/>
+  <circle cx="320" cy="740" r="118" fill="#7daeff"/>
+  <circle cx="704" cy="740" r="118" fill="#e5b567"/>
+</svg>
