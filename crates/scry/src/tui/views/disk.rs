@@ -1,6 +1,6 @@
-//! Disk: free space and its forecast in a band above the list, then the catalog's items
-//! ranked by what deleting them frees, each with the cleanup it allows. `t` cleans up the
-//! selected item.
+//! Disk: the volume as a bar with its forecast, then the catalog's items as a treemap or a
+//! list ranked by what deleting them frees, each with the cleanup it allows. `t` cleans up
+//! the selected item.
 
 use scry_core::disk::clean::Allows;
 use scry_core::disk::forecast::Forecast;
@@ -8,17 +8,21 @@ use scry_core::view::disk::{DiskItem, DiskList};
 use scry_core::view::worktrees::bytes;
 use scry_core::view::{Board, Load, Tab, Tone, disk_bytes};
 
-use super::{Cell, Column, Ink, Row, SortKey, ViewDef};
+use super::{Bars, Cell, Chip, Column, Ink, Row, SortKey, ViewDef};
 
 pub const VIEW: ViewDef = ViewDef {
     tab: Tab::Disk,
+    title: "WHAT FILLS THE DISK",
+    note,
+    about: "What",
+    bars: Some(worth),
     columns: &[
-        Column::fill("ITEM", 18),
-        Column::fixed("KIND", 13).from(84),
-        Column::fixed("SIZE", 5),
-        Column::fixed("FREES", 6),
-        Column::fixed("CLEANUP", 7),
-        Column::fixed("BY", 15).from(110),
+        Column::fill("item", 18),
+        Column::fixed("kind", 13).from(84),
+        Column::fixed("size", 5),
+        Column::fixed("frees", 6),
+        Column::fixed("cleanup", 7),
+        Column::fixed("made by", 15).from(110),
     ],
     rows,
     empty: (
@@ -57,9 +61,24 @@ fn row(d: &DiskItem, sizing: bool) -> Row {
         (Some(state), _) => Some(state.word().to_string()),
         _ => None,
     };
+    let mut chips = vec![
+        Chip::Kind(d.kind.word().into(), d.kind),
+        Chip::Tone(
+            d.cleanup().to_string(),
+            if cleanable(d) { Tone::Ok } else { Tone::Quiet },
+        ),
+    ];
+    if let Some(f) = d.frees {
+        let at_least = if d.at_least { "≥ " } else { "" };
+        chips.push(Chip::Tone(
+            format!("frees {at_least}{}", disk_bytes(f)),
+            Tone::Quiet,
+        ));
+    }
     Row {
         id: d.id.clone(),
         depth: 0,
+        chips,
         cells: vec![
             Cell::text(&d.name).with_context(context),
             Cell::muted(d.kind.word()),
@@ -69,9 +88,45 @@ fn row(d: &DiskItem, sizing: bool) -> Row {
             Cell::muted(&d.creator),
         ],
         detail: Some(d.detail.clone()),
-        target: None,
-        jump: None,
+        ..Row::default()
     }
+}
+
+/// Whether Scry, or the tool's own command, can give the space back.
+pub fn cleanable(d: &DiskItem) -> bool {
+    !matches!(d.allows, Allows::Never { .. } | Allows::Off { .. })
+}
+
+/// The items cleanup can take, largest first, for the pane's ranking.
+fn worth(board: &Board) -> Option<Bars> {
+    let list = board.disk.ready()?;
+    let mut rows: Vec<&DiskItem> = list
+        .items
+        .iter()
+        .filter(|d| cleanable(d) && d.frees.is_some_and(|f| f > 0))
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    rows.sort_by_key(|d| std::cmp::Reverse(d.frees));
+    Some(Bars {
+        title: "Worth cleaning".into(),
+        note: if list.destructive {
+            format!("≥ {}", disk_bytes(list.reclaimable))
+        } else {
+            String::new()
+        },
+        rows: rows
+            .iter()
+            .map(|d| (d.name.clone(), d.frees.unwrap_or(0), d.kind))
+            .collect(),
+    })
+}
+
+fn note(board: &Board) -> Option<String> {
+    let list = board.disk.ready()?;
+    list.destructive
+        .then(|| format!("≥ {} to clean up", disk_bytes(list.reclaimable)))
 }
 
 /// The cleanup word, toned by what it would do: a delete is final, the Trash is not.
@@ -98,11 +153,11 @@ fn badge(board: &Board) -> usize {
     usize::from(matches!(filling, Some(Forecast::FullIn { days, .. }) if *days <= 30.0))
 }
 
-/// The band above the list: free space, then the forecast, the Trash and whether cleanup
-/// is on.
-pub fn band(board: &Board) -> Option<Vec<Vec<(String, Ink)>>> {
+/// The lines under the volume bar: free space, then the forecast, the Trash and whether
+/// cleanup is on.
+pub fn lines(board: &Board) -> Option<[Vec<(String, Ink)>; 2]> {
     let list = board.disk.ready()?;
-    Some(vec![space(list), outlook(list)])
+    Some([space(list), outlook(list)])
 }
 
 fn space(list: &DiskList) -> Vec<(String, Ink)> {

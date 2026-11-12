@@ -8,14 +8,18 @@ use super::{Cell, Column, Row, SortKey, ViewDef};
 
 pub const VIEW: ViewDef = ViewDef {
     tab: Tab::Worktrees,
+    title: "WORKTREES",
+    note,
+    about: "Why",
+    bars: None,
     columns: &[
-        Column::fill("WORKTREE", 16),
-        Column::fill("REPO", 8).from(76),
-        Column::fill("BRANCH", 10).from(100),
-        Column::fixed("SIZE", 5),
-        Column::fixed("CREATOR", 11).from(70),
-        Column::fixed("LAST", 4).from(90),
-        Column::fixed("STATE", 14),
+        Column::fill("worktree", 16),
+        Column::fill("repo", 8).from(76),
+        Column::fill("branch", 10).from(100),
+        Column::fixed("size", 5),
+        Column::fixed("creator", 11).from(70),
+        Column::fixed("last commit", 4).from(90),
+        Column::fixed("state", 12),
     ],
     rows,
     // `empty` below says which folders were searched.
@@ -68,8 +72,7 @@ fn row(w: &WorktreeItem, sizing: bool) -> Row {
             Cell::state(Some(w.state)),
         ],
         detail: Some(w.detail.clone()),
-        target: None,
-        jump: None,
+        ..Row::default()
     }
 }
 
@@ -94,6 +97,13 @@ fn repos(list: &WorktreeList) -> String {
     match list.repos {
         1 => "1 repo".into(),
         n => format!("{n} repos"),
+    }
+}
+
+fn note(board: &Board) -> Option<String> {
+    match badge(board) {
+        0 => None,
+        n => Some(format!("{n} to look at")),
     }
 }
 

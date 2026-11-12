@@ -2,8 +2,7 @@
 source: crates/scry/src/tui/tests.rs
 expression: first
 ---
-" scry   cpu ▃▅▄▃▂▃▄▃ 23%   mem ● normal   swap 1.2G   disk 84G · full in 19d    "
-"  1 Overview ·5   2 Ports ·1   3 Agents ·24   4 Disk ·1   5 Worktrees ·4        "
+" SCRY   Overview 5   Ports 1   Agents 24   Disk 1   Worktrees 4                 "
 "────────────────────────────────────────────────────────────────────────────────"
 "                                                                                "
 "  Reap 24 leftovers?                                                            "
@@ -22,7 +21,8 @@ expression: first
 "  61003   5h    node worker-03                                             48M  "
 "  61004   5h    node worker-04                                             48M  "
 "  61005   5h    node worker-05                                             48M  "
-"  ↓ 14 more   j k scroll                                                        "
+"  61006   5h    node worker-06                                             48M  "
+"  61007   5h    node worker-07                                             48M  "
+"  ↓ 12 more   j k scroll                                                        "
 "                                                                                "
-"────────────────────────────────────────────────────────────────────────────────"
 " ⏎ reap all   esc cancel                                                        "

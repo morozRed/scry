@@ -2,10 +2,11 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Row, Table, Wrap};
 use scry_core::view::{Tone, human_age, human_bytes};
+use unicode_width::UnicodeWidthStr;
 
 use scry_core::disk::clean::Action;
 use scry_core::view::worktrees::bytes;
@@ -16,9 +17,9 @@ use scry_core::keep::KeepEdit;
 use crate::tui::app::{CleanSheet, Sheet, SheetKind};
 use crate::tui::theme::{Chrome, Theme};
 
-/// A sheet that would leave fewer rows than this of the list above it covers the body, so
-/// no lone row peeks out above its edge.
-const PEEK_MIN: u16 = 4;
+/// A sheet that would leave fewer rows than this above it covers the body, so no lone row
+/// peeks out above its edge: the blank row and the list's title, three rows, and the gap.
+const PEEK_MIN: u16 = 6;
 /// The plain background kept around the help card, so nothing under it touches its edge.
 const MARGIN: (u16, u16) = (2, 1);
 
@@ -442,15 +443,16 @@ pub fn clean_sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &CleanSheet)
     area
 }
 
-const KEYS: [(&str, &str, &str); 16] = [
-    ("Move", "j k ↑ ↓", "up and down, ctrl-d ctrl-u by page"),
-    ("", "g G", "first and last row"),
-    ("", "⏎", "fold a session, or go to the row"),
-    ("", "h l", "fold and unfold; h goes to the parent"),
-    ("Views", "1-5  tab", "switch view"),
+const KEYS: [(&str, &str, &str); 17] = [
+    ("Move", "j k ↑ ↓", "rows; g G first and last, ^d ^u a page"),
+    ("", "h l space", "fold, unfold; h goes to the parent"),
+    ("", "⏎  click", "details, or go to an Overview item"),
+    ("Views", "1-5  tab", "switch view; or click its name"),
+    ("", "v", "Disk: treemap or list; hjkl by tile"),
     ("Find", "/", "filter, fuzzy, within a column"),
-    ("", "esc", "clear the filter"),
+    ("", "esc", "clear the filter, close the details"),
     ("", "s  S", "sort by the next column, reverse"),
+    ("", "^p  :", "every command, by name"),
     ("Act", "x", "stop the selected process"),
     ("", "X", "reap leftovers"),
     ("", "K", "keep: never select it again"),
@@ -501,6 +503,70 @@ pub fn help(f: &mut Frame, body: Rect, theme: &Theme) {
     .intersection(body);
     f.render_widget(Clear, margin);
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The command palette: what was typed, then the commands that match it with their keys,
+/// in a card near the top of the body.
+pub fn palette(
+    f: &mut Frame,
+    body: Rect,
+    theme: &Theme,
+    query: &str,
+    entries: &[(&str, &str)],
+    cursor: usize,
+) {
+    let w = 60.min(body.width.saturating_sub(4));
+    let block = card(theme, Borders::ALL).padding(Padding::horizontal(1));
+    // The rows the card's edge takes, which only the ANSI look draws.
+    let edge = 10 - block.inner(Rect::new(0, 0, w, 10)).height;
+    let list_h = (entries.len().max(1) as u16).min(body.height.saturating_sub(4 + edge));
+    let h = list_h + 2 + edge;
+    let area = Rect {
+        x: body.x + (body.width - w) / 2,
+        y: body.y + 1,
+        width: w,
+        height: h.min(body.height.saturating_sub(1)),
+    };
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let buf = f.buffer_mut();
+    let prompt = Line::from(vec![
+        Span::styled("› ", theme.accent),
+        Span::styled(query.to_string(), theme.text),
+        Span::styled("▏", theme.accent),
+    ]);
+    buf.set_line(inner.x, inner.y, &prompt, inner.width);
+    buf.set_string(
+        inner.x,
+        inner.y + 1,
+        "─".repeat(inner.width as usize),
+        theme.border,
+    );
+    if entries.is_empty() {
+        buf.set_string(inner.x, inner.y + 2, "No command matches.", theme.muted);
+        return;
+    }
+    let rows = inner.height.saturating_sub(2) as usize;
+    let top = cursor.saturating_sub(rows.saturating_sub(1));
+    for (i, (label, keys)) in entries.iter().enumerate().skip(top).take(rows) {
+        let y = inner.y + 2 + (i - top) as u16;
+        let line = Rect::new(inner.x, y, inner.width, 1);
+        let base = if i == cursor {
+            theme.selection
+        } else {
+            Style::new()
+        };
+        buf.set_style(line, base);
+        buf.set_string(inner.x + 1, y, *label, theme.text.patch(base));
+        let kw = keys.width() as u16;
+        buf.set_string(
+            inner.right().saturating_sub(kw + 1),
+            y,
+            *keys,
+            theme.key.patch(base),
+        );
+    }
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {

@@ -6,6 +6,19 @@ All notable changes to Scry are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **A new look for the terminal UI**, after ghui and disktree. One header line with the
+  views and the pulse; lists without column titles, the state as a glyph in a gutter; the
+  detail beside the list from 100 columns, with the state and facts as filled chips and its
+  sections set apart by rules. The Overview opens with gauges for CPU, memory and the disk,
+  and Disk with the volume as a bar and its items as a treemap coloured by kind, hatched
+  where Scry can clean them up. `v` switches Disk to the ranked list.
+- **Navigation.** `enter` opens the selected row's detail over the whole screen (the
+  Overview still goes to its row), and `space` folds a session. `ctrl-p` or `:` opens a
+  palette of every command that applies here. The mouse picks views, rows and tiles and
+  scrolls with the wheel; the arrows move between treemap tiles.
+
 ## [0.1.0]
 
 The first public release.

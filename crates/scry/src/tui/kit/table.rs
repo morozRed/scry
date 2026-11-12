@@ -1,23 +1,23 @@
-//! A flattened tree as a table: columns align across depths, the first column carries the
-//! tree glyphs, and numbers align right.
+//! A flattened tree as a list without a header row: the state as a glyph in a gutter, the
+//! first column indented by depth, the other columns aligned across rows and numbers to the
+//! right. The section title above the list names it, so the columns need no titles.
 
 use std::cell::Cell as Shared;
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Cell, HighlightSpacing, Row, Table, TableState};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use super::fit;
 use crate::tui::theme::{Theme, glyph};
-use crate::tui::views::{self, CellKind, Column, Hits, Shown, Sort, Width, is_numeric};
+use crate::tui::views::{self, CellKind, Column, Hits, Shown, Width, is_numeric};
+use scry_core::view::Tone;
 
 const GAP: u16 = 2;
-/// ` ↓` after a sorted column's title.
-const ARROW: u16 = 2;
+/// The state glyph and the space after it.
+pub const GUTTER: u16 = 2;
 /// A text column grows to its longest cell up to this, and no further while the numbers
 /// beside it have room: past it, long cells end in `…` rather than push the numbers away.
 const FILL_MAX: u16 = 48;
@@ -29,10 +29,10 @@ pub struct ListView<'a> {
     pub rows: &'a [views::Row],
     pub shown: &'a [Shown<'a>],
     pub cursor: usize,
-    pub sort: Option<Sort>,
 }
 
-/// Draws the list and returns where each visible row landed, by id.
+/// Draws the list and returns where each visible row landed, by id. `offset` is the first
+/// row on screen; it moves to keep the cursor in view.
 pub fn table(
     f: &mut Frame,
     area: Rect,
@@ -40,107 +40,108 @@ pub fn table(
     list: &ListView,
     offset: &Shared<usize>,
 ) -> Vec<(String, Rect)> {
-    let cursor_w = theme.cursor.0.width() as u16;
-    let inner = area.width.saturating_sub(cursor_w);
+    let inner = area.width.saturating_sub(GUTTER);
     let visible = views::visible(list.columns, area.width);
     let widths = widths(list, &visible, inner);
     let numeric: Vec<bool> = visible.iter().map(|&i| is_numeric(list.rows, i)).collect();
 
-    let header = Row::new(visible.iter().enumerate().map(|(n, &i)| {
-        let mut title = list.columns[i].title.to_string();
-        let mut style = theme.heading;
-        if let Some(s) = list.sort.filter(|s| s.column == i) {
-            title.push_str(if s.descending { " ↓" } else { " ↑" });
-            style = style.patch(theme.accent);
-        }
-        let line = Line::styled(title, style);
-        Cell::from(if numeric[n] {
-            line.alignment(Alignment::Right)
-        } else {
-            line
-        })
-    }));
+    let room = area.height as usize;
+    let len = list.shown.len();
+    // A list that grew shorter, or a terminal that grew taller, must not leave rows
+    // scrolled away above empty space.
+    let mut top = offset.get().min(len.saturating_sub(room));
+    if list.cursor < top {
+        top = list.cursor;
+    } else if room > 0 && list.cursor >= top + room {
+        top = list.cursor + 1 - room;
+    }
+    offset.set(top);
 
     let none = Hits::default();
-    let body = list.shown.iter().map(|s| {
-        Row::new(visible.iter().enumerate().map(|(n, &i)| {
-            let w = widths[n] as usize;
+    let buf = f.buffer_mut();
+    let mut painted = Vec::new();
+    for (n, s) in list.shown.iter().enumerate().skip(top).take(room) {
+        let y = area.y + (n - top) as u16;
+        let row_area = Rect::new(area.x, y, area.width, 1);
+        let selected = n == list.cursor;
+        let base = if selected {
+            buf.set_style(row_area, theme.selection);
+            theme.selection
+        } else {
+            Style::new()
+        };
+        let (mark, mark_style) = match s.row.state() {
+            Some(state) => (glyph(state.tone()), theme.tone(state.tone())),
+            None if s.row.depth > 0 => ("·", theme.faint),
+            None => (" ", theme.faint),
+        };
+        buf.set_span(area.x, y, &Span::styled(mark, mark_style.patch(base)), 1);
+
+        let mut x = area.x + GUTTER;
+        for (k, &i) in visible.iter().enumerate() {
+            let w = widths[k];
             let hits = s.hits.get(i).unwrap_or(&none);
-            let line = if n == 0 {
-                fit(first_cell(theme, s, hits), w)
+            let spans = if k == 0 {
+                first_cell(theme, s, i, hits)
             } else {
-                fit(cell_spans(theme, &s.row.cells[i], hits), w)
+                cell_spans(theme, &s.row.cells[i], hits)
             };
-            Cell::from(if numeric[n] {
-                line.alignment(Alignment::Right)
+            let line = patch(fit(spans, w as usize), base);
+            let lw = line.width() as u16;
+            let at = if numeric[k] {
+                x + w.saturating_sub(lw)
             } else {
-                line
+                x
+            };
+            buf.set_line(at, y, &line, w);
+            x += w + GAP;
+        }
+        painted.push((s.row.id.clone(), row_area));
+    }
+    painted
+}
+
+fn patch(line: Line<'_>, base: Style) -> Line<'_> {
+    if base == Style::new() {
+        return line;
+    }
+    Line::from(
+        line.spans
+            .into_iter()
+            .map(|s| {
+                let style = s.style.patch(Style {
+                    bg: base.bg,
+                    add_modifier: base.add_modifier,
+                    ..Style::new()
+                });
+                Span::styled(s.content, style)
             })
-        }))
-    });
-
-    // Rows that fit under the header. A list that grew shorter, or a terminal that grew
-    // taller, must not leave rows scrolled away above empty space.
-    let room = area.height.saturating_sub(1) as usize;
-    let top = offset.get().min(list.shown.len().saturating_sub(room));
-    let (symbol, symbol_style) = theme.cursor;
-    let table = Table::new(body, widths.iter().map(|&w| Constraint::Length(w)))
-        .header(header)
-        .column_spacing(GAP)
-        .row_highlight_style(theme.selection)
-        .highlight_symbol(Text::from(Span::styled(symbol, symbol_style)))
-        .highlight_spacing(HighlightSpacing::Always);
-    let mut state = TableState::default()
-        .with_offset(top)
-        .with_selected(Some(list.cursor));
-    f.render_stateful_widget(table, area, &mut state);
-    offset.set(state.offset());
-
-    list.shown
-        .iter()
-        .enumerate()
-        .skip(state.offset())
-        .take(room)
-        .map(|(i, s)| {
-            let y = area.y + 1 + (i - state.offset()) as u16;
-            (s.row.id.clone(), Rect::new(area.x, y, area.width, 1))
-        })
-        .collect()
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Column widths: text columns as wide as their longest cell (at most `FILL_MAX`), with the
 /// spare width left at the right. When that does not fit, text columns share what the
 /// fixed ones leave.
 fn widths(list: &ListView, visible: &[usize], inner: u16) -> Vec<u16> {
-    // A sortable column keeps room for its arrow, so the title is never cut.
-    let title = |c: &Column| {
-        if c.sortable {
-            c.title.width() as u16 + ARROW
-        } else {
-            0
-        }
-    };
     let natural: Vec<u16> = visible
         .iter()
-        .map(|&i| {
-            let c = &list.columns[i];
-            match c.width {
-                Width::Fixed(w) => w.max(title(c)),
-                Width::Fill(min) => longest(list.rows, i).min(FILL_MAX).max(min).max(title(c)),
-            }
+        .map(|&i| match list.columns[i].width {
+            Width::Fixed(w) => w,
+            Width::Fill(min) => longest(list.rows, i, visible[0]).min(FILL_MAX).max(min),
         })
         .collect();
     let gaps = GAP * visible.len().saturating_sub(1) as u16;
     if natural.iter().sum::<u16>() + gaps <= inner {
         return natural;
     }
-    let constraints = visible.iter().zip(&natural).map(|(&i, &w)| {
-        let c = &list.columns[i];
-        match c.width {
+    let constraints = visible
+        .iter()
+        .zip(&natural)
+        .map(|(&i, &w)| match list.columns[i].width {
             Width::Fixed(_) => Constraint::Length(w),
-            Width::Fill(min) => Constraint::Min(min.max(title(c))),
-        }
-    });
+            Width::Fill(min) => Constraint::Min(min),
+        });
     Layout::horizontal(constraints)
         .spacing(GAP)
         .split(Rect::new(0, 0, inner, 1))
@@ -149,9 +150,10 @@ fn widths(list: &ListView, visible: &[usize], inner: u16) -> Vec<u16> {
         .collect()
 }
 
-/// The widest cell of column `i` across `rows`, with the tree guides and fold count the
-/// first column adds.
-fn longest(rows: &[views::Row], i: usize) -> u16 {
+/// The widest cell of column `i` across `rows`, with the indent and fold count the first
+/// column adds.
+fn longest(rows: &[views::Row], i: usize, first: usize) -> u16 {
+    use unicode_width::UnicodeWidthStr;
     rows.iter()
         .enumerate()
         .map(|(n, r)| {
@@ -160,7 +162,7 @@ fn longest(rows: &[views::Row], i: usize) -> u16 {
             };
             let context = cell.context.as_ref().map_or(0, |c| 2 + c.width());
             let mut w = cell.text.width() + context;
-            if i == 0 {
+            if i == first {
                 w += 2 + 2 * r.depth as usize;
                 let below = rows[n + 1..]
                     .iter()
@@ -176,8 +178,10 @@ fn longest(rows: &[views::Row], i: usize) -> u16 {
         .unwrap_or(0)
 }
 
-fn first_cell<'a>(theme: &Theme, s: &Shown<'a>, hits: &Hits) -> Vec<Span<'a>> {
-    let cell = &s.row.cells[0];
+/// The fold marker or indent, then the text. A parent row reads as a group's header: its
+/// name in the accent, bold.
+fn first_cell<'a>(theme: &Theme, s: &Shown<'a>, i: usize, hits: &Hits) -> Vec<Span<'a>> {
+    let cell = &s.row.cells[i];
     let mut spans = vec![Span::styled(s.prefix.clone(), theme.faint)];
     if let CellKind::State(_) = cell.kind {
         spans.extend(cell_spans(theme, cell, hits));
@@ -185,30 +189,32 @@ fn first_cell<'a>(theme: &Theme, s: &Shown<'a>, hits: &Hits) -> Vec<Span<'a>> {
     }
     let base = match cell.kind {
         CellKind::Muted => theme.muted,
-        _ if s.row.depth == 0 && s.prefix.starts_with(['▾', '▸']) => theme.strong,
+        _ if s.row.depth == 0 && s.prefix.starts_with(['▾', '▸']) => {
+            theme.accent.add_modifier(Modifier::BOLD)
+        }
         _ => theme.text,
     };
     spans.extend(marked(&cell.text, &hits.text, base, theme.matched));
+    // Before the context, so a narrow column cuts the context, not the count.
+    if s.folded > 0 {
+        spans.push(Span::styled(format!(" +{}", s.folded), theme.muted));
+    }
     if let Some(ctx) = &cell.context {
         spans.push(Span::styled("  ", theme.muted));
         spans.extend(marked(ctx, &hits.context, theme.muted, theme.matched));
     }
-    if s.folded > 0 {
-        spans.push(Span::styled(format!("  +{}", s.folded), theme.muted));
-    }
     spans
 }
 
+/// A state column shows the word only, in its tone: the gutter has the glyph.
 fn cell_spans<'a>(theme: &Theme, cell: &views::Cell, hits: &Hits) -> Vec<Span<'a>> {
     match cell.kind {
         CellKind::State(state) => {
-            let tone = theme.tone(state.tone());
-            let mut v = vec![
-                Span::styled(glyph(state.tone()), tone),
-                Span::styled(" ", tone),
-            ];
-            v.extend(marked(state.word(), &hits.text, tone, theme.matched));
-            v
+            let tone = match state.tone() {
+                Tone::Quiet => theme.muted,
+                t => theme.tone(t),
+            };
+            marked(state.word(), &hits.text, tone, theme.matched)
         }
         CellKind::Muted => marked(&cell.text, &hits.text, theme.muted, theme.matched),
         CellKind::Text | CellKind::Num => {

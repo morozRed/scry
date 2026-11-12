@@ -8,7 +8,7 @@ and every view is also a command with `--json` output for scripts and agents.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screens/agents-dark-120x40.svg">
-  <img alt="Scry's Agents view: agent sessions as a tree with their processes, RAM, ports and evidence. Four processes of an ended Claude Code session are flagged as leftovers, and the pane below explains the selected one in a sentence." src="docs/screens/agents-light-120x40.svg">
+  <img alt="Scry's Agents view: agent sessions as a tree with their processes, ports, RAM and age. Four processes of an ended Claude Code session are flagged as leftovers, and the pane beside the list explains the selected one: why it is there, its details and the evidence." src="docs/screens/agents-light-120x40.svg">
 </picture>
 
 ## Why
@@ -70,19 +70,21 @@ SCRY_HOME=/tmp/scry-try scry
 
 ## A tour of the terminal UI
 
-Press `1` to `5` to switch views, `j`/`k` or the arrow keys to move, `/` to filter, `s` to
-sort and `?` for every key. The pane under each list explains the selected row in one
-sentence, followed by its evidence.
+Press `1` to `5` or `tab` to switch views, `j`/`k` or the arrow keys to move, `/` to
+filter, `s` to sort and `?` for every key. `ctrl-p` (or `:`) finds any command by name, and
+the mouse works too: click a view or a row, scroll with the wheel. The pane beside each list
+(under it below 100 columns) explains the selected row in one sentence, with its details
+and evidence; `enter` opens it over the whole screen.
 
 ### 1 Overview
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screens/overview-dark-80x24.svg">
-  <img alt="The Overview: a ranked list of leftovers, a port held by an ended session, a filling disk and stale worktrees" src="docs/screens/overview-light-80x24.svg">
+  <img alt="The Overview: gauges for CPU, memory pressure and free disk, then a ranked list of leftovers, a port held by an ended session, a filling disk and stale worktrees" src="docs/screens/overview-light-80x24.svg">
 </picture>
 
-One ranked list of what needs attention across all views. `Enter` jumps to the row it is
-about. When nothing needs attention, it says so.
+Gauges for CPU, memory and the disk, then one ranked list of what needs attention across
+all views. `Enter` jumps to the row it is about. When nothing needs attention, it says so.
 
 ### 2 Ports
 
@@ -101,8 +103,8 @@ agent session behind it. `x` stops the selected process.
   <img alt="The Agents view: sessions as a tree, with leftovers flagged" src="docs/screens/agents-light-80x24.svg">
 </picture>
 
-Agent sessions as a tree, each with the processes it started, their RAM, ports and the
-evidence that ties them to the session. Processes left running after their session ended
+Agent sessions as a tree, each with the processes it started, their ports, RAM and age, and
+in the pane the evidence that ties them to the session. `space` folds a session. Processes left running after their session ended
 are flagged as **leftovers**. `X` stops them all after a confirmation, and `K` puts one on
 your keep list so Scry never selects it again.
 
@@ -110,12 +112,14 @@ your keep list so Scry never selects it again.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/screens/disk-dark-80x24.svg">
-  <img alt="The Disk view: free space and its forecast, then caches, node_modules and worktrees ranked by what deleting them frees" src="docs/screens/disk-light-80x24.svg">
+  <img alt="The Disk view: the volume as a bar with its forecast, then caches, node_modules and worktrees as a treemap coloured by kind, with what Scry can clean up hatched" src="docs/screens/disk-light-80x24.svg">
 </picture>
 
 Free space as Finder counts it, a forecast of when it runs out, and the caches, simulator
-data, `node_modules` folders and worktrees that fill it, ranked by what deleting them would
-free. `t` cleans up the selected item in the one way it allows.
+data, `node_modules` folders and worktrees that fill it, as a treemap sized by what each
+takes and coloured by kind, with what Scry can clean up hatched. The arrow keys move between
+tiles; `v` switches to a list ranked by what deleting each would free. `t` cleans up the
+selected item in the one way it allows.
 
 ### 5 Worktrees
 

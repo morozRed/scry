@@ -2,21 +2,15 @@
 
 pub mod chrome;
 pub mod detail;
+pub mod gauges;
 pub mod overlay;
 pub mod states;
 pub mod table;
+pub mod treemap;
 
-use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Block;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-
-pub fn fill(f: &mut Frame, area: Rect, style: Style) {
-    f.render_widget(Block::new().style(style), area);
-}
 
 /// Display columns, as the terminal draws them: wide CJK and emoji take two.
 pub fn width(spans: &[Span]) -> usize {
@@ -38,6 +32,39 @@ pub fn wrapped_lines(text: &str, width: u16) -> u16 {
         }
     }
     lines
+}
+
+/// `text` word-wrapped to `width` columns, as [`wrapped_lines`] counts it. A word longer
+/// than a line is cut across lines.
+pub fn wrap(text: &str, width: u16) -> Vec<String> {
+    let width = width.max(1) as usize;
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let w = word.width();
+        if !cur.is_empty() && cur.width() + 1 + w > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        if w > width && cur.is_empty() {
+            let mut piece = String::new();
+            for g in word.graphemes(true) {
+                if piece.width() + g.width() > width {
+                    out.push(std::mem::take(&mut piece));
+                }
+                piece.push_str(g);
+            }
+            cur = piece;
+            continue;
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// Pads `text` with spaces to `cols` display columns.
