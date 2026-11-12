@@ -6,11 +6,16 @@ use super::{Cell, Column, Row, ViewDef};
 
 pub const VIEW: ViewDef = ViewDef {
     tab: Tab::Overview,
+    title: "NEEDS ATTENTION",
+    note,
+    about: "Why",
+    bars: None,
     columns: &[
-        Column::fixed("STATE", 10).unsorted(),
-        Column::fill("NEEDS ATTENTION", 24).unsorted(),
-        Column::fixed("SIZE", 5),
-        Column::fixed("VIEW", 11).from(70).unsorted(),
+        // The gutter shows the state; the word would repeat it.
+        Column::fixed("state", 10).hidden(),
+        Column::fill("item", 24).unsorted(),
+        Column::fixed("size", 5),
+        Column::fixed("view", 11).from(60).unsorted(),
     ],
     rows,
     empty: (
@@ -52,11 +57,18 @@ fn rows(board: &Board) -> Load<Vec<Row>> {
                 Cell::muted(format!("→ {}", a.tab.title())),
             ],
             detail: Some(a.detail.clone()),
-            target: None,
             jump: Some((a.tab, a.row.clone())),
+            ..Row::default()
         })
         .collect();
     Load::Ready(rows)
+}
+
+fn note(board: &Board) -> Option<String> {
+    match badge(board) {
+        0 => None,
+        n => Some(n.to_string()),
+    }
 }
 
 fn badge(board: &Board) -> usize {

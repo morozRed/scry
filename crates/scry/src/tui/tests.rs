@@ -180,7 +180,7 @@ fn every_key_on_the_help_card_shows_at_the_smallest_size() {
         press(&mut a, "?");
         let text = screen(&render(&a, 80, 24));
         for what in [
-            "first and last row",
+            "rows; g G first and last",
             "this help",
             "suspend to the shell",
             "quit",
@@ -303,20 +303,91 @@ fn enter_on_an_attention_line_opens_its_row() {
     press(&mut a, "\n");
     assert_eq!(a.tab, Tab::Agents);
     assert_eq!(a.state().selected.as_deref(), Some("s-4f2c"));
-    press(&mut a, "\n");
+    press(&mut a, " ");
     assert!(a.state().folded.contains("s-4f2c"));
 }
 
 #[test]
-fn enter_on_a_process_does_nothing_and_h_goes_to_its_parent() {
+fn enter_opens_the_detail_and_h_goes_to_the_parent() {
     let mut a = design();
     press(&mut a, "3jj");
     assert_eq!(a.state().selected.as_deref(), Some("next-48213"));
-    assert_eq!(a.on_key(key(KeyCode::Enter)), Action::None);
+    assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Redraw);
+    assert!(matches!(a.mode, Mode::Detail(_)));
+    let text = screen(&render(&a, 80, 24));
+    assert!(text.contains("Evidence"), "the whole detail:\n{text}");
+    assert!(
+        !text.contains("mcp-server-github"),
+        "over the list:\n{text}"
+    );
+    // The row's own keys still work; esc goes back to the list.
+    press(&mut a, "x");
+    assert!(matches!(&a.mode, Mode::Sheet(s) if s.targets[0].pid == 48213));
+    press(&mut a, "\x1b\n\x1b");
+    assert_eq!(a.mode, Mode::Normal);
     assert_eq!(a.state().selected.as_deref(), Some("next-48213"));
     assert!(a.state().folded.is_empty());
     press(&mut a, "h");
     assert_eq!(a.state().selected.as_deref(), Some("npm-48201"));
+}
+
+#[test]
+fn the_command_palette_finds_a_command_by_name_and_runs_it() {
+    let mut a = design();
+    press(&mut a, "3");
+    let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+    a.on_key(ctrl('p'));
+    assert!(matches!(a.mode, Mode::Palette(_)));
+    let all = a.commands("").len();
+    press(&mut a, "reap");
+    assert!(a.commands("reap").len() < all);
+    let text = screen(&render(&a, 80, 24));
+    assert!(
+        text.contains("Reap leftovers") && text.contains('X'),
+        "{text}"
+    );
+    press(&mut a, "\n");
+    assert!(matches!(&a.mode, Mode::Sheet(s) if s.kind == SheetKind::Reap));
+    // : opens it too, and esc closes it without running anything.
+    press(&mut a, "\x1b:quit\x1b");
+    assert_eq!(a.mode, Mode::Normal);
+    // Only what applies here is offered.
+    press(&mut a, "1");
+    assert!(a.commands("treemap").is_empty());
+    press(&mut a, "4");
+    assert_eq!(a.commands("treemap").len(), 1);
+}
+
+#[test]
+fn the_mouse_picks_views_and_rows() {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let click = |column, row| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let mut a = design();
+    let b = render(&a, 120, 40);
+    let (x, y) = find(b.buffer(), "Agents").unwrap();
+    assert_eq!(a.on_mouse(click(x + 1, y)), Action::Redraw);
+    assert_eq!(a.tab, Tab::Agents);
+    let b = render(&a, 120, 40);
+    let (x, y) = find(b.buffer(), "chrome --headless").unwrap();
+    a.on_mouse(click(x, y));
+    assert_eq!(a.state().selected.as_deref(), Some("chrome-48311"));
+    // A second click opens it.
+    a.on_mouse(click(x, y));
+    assert!(matches!(a.mode, Mode::Detail(_)));
+    // The wheel scrolls the detail, then moves the selection in the list.
+    let wheel = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        ..click(0, 0)
+    };
+    assert_eq!(a.on_mouse(wheel), Action::Redraw);
+    press(&mut a, "\x1b");
+    a.on_mouse(wheel);
+    assert_ne!(a.state().selected.as_deref(), Some("chrome-48311"));
 }
 
 #[test]
@@ -337,28 +408,31 @@ fn a_sheet_waits_for_enter_and_esc_sends_nothing() {
 
 #[test]
 fn sort_cycles_the_columns_on_screen_then_returns_to_the_natural_order() {
-    // At 80 columns Agents hides PID, so s goes from SESSION straight to RAM.
     let mut a = design();
     press(&mut a, "3");
     render(&a, 80, 24);
     press(&mut a, "s");
     assert_eq!(sort(&a), Some((0, false)));
     press(&mut a, "s");
-    assert_eq!(sort(&a), Some((2, true)));
-    press(&mut a, "sssss");
+    assert_eq!(sort(&a), Some((1, true)));
+    press(&mut a, "ssss");
     assert_eq!(sort(&a), None);
 
-    // From 96 columns of list PID is on screen and takes its turn.
+    // From a list 96 columns wide Ports shows the address, which takes its turn.
     let mut a = design();
-    press(&mut a, "3");
-    render(&a, 150, 40);
+    press(&mut a, "2");
+    render(&a, 220, 50);
     press(&mut a, "ss");
-    assert_eq!(sort(&a), Some((1, true)));
-    // Narrowed so PID is hidden again, the list falls back to its natural order: no order
-    // without an arrow.
+    assert_eq!(sort(&a), Some((1, false)));
+    // Narrowed so the address is hidden again, the list falls back to its natural order:
+    // no order that the screen does not name.
     render(&a, 80, 24);
     assert_eq!(a.sort(), None);
-    assert!(lines(&render(&a, 80, 24)).iter().all(|l| !l.contains('↓')));
+    assert!(
+        lines(&render(&a, 80, 24))
+            .iter()
+            .all(|l| !l.contains(" by "))
+    );
 
     // Ports hides ADDR below 96.
     let mut a = design();
@@ -369,22 +443,20 @@ fn sort_cycles_the_columns_on_screen_then_returns_to_the_natural_order() {
 }
 
 #[test]
-fn the_sort_arrow_never_clips_a_title() {
+fn the_section_title_names_what_orders_the_list() {
     let mut a = design();
     press(&mut a, "3");
     render(&a, 80, 24);
-    // AGE, then EVIDENCE.
     press(&mut a, "ssss");
-    assert_eq!(sort(&a).map(|s| s.0), Some(4));
-    assert!(screen(&render(&a, 80, 24)).contains("AGE ↓"));
+    assert_eq!(sort(&a).map(|s| s.0), Some(3));
+    assert!(screen(&render(&a, 80, 24)).contains("by age ↓"));
     press(&mut a, "s");
-    assert_eq!(sort(&a).map(|s| s.0), Some(5));
-    assert!(screen(&render(&a, 80, 24)).contains("EVIDENCE ↑"));
+    assert!(screen(&render(&a, 80, 24)).contains("by state ↑"));
 
     let mut a = design();
     render(&a, 80, 24);
     press(&mut a, "s");
-    assert!(screen(&render(&a, 80, 24)).contains("SIZE ↓"));
+    assert!(screen(&render(&a, 80, 24)).contains("by size ↓"));
 }
 
 #[test]
@@ -476,9 +548,9 @@ fn the_filter_matches_within_one_column_and_highlights_it() {
         assert_eq!(b.buffer()[(x + dx, y)].fg, matched.unwrap());
     }
     // A match in another column is highlighted there.
-    press(&mut a, "\x1b/guess");
+    press(&mut a, "\x1b2/billing");
     let b = render(&a, 80, 24);
-    let (x, y) = find(b.buffer(), "guess").unwrap();
+    let (x, y) = find(b.buffer(), "billing").unwrap();
     assert_eq!(b.buffer()[(x, y)].fg, matched.unwrap());
 }
 
@@ -497,10 +569,10 @@ fn folding_waits_until_the_filter_is_cleared() {
     let mut a = design();
     press(&mut a, "3/codex\n");
     assert_eq!(a.state().selected.as_deref(), Some("s-c0de"));
-    press(&mut a, "\n");
+    press(&mut a, " ");
     assert!(a.state().folded.is_empty(), "no hidden fold");
     assert!(a.toast.as_ref().unwrap().text.starts_with("Folding is off"));
-    press(&mut a, "\x1b\n");
+    press(&mut a, "\x1b ");
     assert!(a.state().folded.contains("s-c0de"));
 }
 
@@ -516,46 +588,56 @@ fn the_footer_offers_only_keys_that_work_here() {
     let mut a = design();
     press(&mut a, "3");
     let agents = lines(&render(&a, 80, 24)).pop().unwrap();
-    for present in ["move", "fold", "reap", "keep", "filter", "refresh", "quit"] {
+    for present in [
+        "move", "details", "stop", "reap", "refresh", "commands", "quit",
+    ] {
         assert!(agents.contains(present), "{agents}");
     }
-    // Sort gives way at 80 columns; it is on the help card, and back when there is room.
+    // The view's later keys give way at 80 columns; they are in the palette and on the
+    // help card, and back when there is room.
     assert!(!agents.contains("sort"), "{agents}");
     let wide = lines(&render(&a, 120, 40)).pop().unwrap();
-    assert!(wide.contains("s sort"), "{wide}");
+    for present in ["space fold", "K keep", "/ filter", "s sort"] {
+        assert!(wide.contains(present), "{wide}");
+    }
 }
 
 #[test]
-fn the_selected_row_has_a_cursor_and_a_tint() {
+fn the_selected_row_has_a_tint_and_its_state_in_the_gutter() {
     let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
     press(&mut a, "3jj");
     let b = render(&a, 80, 24);
     let (x, y) = find(b.buffer(), "next dev").unwrap();
-    assert_eq!(b.buffer()[(0, y)].symbol(), "▌");
-    assert_eq!(b.buffer()[(0, y)].fg, a.theme.accent.fg.unwrap());
+    assert_eq!(b.buffer()[(1, y)].symbol(), "▲");
+    assert_eq!(b.buffer()[(1, y)].fg, a.theme.warn.fg.unwrap());
     assert_eq!(b.buffer()[(x, y)].bg, a.theme.selection.bg.unwrap());
+    // Rows without a state of their own get a faint dot.
+    let (_, y) = find(b.buffer(), "node mcp-server-memory").unwrap();
+    assert_eq!(b.buffer()[(1, y)].symbol(), "·");
 }
 
 #[test]
 fn a_fold_count_is_muted_not_faint() {
     let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
-    press(&mut a, "3\n");
+    press(&mut a, "3 ");
     let b = render(&a, 80, 24);
     let (x, y) = find(b.buffer(), "+4").unwrap();
     assert_eq!(b.buffer()[(x, y)].fg, a.theme.muted.fg.unwrap());
 }
 
 #[test]
-fn the_pane_moves_beside_the_list_only_when_the_list_keeps_96_columns() {
+fn the_pane_moves_beside_the_list_from_100_columns() {
     let a = design();
-    render(&a, 120, 40);
-    assert_eq!(a.list_width.get(), 120);
-    render(&a, 149, 40);
-    assert_eq!(a.list_width.get(), 149);
-    render(&a, 150, 40);
-    assert!(a.list_width.get() >= 96);
+    render(&a, 99, 40);
+    assert_eq!(a.list_width.get(), 97, "under it, the list takes the width");
+    render(&a, 100, 40);
+    assert_eq!(
+        a.list_width.get(),
+        100 - 40 - 1 - 4,
+        "a pane of 40 beside it"
+    );
     render(&a, 220, 50);
-    assert!(a.list_width.get() >= 96);
+    assert_eq!(a.list_width.get(), 220 - 60 - 1 - 4, "the pane stops at 60");
 }
 
 #[test]
@@ -567,11 +649,11 @@ fn the_ansi_rule_keeps_a_blank_column_after_the_list() {
     );
     press(&mut a, "3");
     let b = render(&a, 150, 40);
-    let list = a.list_width.get();
+    let bar = 2 + a.list_width.get() + 2;
     let buf = b.buffer();
-    for y in 5..20 {
-        assert_eq!(buf[(list, y)].symbol(), " ", "row {y}:\n{}", screen(&b));
-        assert_eq!(buf[(list + 1, y)].symbol(), "│");
+    for y in 3..20 {
+        assert_eq!(buf[(bar - 1, y)].symbol(), " ", "row {y}:\n{}", screen(&b));
+        assert_eq!(buf[(bar, y)].symbol(), "│");
     }
 }
 
@@ -668,7 +750,7 @@ fn header_x(b: &TestBackend, title: &str) -> u16 {
 }
 
 #[test]
-fn column_titles_hold_still_while_a_filter_hides_their_numbers() {
+fn columns_hold_still_while_a_filter_hides_their_numbers() {
     let mut a = design();
     press(&mut a, "3");
     let all = render(&a, 80, 24);
@@ -676,8 +758,8 @@ fn column_titles_hold_still_while_a_filter_hides_their_numbers() {
     press(&mut a, "/uvx");
     let few = render(&a, 80, 24);
     assert!(!screen(&few).contains(":3000"), "{}", screen(&few));
-    for title in ["RAM", "PORT", "AGE", "STATE"] {
-        assert_eq!(header_x(&all, title), header_x(&few, title), "{title}");
+    for number in ["38M", "41m"] {
+        assert_eq!(header_x(&all, number), header_x(&few, number), "{number}");
     }
 }
 
@@ -685,43 +767,42 @@ fn column_titles_hold_still_while_a_filter_hides_their_numbers() {
 fn text_columns_take_their_content_and_leave_the_spare_width_at_the_right() {
     let mut a = design();
     press(&mut a, "3");
-    for w in [120, 149] {
+    for w in [99, 160] {
         let b = render(&a, w, 40);
         let (name, y) = find(b.buffer(), "node mcp-server-github").unwrap();
-        let (pid, _) = find_from(b.buffer(), "48190", y).unwrap();
-        let gap = pid - (name + "node mcp-server-github".len() as u16);
-        assert!(gap <= 4, "{gap} columns between name and pid at {w}");
-        let header = &lines(&b)[3];
-        assert!(
-            header.trim_end().len() < w as usize - 30,
-            "the table ends well before the edge at {w}:\n{header}"
-        );
+        let (ram, _) = find_from(b.buffer(), "218M", y).unwrap();
+        let gap = ram - (name + "node mcp-server-github".len() as u16);
+        // The longest name's extra, two gaps, the empty port column, and RAM's one blank.
+        assert!(gap <= 13, "{gap} columns between name and RAM at {w}");
+        if w < 100 {
+            let row = &lines(&b)[y as usize];
+            assert!(
+                row.trim_end().len() < w as usize - 30,
+                "the list ends well before the edge at {w}:\n{row}"
+            );
+        }
     }
 }
 
 #[test]
-fn the_detail_sits_under_the_list_and_the_footer_off_its_band() {
+fn the_detail_sits_under_a_narrow_list_after_a_rule() {
     let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
     press(&mut a, "3jj");
-    let b = render(&a, 120, 40);
-    let buf = b.buffer();
-    let surface = a.theme.surface.bg.unwrap();
-    let (_, last) = find(buf, "python3 -m http.server").unwrap();
-    assert_eq!(
-        buf[(5, last + 1)].bg,
-        surface,
-        "the pane follows the last row"
+    let b = render(&a, 99, 40);
+    let rows = lines(&b);
+    let (_, last) = find(b.buffer(), "python3 -m http.server").unwrap();
+    assert!(
+        rows[last as usize + 1].chars().all(|c| c == '─'),
+        "a rule follows the last row:\n{}",
+        screen(&b)
     );
+    let title = &rows[last as usize + 2];
+    assert!(title.trim() == "next dev", "{title}");
+    assert!(rows[last as usize + 3].contains("leftover"), "the chips");
     assert!(screen(&b).contains(":3000 is held by next dev"));
-    // Sized to the tallest detail in the view, then plain background down to the footer.
-    let pane = (last + 1..40)
-        .take_while(|&y| buf[(5, y)].bg == surface)
-        .count();
-    assert!((3..=7).contains(&pane), "pane is {pane} rows");
-    for y in last + 1 + pane as u16..40 {
-        assert_ne!(buf[(5, y)].bg, surface, "row {y} is off the band");
-    }
-    assert!(lines(&b)[39].contains("quit"));
+    // Then plain background down to the footer.
+    assert!(rows[37].trim().is_empty(), "{}", screen(&b));
+    assert!(rows[39].contains("quit"));
 }
 
 #[test]
@@ -751,7 +832,6 @@ fn the_help_card_is_raised_with_a_plain_margin() {
     let b = render(&a, 80, 24);
     let buf = b.buffer();
     let raised = a.theme.raised.bg.unwrap();
-    assert_ne!(Some(raised), a.theme.surface.bg);
     let (x, y) = find(buf, "Keys").unwrap();
     // Three columns of padding inside the card, then two of plain background outside it.
     assert_eq!(buf[(x - 3, y)].bg, raised);
@@ -759,7 +839,7 @@ fn the_help_card_is_raised_with_a_plain_margin() {
         assert_eq!(buf[(x - dx, y)].bg, Color::Reset);
     }
     // The longest line keeps its padding before the right edge.
-    let text = "fold and unfold; h goes to the parent";
+    let text = "fold, unfold; h goes to the parent";
     let (lx, ly) = find(buf, text).unwrap();
     let end = lx + text.len() as u16;
     for dx in 0..3 {
@@ -775,10 +855,11 @@ fn a_sheet_never_leaves_a_lone_list_row_above_it() {
         press(&mut a, "3X");
         let b = render(&a, 150, 40);
         let (_, title) = find(b.buffer(), "Reap ").unwrap();
-        // Below the tab bar and above the sheet's gap row and top padding.
-        let above = lines(&b)[3..(title - 2).max(3) as usize]
+        // Below the list's title and above the sheet's gap row and top padding; the pane's
+        // rule runs down every row.
+        let above = lines(&b)[4..(title - 2).max(4) as usize]
             .iter()
-            .filter(|l| !l.trim().is_empty())
+            .filter(|l| !l.replace('│', "").trim().is_empty())
             .count();
         assert!(
             above == 0 || above >= 3,
@@ -811,7 +892,7 @@ fn a_long_ansi_sheet_has_one_rule_above_it() {
         .iter()
         .filter(|l| l.chars().all(|c| c == '─'))
         .count();
-    assert_eq!(rules, 2, "the top and bottom rules only");
+    assert_eq!(rules, 1, "the rule under the header only");
 }
 
 #[test]
@@ -819,8 +900,8 @@ fn state_sorts_by_what_it_asks_of_you() {
     let mut a = design();
     press(&mut a, "3");
     render(&a, 120, 40);
-    press(&mut a, "sssssss");
-    assert_eq!(sort(&a), Some((6, false)));
+    press(&mut a, "sssss");
+    assert_eq!(sort(&a), Some((4, false)));
     let Load::Ready(rows) = a.rows() else {
         unreachable!("the design fixture has agents")
     };
@@ -899,7 +980,7 @@ fn first_run_states_say_what_would_fill_each_view() {
     b.board.worktrees = Load::Loading;
     insta::assert_snapshot!("worktrees_loading", render(&b, 80, 24));
 
-    // Without the recorder there is no history, and the band says how to start it.
+    // Without the recorder there is no history, and the line under the volume says how to start it.
     if let Load::Ready(list) = &mut a.board.disk {
         list.forecast = Some(Forecast::NoSamples);
     }
@@ -912,16 +993,47 @@ fn first_run_states_say_what_would_fill_each_view() {
     assert!(screen(&render(&a, 80, 24)).contains("No process on this Mac is accepting"));
 }
 
+/// Disk as a list, whose rows `j` and `k` walk in rank order.
 fn disk() -> App {
     let mut a = design();
-    press(&mut a, "4");
+    press(&mut a, "4v");
+    assert!(!a.disk_map);
     a
+}
+
+#[test]
+fn disk_opens_as_a_treemap_whose_tiles_arrows_move_between() {
+    let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
+    press(&mut a, "4");
+    assert!(a.disk_map);
+    insta::assert_snapshot!("design_disk_treemap_120x40", render(&a, 120, 40));
+    let text = screen(&render(&a, 120, 40));
+    assert!(text.contains("╱╱ cleanable"), "{text}");
+    // Docker.raw is the largest tile and comes first; to its right is DerivedData.
+    assert_eq!(a.selected_row().unwrap().id, "docker-raw");
+    press(&mut a, "l");
+    assert_eq!(a.selected_row().unwrap().id, "xcode-derived-data");
+    press(&mut a, "h");
+    assert_eq!(a.selected_row().unwrap().id, "docker-raw");
+    // The selected tile is drawn in its kind's full hue.
+    let b = render(&a, 120, 40);
+    let (_, legend) = find(b.buffer(), "╱╱ cleanable").unwrap();
+    let (x, y) = find_from(b.buffer(), "Docker.raw", legend).unwrap();
+    let tile = a.theme.tile(scry_core::disk::catalog::Kind::Docker, true);
+    assert_eq!(b.buffer()[(x, y)].bg, tile.name.bg.unwrap());
+    // v shows the list, and back.
+    press(&mut a, "v");
+    assert!(!a.disk_map);
+    assert!(!screen(&render(&a, 120, 40)).contains("╱╱ cleanable"));
+    press(&mut a, "v");
+    assert!(a.disk_map);
 }
 
 #[test]
 fn disk_shows_free_space_the_forecast_and_what_each_item_frees() {
     let mut a = disk();
     insta::assert_snapshot!("design_disk_80x24", render(&a, 80, 24));
+    assert!(screen(&render(&a, 80, 24)).contains("WHAT FILLS THE DISK"));
     press(&mut a, "j");
     insta::assert_snapshot!("design_disk_120x40", render(&a, 120, 40));
     let text = screen(&render(&a, 120, 40));
@@ -1135,7 +1247,7 @@ fn disk_has_loading_failed_and_first_run_states() {
         text.contains("Nothing in the catalog takes space here."),
         "{text}"
     );
-    assert!(text.contains("available of"), "the band stays: {text}");
+    assert!(text.contains("available of"), "the volume stays: {text}");
 }
 
 /// The header row, wide enough for the design board's pulse and the spinner's words.

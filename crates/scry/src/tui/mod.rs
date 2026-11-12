@@ -620,6 +620,11 @@ fn event_loop(
                 Some(l) => keys.extend(l.feed(key, Instant::now())),
                 None => keys.push_back(key),
             },
+            Event::Mouse(m) => {
+                if app.on_mouse(m) != Action::None {
+                    dirty = true;
+                }
+            }
             Event::Resize(..) => dirty = true,
             _ => {}
         }

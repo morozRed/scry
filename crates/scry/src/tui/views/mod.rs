@@ -7,6 +7,8 @@ mod overview;
 mod ports;
 mod worktrees;
 
+pub use disk::cleanable as disk_cleanable;
+
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
@@ -43,7 +45,7 @@ pub fn empty_is_clear(view: &ViewDef) -> bool {
     view.tab != Tab::Agents
 }
 
-/// How a band's text is inked.
+/// How a line of text above a list is inked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ink {
     Text,
@@ -53,12 +55,9 @@ pub enum Ink {
     Tone(Tone),
 }
 
-/// Lines a view shows above its list: Disk's free space and forecast.
-pub fn band(view: &ViewDef, board: &Board) -> Option<Vec<Vec<(String, Ink)>>> {
-    match view.tab {
-        Tab::Disk => disk::band(board),
-        _ => None,
-    }
+/// Disk's lines under its volume bar: space, then forecast, Trash and cleanup.
+pub fn disk_lines(board: &Board) -> Option<[Vec<(String, Ink)>; 2]> {
+    disk::lines(board)
 }
 
 /// The disk item a row stands for, which `t` cleans up: the row itself on Disk, and the
@@ -77,6 +76,14 @@ pub fn disk_item<'a>(tab: Tab, board: &'a Board, row: &str) -> Option<&'a DiskIt
 
 pub struct ViewDef {
     pub tab: Tab,
+    /// The list's name, over it in capitals.
+    pub title: &'static str,
+    /// Beside the title: how much of the list asks for something, when anything does.
+    pub note: fn(&Board) -> Option<String>,
+    /// The detail pane's heading over the row's sentence.
+    pub about: &'static str,
+    /// A section the detail pane adds beside the list, such as Disk's ranking.
+    pub bars: Option<fn(&Board) -> Option<Bars>>,
     pub columns: &'static [Column],
     /// The rows in their natural order. A tree is flattened depth first.
     pub rows: fn(&Board) -> Load<Vec<Row>>,
@@ -88,6 +95,14 @@ pub struct ViewDef {
     pub hints: &'static [(&'static str, &'static str)],
     /// What `X` would act on.
     pub reap: Option<fn(&Board) -> Vec<Target>>,
+}
+
+/// A ranking drawn as bars in the detail pane.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bars {
+    pub title: String,
+    pub note: String,
+    pub rows: Vec<(String, u64, Kind)>,
 }
 
 pub struct Column {
@@ -140,14 +155,23 @@ impl Column {
         self.sortable = false;
         self
     }
+
+    /// Never on screen: the state that only the gutter shows.
+    pub const fn hidden(mut self) -> Column {
+        self.min_list_width = u16::MAX;
+        self.sortable = false;
+        self
+    }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
     pub id: String,
     pub depth: u8,
     pub cells: Vec<Cell>,
     pub detail: Option<Detail>,
+    /// Shown as filled chips under the detail pane's title, after the state.
+    pub chips: Vec<Chip>,
     /// What `x` would stop.
     pub target: Option<Target>,
     /// Where `enter` goes, for rows that stand for something in another view.
@@ -168,6 +192,7 @@ impl Row {
         self.id == other.id
             && self.depth == other.depth
             && self.detail == other.detail
+            && self.chips == other.chips
             && self.cells.len() == other.cells.len()
             && self
                 .cells
@@ -175,6 +200,13 @@ impl Row {
                 .zip(&other.cells)
                 .all(|(a, b)| a.text == b.text && a.context == b.context && a.kind == b.kind)
     }
+}
+
+/// A chip in the detail pane.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Chip {
+    Tone(String, Tone),
+    Kind(String, Kind),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,7 +299,8 @@ pub struct Sort {
     pub descending: bool,
 }
 
-/// A row as the list shows it: with its tree glyphs and the characters the filter matched.
+/// A row as the list shows it: with its fold marker and indent, and the characters the
+/// filter matched.
 #[derive(Debug)]
 pub struct Shown<'a> {
     pub row: &'a Row,
@@ -299,7 +332,7 @@ pub struct Query<'a> {
 }
 
 /// Sorts siblings, applies the filter (keeping a match's ancestors and descendants so the
-/// tree still reads), folds collapsed rows, and draws the tree glyphs.
+/// tree still reads), folds collapsed rows, and indents children under their parent.
 pub fn shown<'a>(rows: &'a [Row], q: &Query) -> Vec<Shown<'a>> {
     let tree = rows.iter().any(|r| r.depth > 0);
     let order = sorted(rows, q.sort);
@@ -353,7 +386,11 @@ pub fn shown<'a>(rows: &'a [Row], q: &Query) -> Vec<Shown<'a>> {
         });
     }
     if tree {
-        draw_guides(&mut out);
+        for s in &mut out {
+            if s.row.depth > 0 {
+                s.prefix = format!("{}{}", "  ".repeat(s.row.depth as usize), s.prefix);
+            }
+        }
     } else {
         out.iter_mut().for_each(|s| s.prefix.clear());
     }
@@ -419,35 +456,6 @@ fn within_matches(rows: &[&Row], hit: &[bool]) -> Vec<bool> {
     keep
 }
 
-fn draw_guides(out: &mut [Shown]) {
-    let depths: Vec<u8> = out.iter().map(|s| s.row.depth).collect();
-    let mut open: Vec<bool> = Vec::new();
-    for i in 0..out.len() {
-        let d = depths[i] as usize;
-        if d == 0 {
-            open.clear();
-            continue;
-        }
-        let last = depths[i + 1..]
-            .iter()
-            .find(|&&n| n as usize <= d)
-            .is_none_or(|&n| (n as usize) < d);
-        let mut prefix = String::from("  ");
-        for k in 1..d {
-            prefix.push_str(if open.get(k).copied().unwrap_or(false) {
-                "│ "
-            } else {
-                "  "
-            });
-        }
-        prefix.push_str(if last { "└ " } else { "├ " });
-        prefix.push_str(&out[i].prefix);
-        out[i].prefix = prefix;
-        open.resize(d + 1, false);
-        open[d] = !last;
-    }
-}
-
 /// Indices in display order: siblings sorted by the column, each subtree kept under its
 /// parent.
 fn sorted(rows: &[Row], sort: Option<Sort>) -> Vec<usize> {
@@ -509,9 +517,7 @@ mod tests {
             id: id.into(),
             depth,
             cells: vec![Cell::text(id), Cell::num(ram.to_string(), ram)],
-            detail: None,
-            target: None,
-            jump: None,
+            ..Row::default()
         }
     }
 
@@ -543,18 +549,18 @@ mod tests {
     }
 
     #[test]
-    fn guides_follow_depth_and_last_sibling() {
+    fn children_indent_under_their_parent() {
         let rows = tree();
         let out = shown(&rows, &query(None, "", &HashSet::new()));
         assert_eq!(
             lines(&out),
             [
                 "▾ claude",
-                "  ├ npm",
-                "  │ └ next",
-                "  └ chrome",
+                "  npm",
+                "    next",
+                "  chrome",
                 "▾ codex",
-                "  └ vite"
+                "  vite"
             ]
         );
     }
@@ -564,7 +570,7 @@ mod tests {
         let rows = tree();
         let folded = HashSet::from(["claude".to_string()]);
         let out = shown(&rows, &query(None, "", &folded));
-        assert_eq!(lines(&out), ["▸ claude", "▾ codex", "  └ vite"]);
+        assert_eq!(lines(&out), ["▸ claude", "▾ codex", "  vite"]);
         assert_eq!(out[0].folded, 3);
     }
 
@@ -573,7 +579,7 @@ mod tests {
         let rows = tree();
         let folded = HashSet::from(["claude".to_string()]);
         let out = shown(&rows, &query(None, "nxt", &folded));
-        assert_eq!(lines(&out), ["▾ claude", "  └ npm", "    └ next"]);
+        assert_eq!(lines(&out), ["▾ claude", "  npm", "    next"]);
         assert_eq!(out[2].hits[0].text, [0, 2, 3]);
         assert_eq!(
             out.iter().map(|s| s.matched).collect::<Vec<_>>(),
@@ -619,11 +625,11 @@ mod tests {
             lines(&out),
             [
                 "▾ codex",
-                "  └ vite",
+                "  vite",
                 "▾ claude",
-                "  ├ chrome",
-                "  └ npm",
-                "    └ next"
+                "  chrome",
+                "  npm",
+                "    next"
             ]
         );
     }

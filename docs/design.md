@@ -10,13 +10,16 @@ pages comes from a real machine.
 
 ## The comparison
 
-Three looks, the same fixture, the Agents view (the densest one), in a light and a dark
-terminal at 80×24, the smallest size Scry supports.
+Two things were chosen this way: the palette, and the layout.
+
+The palette: the same fixture, the Agents view (the densest one), in a light and a dark
+terminal at 80×24, the smallest size Scry supports. A and B are both still drawn by the code,
+in today's layout; C was a layout and a palette together.
 
 | | Light | Dark |
 |---|---|---|
-| **A. Native**: the 16 ANSI colours only, reverse-video selection, thin rules | ![](screens/compare/native-light-80x24.svg) | ![](screens/compare/native-dark-80x24.svg) |
-| **B. Tinted**: fixed hues per light and dark, neutrals mixed from the terminal's own colours, tinted bands instead of rules | ![](screens/compare/tinted-light-80x24.svg) | ![](screens/compare/tinted-dark-80x24.svg) |
+| **A. Native**: the 16 ANSI colours only, reverse-video selection | ![](screens/compare/native-light-80x24.svg) | ![](screens/compare/native-dark-80x24.svg) |
+| **B. Tinted**: fixed hues per light and dark, neutrals mixed from the terminal's own colours | ![](screens/compare/tinted-light-80x24.svg) | ![](screens/compare/tinted-dark-80x24.svg) |
 | **C. Panels**: rounded boxes around list and detail, states as filled pills, ANSI colours | ![](screens/compare/panels-light-80x24.svg) | ![](screens/compare/panels-dark-80x24.svg) |
 
 The same at 120×40, and with the reap sheet open:
@@ -35,18 +38,56 @@ The light terminal is macOS Terminal's default profile, "Basic". The dark one is
 Night, a common dark palette. Basic is what a new Mac gives you, which is the point: an ANSI
 look is only as good as the palette it lands in.
 
-## The pick: B, Tinted
+## The layout: D, Split
+
+The first release drew a header band with the pulse, a tab bar, a table with column titles,
+a cursor bar (`▌`) and tree guides, and the detail on a tinted band under the list, beside
+it only from 150 columns. Its pictures are at commit `ee8318b`.
+
+D replaced it, modelled on [ghui](https://github.com/kitlangton/ghui)'s list and detail, and
+for Disk on [disktree](https://github.com/tobi/disktree)'s treemap:
+
+- **One header line and a rule.** `SCRY`, the views by name with their counts, the pulse on
+  the right. The Overview shows the pulse as gauges instead.
+- **Lists without column titles.** The list's name is the section title (`AGENT SESSIONS`,
+  in the warn hue), with a note of what asks for something and, when sorted, what orders it
+  (`by ram ↓`). Each row reads as a sentence: the state as a glyph in a gutter, the name,
+  then numbers to the right and the state word last. Children are indented, without guides.
+  Agents dropped its PID and evidence columns; both are in the pane.
+- **The detail beside the list from 100 columns** (40 to 60 wide), behind a thin rule: the
+  title in bold, the state and facts as filled chips, then sections set apart by rules: why
+  the row is there, its details, the evidence, and on Disk what is worth cleaning. Under 100
+  columns it sits under the list with the title, the chips and the sentence. `enter` opens it
+  over the whole body, scrolled with `j k`.
+- **The Overview opens with gauges**: CPU with its recent samples, memory pressure as three
+  steps with the swap in use, the free disk with the volume as a bar and the forecast, and
+  from 110 columns how many processes agent sessions started.
+- **Disk opens as a treemap**: the volume as a bar, then every item sized by what it takes,
+  coloured by kind and hatched (`╱`) where Scry can clean it up. The arrows move between
+  tiles by where they are on screen; `v` shows the ranked list instead.
+- **Navigation from ghui**: `ctrl-p` or `:` opens a palette of every command that applies
+  here, found by typing; the mouse picks views, rows and tiles, a second click opens the
+  detail, and the wheel scrolls.
+
+D keeps B's palette and every contrast rule below. At 80×24 the Agents list shows 14 rows
+where the old layout showed 12: the tab bar, the column titles and the rule above the footer
+are gone, and the pane under the list keeps to its sentence.
+
+![Agents at 120×40, dark](screens/agents-dark-120x40.svg)
+![Disk at 150×40, dark](screens/disk-dark-150x40.svg)
+
+## The palette: B, Tinted
 
 **Light mode decided it.** In Terminal's Basic palette, ANSI yellow is `#999900` on white.
 That is the colour of "leftover", the word Scry most needs you to read. Native's reverse-video
 selection turns the selected row into a black bar and recolours the state word inside it.
 Tinted's hues keep a contrast of 5:1 or more on white, Solarized light and dark, black,
 Tomorrow Night and One Dark backgrounds, against 3:1 for that yellow. Its selection is a tint
-of at least 1.3:1 against the background with an accent bar (`▌`) at its left, and every hue
-keeps 3.7:1 or more on the tint, so the state colours stay readable on the selected row.
+of at least 1.3:1 against the background, and every hue keeps 3.7:1 or more on the tint, so
+the state colours stay readable on the selected row.
 
-**In dark mode A and B are close.** Tinted is calmer: bands instead of rules, and a softer
-selection.
+**In dark mode A and B are close.** Tinted is calmer: a softer selection, and greys that
+match the terminal.
 
 **Tinted still follows the terminal.** Scry asks the terminal for its foreground and
 background (OSC 10 and 11), then for its device attributes (DA1), only where the answer is
@@ -70,13 +111,15 @@ terminal whose theme is the other way round from the guess, a light profile in d
 say, gets greys tuned for the wrong side; `SCRY_COLOR_QUERY=1` puts that right in a terminal
 that answers.
 
-The neutrals (text, muted, faint, rules, bands, raised surfaces) are mixed from the two
+The neutrals (text, muted, faint, rules, raised surfaces) are mixed from the two
 colours, so a Solarized or a pure black terminal gets matching greys. Each is then pushed
 further from the background until it reaches its minimum contrast on the background, the
-bands, the overlays and the selection: 6:1 for text, 4.5:1 for muted labels, 3:1 for faint
-marks. The accent and the four state hues are fixed, one set for light backgrounds and one
-for dark. The selection is the background mixed with that accent until it stands 1.3:1
-apart.
+overlays and the selection: 6:1 for text, 4.5:1 for muted labels, 3:1 for faint marks. The
+accent and the four state hues are fixed, one set for light backgrounds and one for dark.
+The selection is the background mixed with that accent until it stands 1.3:1 apart. A
+chip's text is the terminal's background on the hue, and each of the eight disk kinds has
+its own pair of hues; both keep 4.5:1 in every theme above, and so does a tile's label on
+its bar, whose hue is held back until it does.
 
 ![Solarized light, a low-contrast theme](screens/agents-solarized-light-80x24.svg)
 
@@ -129,14 +172,20 @@ agents Scry recognises and the hook that makes attribution exact.
 |---|---|
 | ![](screens/first-run-overview-light.svg) | ![](screens/first-run-agents-dark.svg) |
 
-From 150 columns the detail pane moves beside the list, which keeps 96 columns:
+From 100 columns the detail pane is beside the list; at 150:
 [agents light](screens/agents-light-150x40.svg),
 [agents dark](screens/agents-dark-150x40.svg),
 [ports light](screens/ports-light-150x40.svg),
 [ports dark](screens/ports-dark-150x40.svg),
+[overview dark](screens/overview-dark-150x40.svg),
 [ANSI dark](screens/ansi-dark-150x40.svg).
 
-![Agents at 150×40, dark](screens/agents-dark-150x40.svg)
+Disk as a list ([light](screens/disk-list-light-120x40.svg),
+[dark](screens/disk-list-dark-120x40.svg)), the detail opened with `enter`
+([light](screens/detail-light.svg), [dark](screens/detail-dark.svg)), and the command
+palette ([light](screens/palette-light.svg), [dark](screens/palette-dark.svg)):
+
+![The command palette, dark](screens/palette-dark.svg)
 
 States and overlays, each in [light](screens/state-loading-light.svg) and dark:
 
@@ -166,18 +215,20 @@ Components ask the theme for a role, never for a colour. A look is one construct
 
 | Token | Used for |
 |---|---|
-| `text`, `strong` | Body text; titles, session names and command names |
-| `muted` | Labels, context, evidence words, fold counts, the fixture name or refresh spinner, the sparkline |
-| `faint` | Tree guides, separators and whatever an overlay covers: nothing you need to read |
-| `accent` | The name, the sort arrow |
-| `heading` | Column titles |
-| `ok`, `info`, `warn`, `danger` | State glyphs and words |
-| `selection`, `cursor` | The selected row's tint, and the bar left of it |
-| `surface` | Bands behind the header and the detail pane |
-| `raised` | The sheet and the help card, a step further from the background than the bands |
+| `text`, `strong` | Body text; the name, the pane's title, command names |
+| `muted` | Labels, context, notes, fold counts, the fixture name or refresh spinner, the sparkline |
+| `faint` | Dots in the gutter, separators, the used part of the volume and whatever an overlay covers |
+| `accent` | The open view, a session's name, the palette's prompt |
+| `heading` | Gauge labels, the overlays' column titles |
+| `title` | A list's name and each section of the pane, in the warn hue, bold |
+| `ok`, `info`, `warn`, `danger` | State glyphs and words, gauges and the volume bar |
+| `selection` | The selected row's tint |
+| `chip(tone)`, `kind_chip(kind)` | Filled chips in the pane: a hue behind the terminal's background colour; reverse video without truecolor |
+| `kind(kind)`, `tile(kind, selected)` | A disk kind's swatch, and a treemap tile's label bar, fill and hatch |
+| `raised` | The sheets, the help card, the palette and quiet chips, a step from the background |
 | `border` | Rules, and the edges of overlays in the ANSI look |
-| `key`, `matched`, `tab_active` | Keys in hints, filter hits (the accent, underlined), the open tab |
-| `chrome` | `Rules` (Native) or `Bands` (Tinted) |
+| `key`, `matched` | Keys in hints, filter hits (the accent, underlined) |
+| `chrome` | How overlays are edged: lines (Native) or their fill (Tinted) |
 | `motion` | The background, foreground and glow colours fades run between; truecolor only |
 
 ### State is a glyph and a word
@@ -197,25 +248,37 @@ the glyph, so nothing depends on colour alone.
 
 All in `crates/scry/src/tui/kit/`:
 
-- `chrome`: the header (the name, then a slot for the pulse strip that drops segments from
-  the right when space runs out), the tab bar with attention counts, the footer, rules. The
-  footer sits on the plain background, under the detail band rather than in it. Its left
-  side shows the filter while it is typed, else a toast, else the filter that is applied,
-  and then the keys that do something on this view as it is, three columns apart, or two
-  when that keeps the last one on screen.
-- `table`: a flattened tree as a table. Columns align across depths; the first column
-  carries the tree glyphs (`▾ ▸ ├ └ │`) and a fold count, and any cell shows the characters
-  the filter matched. Numbers align right, cut text ends in `…`, and columns hide below a set
-  width. Text columns are as wide as their longest cell, up to 48 columns, and the spare width
-  stays at the right, so a name sits next to its numbers. Widths and number alignment come
-  from every row of the view, so a filter or a fold never moves a column. Every sortable
-  column keeps room for ` ↓` or ` ↑` after its title, so the arrow never cuts it. Widths count
-  display columns and cuts fall between graphemes, so CJK, accents and emoji line up. The list
-  never stays scrolled past rows that would fit.
-- `detail`: the selected row in one sentence, then the evidence. Under 150 columns it sits
-  right under the list with facts on the title line, as tall as the tallest detail in the
-  view (at most 7 rows, 5 on a short screen), so it keeps its height while the cursor moves.
-  From 150 it is beside the list, with one fact per line.
+- `chrome`: the header line (`SCRY`, the views with their counts, and on the right the
+  pulse, which drops segments from the right when space runs out, then the activity), rules,
+  the section title over a list, and the footer. The footer's left side shows the filter
+  while it is typed, else a toast, else the filter that is applied, and then the keys that do
+  something on this view as it is. When they do not fit, the view's later keys give way
+  first; refresh, commands, help and quit stay.
+- `table`: a flattened tree as a list without column titles. The state is a glyph in a
+  two-column gutter (`·` for a row with none), a parent's name is in the accent with `▾ ▸`
+  and a fold count, children are indented, and any cell shows the characters the filter
+  matched. Numbers align right, cut text ends in `…`, and columns hide below a set width.
+  Text columns are as wide as their longest cell, up to 48 columns, and the spare width stays
+  at the right, so a name sits next to its numbers. Widths and number alignment come from
+  every row of the view, so a filter or a fold never moves a column. Widths count display
+  columns and cuts fall between graphemes, so CJK, accents and emoji line up. The list keeps
+  the cursor in view and never stays scrolled past rows that would fit.
+- `detail`: the pane. Beside the list, or over the whole body after `enter`: the title, the
+  chips (the state, then what the view adds: evidence and pid, a disk item's kind, cleanup
+  and what it frees), and sections under full-width rules: the sentence, the details, the
+  evidence, and on Disk a ranking of what is worth cleaning with a bar in each kind's hue.
+  An arrow at its edge says there is more above or below. Under a list narrower than 100
+  columns: the title, the chips and the sentence, right under the last row behind a rule,
+  at most 6 rows (4 on a short screen).
+- `gauges`: the Overview's CPU, memory, disk and agent gauges, each a label, a figure three
+  rows tall in half blocks, a graph two rows tall and a caption, side by side with rules
+  between.
+- `treemap`: the volume as a bar two rows tall (used, purgeable, free) with the space and the
+  forecast under it; the legend of kinds; and the items as a squarified treemap laid out on
+  doubled rows, so tiles look square on screen. Each tile has a label bar with the name and
+  its size, a tinted fill, and a hatch where Scry can clean it up; the selected one is drawn
+  in its kind's full hue. Moving between tiles works as a browser moves focus: the tiles
+  lined up with the selected one first, then the nearest edge, then the least offset.
 - `overlay`: the confirmation sheet, which rises from the bottom and lists every target with
   pid, age, command, session, evidence and the memory it frees; and the help card. Both sit
   on the `raised` surface, and what they cover fades to the faint ink. In the tinted look the
@@ -223,12 +286,9 @@ All in `crates/scry/src/tui/kit/`:
   outside it; the help card keeps a margin of plain background around it. When the targets do
   not fit, the sheet scrolls with `j k`, its last line says how many are above and below, and
   the title and total stay in view. It keeps its place through a resize. A sheet that would
-  leave fewer than four rows of the list above it covers the whole body. Only the command
-  name in each row is bold.
-- `band`, in `chrome`: lines above a view's list, indented to its text. Disk shows free
-  space (Finder's "available", then purgeable space and local snapshots) on one line and
-  the forecast, the Trash and how much cleanup could free on the next. The forecast is a
-  glyph and a word like every state: ▲ "full in ~19 days", ● "not filling".
+  leave fewer than three rows of the list above it covers the whole body. Only the command
+  name in each row is bold. The command palette sits near the top: what was typed, then the
+  commands that match with their keys.
 - The cleanup sheet, in `overlay`: rises like the stop sheet and names the action, the
   folder as the list shows it, its size and at least what it frees, and for a worktree its
   repo. A delete waits for the item's name to be typed into the sheet; enter does nothing
@@ -246,11 +306,18 @@ The keys mean different things in each mode, so the mode is one value, not a set
 
 | Mode | Keys |
 |---|---|
-| Normal | `j k ↑ ↓ g G` move, `⏎` fold a session or go to its row, `h l` fold and unfold (`h` on a process goes to its parent), `1-5 tab` views, `/` filter, `esc` clear the filter, `s S` sort, `x` stop, `X` reap, `t` clean up (Disk and Worktrees), `r` refresh, `?` help, `q` quit |
+| Normal | `j k ↑ ↓ g G` move, `⏎` details (on the Overview, go to the row), `space` fold a session, `h l` fold and unfold (`h` on a process goes to its parent), `1-5 tab` views, `/` filter, `esc` clear the filter, `s S` sort, `x` stop, `X` reap, `K` keep, `t` clean up (Disk and Worktrees), `v` treemap or list (Disk), `ctrl-p :` commands, `r` refresh, `?` help, `q` quit. On Disk's treemap `h j k l` and the arrows move by tile |
+| Detail | `j k ↑ ↓ g G` and `ctrl-d ctrl-u` scroll, `esc ⏎ q` back to the list; every other key acts as in Normal, on the same row |
+| Palette | type to find, `↑ ↓` or `ctrl-n ctrl-p` move, `⏎` run, `esc` close |
 | Filter | type to filter, `⏎` keep, `esc` clear, `↑ ↓` move |
 | Sheet | `⏎` confirm, `j k` scroll, `esc` cancel |
 | Clean | `⏎` or `y` confirm, `esc` cancel; for a delete, type the name, then `⏎` |
 | Help | `esc ? q` close |
+
+The mouse works in Normal, Filter and Detail: a click picks a view, a row or a tile, a click
+on the picked one opens it as `⏎` would, and the wheel moves the selection, or scrolls the
+detail or a sheet. Mouse reporting holds the terminal's own selection; hold `shift` (in
+iTerm2 and Ghostty, `option` in Terminal) to select text.
 
 Only `q` and ctrl-c quit, so one `esc` too many never closes Scry. In the filter, alt chords
 are ignored rather than typed. SIGTERM and SIGINT put the terminal back and exit with 128 plus
@@ -261,11 +328,12 @@ its restore until the exit, so no mode change can undo the restore.
 The filter is fuzzy with smart case. Each word of it matches inside one column on screen, so
 letters scattered across a row never make a match, and the matched characters are
 highlighted where they are. The selection moves to the first row that matches, not to a
-session kept above it for context. Folds are off while a filter is applied, and `⏎` says so
-rather than changing a fold you cannot see.
+session kept above it for context. Folds are off while a filter is applied, and `space`
+says so rather than changing a fold you cannot see.
 
-`s` walks the columns on screen only. When a resize hides the sorted column, the list goes
-back to its natural order until the column returns. STATE sorts by what it asks of you:
+`s` walks the columns on screen only, and the section title names the one in effect. When a
+resize hides the sorted column, the list goes back to its natural order until the column
+returns. STATE sorts by what it asks of you:
 full, then leftover, stale and filling, then kept, the quiet states and live last. Rows
 without a value come last whichever way a column sorts.
 
@@ -332,17 +400,19 @@ values:
 - `Detail`: title, facts, one sentence, evidence lines. Evidence states facts, never what to
   press. `Target`: what an action would touch.
 
-On the TUI side, a view turns its model into `Row`s (id, depth, cells, detail, stop target,
-jump target). Each view keeps a `ViewState`: the selected row id, filter text, sort and the
+On the TUI side, a view turns its model into `Row`s (id, depth, cells, detail, chips, stop
+target, jump target). Each view keeps a `ViewState`: the selected row id, filter text, sort and the
 set of folded rows.
 
 ## Adding or filling a view
 
-Each view is one file in `crates/scry/src/tui/views/` that fills a `ViewDef`: its columns, a
-function from `Board` to rows, its empty text, its tab badge, its key hints and what `X`
-reaps. `views/mod.rs` lists them in `VIEWS`, one line each; all five are registered already.
-A view's model lives in `scry-core/src/view/` with a field on `Board`; `views::band` and
-`views::empty` name the views with a band or an empty text that only the board knows.
+Each view is one file in `crates/scry/src/tui/views/` that fills a `ViewDef`: its title and
+note, the pane's heading and ranking, its columns, a function from `Board` to rows, its empty
+text, its tab badge, its key hints and what `X` reaps. `views/mod.rs` lists them in `VIEWS`,
+one line each; all five are registered already. A view's model lives in
+`scry-core/src/view/` with a field on `Board`; `views::disk_lines` and `views::empty` name
+the views with lines or an empty text that only the board knows. The palette's commands are
+one table in `app.rs`, `COMMANDS`, each with the key it presses and when it applies.
 
 ## Rerunning the pictures and the numbers
 

@@ -6,14 +6,18 @@ use super::{Cell, Column, Row, ViewDef};
 
 pub const VIEW: ViewDef = ViewDef {
     tab: Tab::Ports,
+    title: "LISTENING PORTS",
+    note,
+    about: "Why",
+    bars: None,
     columns: &[
-        Column::fixed("PORT", 6),
-        Column::fixed("ADDR", 9).from(96),
-        Column::fill("PROCESS", 12),
-        Column::fill("PROJECT", 10),
-        Column::fill("SESSION", 12).from(76),
-        Column::fixed("AGE", 4),
-        Column::fixed("STATE", 10),
+        Column::fixed("port", 6),
+        Column::fixed("address", 9).from(96),
+        Column::fill("process", 12),
+        Column::fill("project", 10),
+        Column::fill("session", 12).from(76),
+        Column::fixed("age", 4),
+        Column::fixed("state", 8),
     ],
     rows,
     empty: (
@@ -47,11 +51,19 @@ fn rows(board: &Board) -> Load<Vec<Row>> {
                     ],
                     detail: Some(p.detail()),
                     target: p.stop_target(),
-                    jump: None,
+                    ..Row::default()
                 }
             })
             .collect()
     })
+}
+
+fn note(board: &Board) -> Option<String> {
+    match badge(board) {
+        0 => None,
+        1 => Some("1 leftover".into()),
+        n => Some(format!("{n} leftovers")),
+    }
 }
 
 fn badge(board: &Board) -> usize {

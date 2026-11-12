@@ -1,13 +1,16 @@
 //! The UI model and its update: what is on screen, which mode the keys are in, and how
 //! each key changes it. Nothing here draws.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use scry_core::disk::catalog::Kind;
 use scry_core::disk::clean::{Allows, Plan};
 use scry_core::engine::Labels;
@@ -16,6 +19,8 @@ use scry_core::paths::Paths;
 use scry_core::reap::Report;
 use scry_core::view::{Board, Load, Tab, Target, Tone};
 
+use super::filter::Fuzzy;
+use super::kit::treemap::{self, Dir};
 use super::theme::Theme;
 use super::ui::MIN_W;
 use super::views::{self, Query, Row, Shown, Sort};
@@ -82,6 +87,167 @@ pub enum Mode {
     /// A cleanup waiting for its confirmation; a delete waits for its name to be typed.
     Clean(Box<CleanSheet>),
     Help,
+    /// The selected row's detail over the whole body, scrolled this far. The view's own
+    /// keys still act on the row.
+    Detail(Cell<usize>),
+    /// Every command for this view, found by typing.
+    Palette(Box<Palette>),
+}
+
+/// The command palette: what was typed, and which match is selected.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Palette {
+    pub query: String,
+    pub cursor: usize,
+}
+
+/// One entry of the palette. Running it presses `key` in the list.
+pub struct Command {
+    pub label: &'static str,
+    pub keys: &'static str,
+    pub key: KeyCode,
+    pub when: fn(&App) -> bool,
+}
+
+fn always(_: &App) -> bool {
+    true
+}
+
+pub static COMMANDS: [Command; 21] = [
+    Command {
+        label: "Show details",
+        keys: "⏎",
+        key: KeyCode::Enter,
+        when: |a| a.tab != Tab::Overview && a.selected_row().is_some(),
+    },
+    Command {
+        label: "Go to this item",
+        keys: "⏎",
+        key: KeyCode::Enter,
+        when: |a| a.selected_row().is_some_and(|r| r.jump.is_some()),
+    },
+    Command {
+        label: "Fold or unfold the session",
+        keys: "space",
+        key: KeyCode::Char(' '),
+        when: |a| a.tab == Tab::Agents,
+    },
+    Command {
+        label: "Stop the selected process",
+        keys: "x",
+        key: KeyCode::Char('x'),
+        when: |a| a.selected_row().is_some_and(|r| r.target.is_some()),
+    },
+    Command {
+        label: "Reap leftovers",
+        keys: "X",
+        key: KeyCode::Char('X'),
+        when: |a| views::view(a.tab).reap.is_some(),
+    },
+    Command {
+        label: "Keep the selected process",
+        keys: "K",
+        key: KeyCode::Char('K'),
+        when: |a| a.selected_row().is_some_and(|r| r.target.is_some()),
+    },
+    Command {
+        label: "Clean up the selected item",
+        keys: "t",
+        key: KeyCode::Char('t'),
+        when: |a| matches!(a.tab, Tab::Disk | Tab::Worktrees),
+    },
+    Command {
+        label: "Switch between treemap and list",
+        keys: "v",
+        key: KeyCode::Char('v'),
+        when: |a| a.tab == Tab::Disk,
+    },
+    Command {
+        label: "Filter",
+        keys: "/",
+        key: KeyCode::Char('/'),
+        when: always,
+    },
+    Command {
+        label: "Sort by the next column",
+        keys: "s",
+        key: KeyCode::Char('s'),
+        when: |a| !a.disk_map_on(),
+    },
+    Command {
+        label: "Reverse the sort",
+        keys: "S",
+        key: KeyCode::Char('S'),
+        when: |a| a.sort().is_some(),
+    },
+    Command {
+        label: "Go to Overview",
+        keys: "1",
+        key: KeyCode::Char('1'),
+        when: always,
+    },
+    Command {
+        label: "Go to Ports",
+        keys: "2",
+        key: KeyCode::Char('2'),
+        when: always,
+    },
+    Command {
+        label: "Go to Agents",
+        keys: "3",
+        key: KeyCode::Char('3'),
+        when: always,
+    },
+    Command {
+        label: "Go to Disk",
+        keys: "4",
+        key: KeyCode::Char('4'),
+        when: always,
+    },
+    Command {
+        label: "Go to Worktrees",
+        keys: "5",
+        key: KeyCode::Char('5'),
+        when: always,
+    },
+    Command {
+        label: "Go to the first row",
+        keys: "g",
+        key: KeyCode::Char('g'),
+        when: always,
+    },
+    Command {
+        label: "Go to the last row",
+        keys: "G",
+        key: KeyCode::Char('G'),
+        when: always,
+    },
+    Command {
+        label: "Refresh now",
+        keys: "r",
+        key: KeyCode::Char('r'),
+        when: always,
+    },
+    Command {
+        label: "Show every key",
+        keys: "?",
+        key: KeyCode::Char('?'),
+        when: always,
+    },
+    Command {
+        label: "Quit",
+        keys: "q",
+        key: KeyCode::Char('q'),
+        when: always,
+    },
+];
+
+/// Where the last frame put what the mouse can click.
+#[derive(Clone, Debug, Default)]
+pub struct Hits {
+    pub tabs: Vec<(Tab, Rect)>,
+    pub rows: Vec<(String, Rect)>,
+    pub tiles: Vec<(String, Rect)>,
 }
 
 /// What a cleanup will touch, as its confirmation shows it.
@@ -233,6 +399,10 @@ pub struct App {
     /// Says which agent that writes into a disk item is running, if one is; asked as a
     /// cleanup's sheet opens. Nothing for a fixture.
     pub writer: fn(&str) -> Option<String>,
+    /// Disk shows its items as a treemap; `v` switches to the list and back.
+    pub disk_map: bool,
+    /// What the last frame drew where, for the mouse and for moving between tiles.
+    pub hits: RefCell<Hits>,
 }
 
 impl App {
@@ -251,7 +421,29 @@ impl App {
             acting: None,
             stubborn: None,
             writer: |_| None,
+            disk_map: true,
+            hits: RefCell::default(),
         }
+    }
+
+    /// Disk is showing the treemap.
+    pub fn disk_map_on(&self) -> bool {
+        self.tab == Tab::Disk && self.disk_map
+    }
+
+    /// The palette's matches for what was typed: those that contain it first, each group in
+    /// the table's order.
+    pub fn commands(&self, query: &str) -> Vec<&'static Command> {
+        let mut fuzzy = Fuzzy::new(query);
+        let mut found: Vec<&'static Command> = COMMANDS
+            .iter()
+            .filter(|c| (c.when)(self))
+            .filter(|c| fuzzy.as_mut().is_none_or(|f| f.row(&[c.label]).is_some()))
+            .collect();
+        // What was typed as it stands comes first; scattered letters after.
+        let typed = query.trim().to_lowercase();
+        found.sort_by_key(|c| !c.label.to_lowercase().contains(&typed));
+        found
     }
 
     pub fn state(&self) -> &ViewState {
@@ -444,11 +636,18 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             let page = |app: &mut App, by: isize| match app.mode {
                 Mode::Sheet(_) => app.scroll_sheet(by),
+                Mode::Detail(_) => app.scroll_detail(by),
                 _ => app.step(by),
             };
             return match key.code {
                 KeyCode::Char('c') => Action::Quit,
                 KeyCode::Char('z') => Action::Suspend,
+                KeyCode::Char('p') => match self.mode {
+                    Mode::Palette(_) => self.palette_step(-1),
+                    Mode::Normal | Mode::Detail(_) => self.open_palette(),
+                    _ => Action::None,
+                },
+                KeyCode::Char('n') if matches!(self.mode, Mode::Palette(_)) => self.palette_step(1),
                 KeyCode::Char('u') if self.mode == Mode::Filter => {
                     self.state_mut().filter.clear();
                     self.follow_filter()
@@ -471,6 +670,154 @@ impl App {
                 }
                 _ => Action::None,
             },
+            Mode::Detail(_) => self.on_detail(key.code),
+            Mode::Palette(_) => self.on_palette(key.code),
+        }
+    }
+
+    /// The expanded detail scrolls with the movement keys and closes with esc or enter;
+    /// every other key does what it does in the list, for the same row.
+    fn on_detail(&mut self, code: KeyCode) -> Action {
+        match code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Backspace | KeyCode::Char('q') => {
+                self.enter(Mode::Normal)
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_detail(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_detail(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_detail(PAGE),
+            KeyCode::PageUp => self.scroll_detail(-PAGE),
+            KeyCode::Char('g') | KeyCode::Home => self.scroll_detail(isize::MIN / 2),
+            KeyCode::Char('G') | KeyCode::End => self.scroll_detail(isize::MAX / 2),
+            other => {
+                let tab = self.tab;
+                let action = self.on_normal(other);
+                if self.tab != tab {
+                    self.mode = Mode::Normal;
+                }
+                action
+            }
+        }
+    }
+
+    fn scroll_detail(&mut self, by: isize) -> Action {
+        let Mode::Detail(scroll) = &self.mode else {
+            return Action::None;
+        };
+        scroll.set(scroll.get().saturating_add_signed(by));
+        Action::Redraw
+    }
+
+    fn open_palette(&mut self) -> Action {
+        self.enter(Mode::Palette(Box::default()))
+    }
+
+    fn palette_step(&mut self, by: isize) -> Action {
+        let Mode::Palette(p) = &self.mode else {
+            return Action::None;
+        };
+        let n = self.commands(&p.query).len();
+        let Mode::Palette(p) = &mut self.mode else {
+            return Action::None;
+        };
+        if n > 0 {
+            p.cursor = (p.cursor as isize + by).rem_euclid(n as isize) as usize;
+        }
+        Action::Redraw
+    }
+
+    fn on_palette(&mut self, code: KeyCode) -> Action {
+        let Mode::Palette(p) = &mut self.mode else {
+            return Action::None;
+        };
+        match code {
+            KeyCode::Esc => self.enter(Mode::Normal),
+            KeyCode::Up => self.palette_step(-1),
+            KeyCode::Down | KeyCode::Tab => self.palette_step(1),
+            KeyCode::Backspace => {
+                p.query.pop();
+                p.cursor = 0;
+                Action::Redraw
+            }
+            KeyCode::Char(c) => {
+                p.query.push(c);
+                p.cursor = 0;
+                Action::Redraw
+            }
+            KeyCode::Enter => {
+                let (query, cursor) = (p.query.clone(), p.cursor);
+                let picked = self.commands(&query).get(cursor).map(|c| c.key);
+                self.mode = Mode::Normal;
+                match picked {
+                    Some(key) => self.on_normal(key),
+                    None => Action::Redraw,
+                }
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The wheel moves the selection, or scrolls what is open; a click picks a view, a row
+    /// or a tile, and a click on the row already picked opens it as enter would.
+    pub fn on_mouse(&mut self, m: MouseEvent) -> Action {
+        let at = Position::new(m.column, m.row);
+        let by = match m.kind {
+            MouseEventKind::ScrollDown => 1,
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::Down(MouseButton::Left) => 0,
+            _ => return Action::None,
+        };
+        match (&self.mode, by) {
+            (Mode::Detail(_), 0) => return Action::None,
+            (Mode::Detail(_), by) => return self.scroll_detail(by * 3),
+            (Mode::Sheet(_), 0) => return Action::None,
+            (Mode::Sheet(_), by) => return self.scroll_sheet(by),
+            (Mode::Palette(_), by) if by != 0 => return self.palette_step(by),
+            (Mode::Normal | Mode::Filter, by) if by != 0 => {
+                return if self.disk_map_on() {
+                    Action::None
+                } else {
+                    self.step(by)
+                };
+            }
+            (Mode::Normal | Mode::Filter, _) => {}
+            _ => return Action::None,
+        }
+        let hits = self.hits.borrow().clone();
+        if let Some((tab, _)) = hits.tabs.iter().find(|(_, r)| r.contains(at)) {
+            self.mode = Mode::Normal;
+            return self.go(*tab);
+        }
+        let picked = hits
+            .rows
+            .iter()
+            .chain(&hits.tiles)
+            .find(|(_, r)| r.contains(at))
+            .map(|(id, _)| id.clone());
+        let Some(id) = picked else {
+            return Action::None;
+        };
+        if self.mode == Mode::Filter {
+            self.mode = Mode::Normal;
+        }
+        if self.selected_row().is_some_and(|r| r.id == id) {
+            return self.on_normal(KeyCode::Enter);
+        }
+        self.state_mut().selected = Some(id);
+        Action::Redraw
+    }
+
+    /// Moves to the tile next to the selected one on screen.
+    fn move_tile(&mut self, dir: Dir) -> Action {
+        let Some(row) = self.selected_row() else {
+            return Action::None;
+        };
+        let next = treemap::neighbour(&self.hits.borrow().tiles, &row.id, dir);
+        match next {
+            Some(id) => {
+                self.state_mut().selected = Some(id);
+                Action::Redraw
+            }
+            None => Action::None,
         }
     }
 
@@ -485,6 +832,15 @@ impl App {
             KeyCode::Esc => Action::None,
             KeyCode::Char('?') => self.enter(Mode::Help),
             KeyCode::Char('/') => self.enter(Mode::Filter),
+            KeyCode::Char(':') => self.open_palette(),
+            KeyCode::Char('v') if self.tab == Tab::Disk => {
+                self.disk_map = !self.disk_map;
+                Action::Redraw
+            }
+            KeyCode::Char('h') | KeyCode::Left if self.disk_map_on() => self.move_tile(Dir::Left),
+            KeyCode::Char('l') | KeyCode::Right if self.disk_map_on() => self.move_tile(Dir::Right),
+            KeyCode::Char('j') | KeyCode::Down if self.disk_map_on() => self.move_tile(Dir::Down),
+            KeyCode::Char('k') | KeyCode::Up if self.disk_map_on() => self.move_tile(Dir::Up),
             KeyCode::Char(c @ '1'..='5') => self.go(Tab::ALL[(c as u8 - b'1') as usize]),
             KeyCode::Tab => self.go(Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()]),
             KeyCode::BackTab => {
@@ -497,6 +853,7 @@ impl App {
             KeyCode::Char('g') | KeyCode::Home => self.step(isize::MIN / 2),
             KeyCode::Char('G') | KeyCode::End => self.step(isize::MAX / 2),
             KeyCode::Enter => self.open(),
+            KeyCode::Char(' ') => self.toggle_fold(),
             KeyCode::Char('l') | KeyCode::Right => self.fold(false),
             KeyCode::Char('h') | KeyCode::Left => self.fold(true),
             KeyCode::Char('s') => self.cycle_sort(),
@@ -828,6 +1185,9 @@ impl App {
 
     fn go(&mut self, tab: Tab) -> Action {
         self.tab = tab;
+        if matches!(self.mode, Mode::Detail(_)) {
+            self.mode = Mode::Normal;
+        }
         Action::Redraw
     }
 
@@ -846,8 +1206,8 @@ impl App {
         Action::Redraw
     }
 
-    /// Enter jumps to the row an Overview line stands for, or folds and unfolds a parent.
-    /// On a row without children it does nothing.
+    /// Enter jumps to the row an Overview line stands for, or opens the selected row's
+    /// detail over the whole body.
     fn open(&mut self) -> Action {
         let Some(row) = self.selected_row() else {
             return Action::None;
@@ -861,6 +1221,17 @@ impl App {
             }
             return Action::Redraw;
         }
+        if row.detail.is_none() {
+            return Action::None;
+        }
+        self.enter(Mode::Detail(Cell::new(0)))
+    }
+
+    /// Space folds and unfolds a parent. On a row without children it does nothing.
+    fn toggle_fold(&mut self) -> Action {
+        let Some(row) = self.selected_row() else {
+            return Action::None;
+        };
         let Load::Ready(rows) = self.rows() else {
             return Action::None;
         };

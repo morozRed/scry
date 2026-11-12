@@ -38,13 +38,16 @@ const BEL: u8 = 0x07;
 const ESC: u8 = 0x1b;
 /// Longest colour spec and DA1 parameter list that still count as an answer.
 const SPEC_MAX: u8 = 48;
-/// Enters the alternate screen.
-const ENTER: &[u8] = b"\x1b[?1049h";
-/// Leaves the alternate screen and shows the cursor.
-const LEAVE: &[u8] = b"\x1b[?1049l\x1b[?25h";
+/// Enters the alternate screen, then asks for clicks and the wheel (1000) in SGR form (1006).
+const ENTER: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1006h";
+/// Leaves the alternate screen, stops mouse reports and shows the cursor. Leaving comes
+/// first: a restore that cannot wait sends only what the terminal takes at once.
+const LEAVE: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1006l\x1b[?25h";
 /// How long entering or leaving the alternate screen waits for a terminal that is not
 /// reading. A terminal that reads at all takes a few bytes at once.
 const SCREEN_WAIT: Duration = Duration::from_secs(1);
+/// How long a restore on the way out waits for room to leave the alternate screen.
+const RESTORE_WAIT: Duration = Duration::from_millis(150);
 
 /// The terminal crossterm reads, and its modes before Scry changed any.
 struct Saved {
@@ -159,15 +162,17 @@ pub fn leave_alternate() {
 }
 
 /// Puts back the saved modes, then leaves the alternate screen and shows the cursor if the
-/// terminal takes those bytes at once, and exits. Nothing here waits on the terminal, so one
-/// that stopped reading or hung up cannot keep Scry from exiting. A second caller waits here
-/// until the first exits.
+/// terminal takes those bytes within `RESTORE_WAIT`, and exits. Only that short wait is
+/// spent on the terminal, so one that stopped reading cannot keep Scry from exiting, and
+/// one that hung up ends the wait at once. The wait matters when a frame being written
+/// filled the output queue just as the signal came: a reader that is still there drains it.
+/// A second caller waits here until the first exits.
 pub fn restore_and_exit(code: i32) -> ! {
     std::mem::forget(MODES.lock().unwrap_or_else(PoisonError::into_inner));
     if let Some(saved) = SAVED.get() {
         saved.put_back();
     }
-    put(LEAVE, Duration::ZERO, &|| false);
+    put(LEAVE, RESTORE_WAIT, &|| false);
     // SAFETY: _exit ends the process and runs nothing else. `process::exit` would first
     // flush Rust's stdout buffer, a write that can block on the same full queue.
     unsafe { libc::_exit(code) }
