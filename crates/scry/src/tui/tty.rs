@@ -1,5 +1,6 @@
-//! The terminal outside ratatui: the colour question at startup, answers that come after
-//! Scry stopped waiting for them, and putting the terminal back from the signal thread.
+//! The terminal outside ratatui: the modes Scry found it in and putting them back, from the
+//! signal thread too, the colour question at startup, and answers or keys that arrive after
+//! Scry stopped reading for them.
 //!
 //! Scry asks only when the environment says the terminal answers at once (see
 //! `theme::Env::may_ask`), and asks in raw mode, before the event loop reads a key, so the
@@ -7,7 +8,11 @@
 //! answers DA1, so the DA1 answer marks the end: everything before it is the answer or keys
 //! typed meanwhile, which are handed back. Only when the wait ends before DA1 can the rest
 //! of an answer still come; [`LateReply`] then picks it out of the keys for a short while.
+//! It also finishes a key whose first bytes Scry read and whose rest crossterm reads.
 
+use std::ffi::{CStr, CString};
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -22,6 +27,9 @@ const QUERY: &[u8] = b"\x1b]10;?\x07\x1b]11;?\x07\x1b[c";
 /// A terminal that answers at once does so in a few milliseconds.
 const WAIT: Duration = Duration::from_secs(1);
 const SLICE: Duration = Duration::from_millis(50);
+/// How long the rest of a key is still read after the reads stopped inside it. A terminal
+/// writes a key in one go, so the rest is normally waiting already.
+const SPLIT: Duration = Duration::from_millis(100);
 /// How long after an unfinished answer the rest of it is still picked out of the keys.
 const LATE_FOR: Duration = Duration::from_secs(2);
 /// After that, keys held as a possible answer go through once no key came for this long.
@@ -30,76 +38,119 @@ const BEL: u8 = 0x07;
 const ESC: u8 = 0x1b;
 /// Longest colour spec and DA1 parameter list that still count as an answer.
 const SPEC_MAX: u8 = 48;
+/// Leaves the alternate screen and shows the cursor.
+const LEAVE: &[u8] = b"\x1b[?1049l\x1b[?25h";
 
-struct Tty {
-    /// Scry's own open of the terminal crossterm uses, so making it non-blocking leaves the
-    /// shell's descriptor alone.
-    fd: libc::c_int,
+/// The terminal crossterm reads, and its modes before Scry changed any.
+struct Saved {
+    /// Scry's own non-blocking open of that terminal, for the colour question, so the
+    /// shell's descriptor stays blocking. `None` when it could not be opened, as for a
+    /// terminal owned by another user; stdin is then that terminal, and the modes go back
+    /// through it.
+    fd: Option<OwnedFd>,
     cooked: libc::termios,
 }
 
-static TTY: OnceLock<Tty> = OnceLock::new();
-/// Held for every change of terminal modes, and by `restore_and_exit` until the exit, so no
-/// mode change can land after the terminal was put back.
-static MODES: Mutex<()> = Mutex::new(());
+impl Saved {
+    /// Reads the modes through `fd`, or through stdin without one. `None`, with `fd`
+    /// closed, when that is not a terminal.
+    fn of(fd: Option<OwnedFd>) -> Option<Saved> {
+        let raw = fd.as_ref().map_or(libc::STDIN_FILENO, AsRawFd::as_raw_fd);
+        // SAFETY: termios is plain data, so all zeroes is a valid value for tcgetattr to fill.
+        let mut cooked: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `raw` is open, and `cooked` is a valid termios to write into.
+        if unsafe { libc::tcgetattr(raw, &mut cooked) } != 0 {
+            return None;
+        }
+        Some(Saved { fd, cooked })
+    }
 
-/// Remembers the terminal's modes before Scry changes any. Uses the terminal crossterm
-/// uses: stdin when it is one, else /dev/tty.
-pub fn save() {
-    let mut name = [0 as c_char; 128];
-    // SAFETY: isatty accepts any descriptor. ttyname_r writes at most `name.len()` bytes,
-    // NUL-terminated when it returns 0, into a buffer that lives across the call.
-    let named = unsafe {
-        libc::isatty(libc::STDIN_FILENO) == 1
-            && libc::ttyname_r(libc::STDIN_FILENO, name.as_mut_ptr(), name.len()) == 0
-    };
-    let path = if named {
-        name.as_ptr()
-    } else {
-        c"/dev/tty".as_ptr()
-    };
-    let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC;
-    // SAFETY: `path` points to a NUL-terminated string that outlives the call. The
-    // descriptor stays open for the life of the process.
-    let fd = unsafe { libc::open(path, flags) };
-    if fd < 0 {
-        return;
+    fn raw_fd(&self) -> RawFd {
+        self.fd
+            .as_ref()
+            .map_or(libc::STDIN_FILENO, AsRawFd::as_raw_fd)
     }
-    // `select` cannot watch a descriptor this high, so Scry does without one.
-    if fd >= libc::FD_SETSIZE as libc::c_int {
-        // SAFETY: `fd` was opened above and is not used again.
-        unsafe { libc::close(fd) };
-        return;
-    }
-    // SAFETY: termios is plain data, so all zeroes is a valid value for tcgetattr to fill.
-    let mut cooked: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` is open and `cooked` is a valid termios to write into.
-    if unsafe { libc::tcgetattr(fd, &mut cooked) } == 0 {
-        let _ = TTY.set(Tty { fd, cooked });
+
+    /// Sets the saved modes again. TCSANOW does not wait for output to drain.
+    fn put_back(&self) {
+        // SAFETY: the descriptor is open while `self` lives, and `self.cooked` is the
+        // termios tcgetattr filled.
+        unsafe { libc::tcsetattr(self.raw_fd(), libc::TCSANOW, &self.cooked) };
     }
 }
 
-/// Runs `f`, which changes terminal modes. Once `restore_and_exit` has started it waits
-/// for the exit instead, so it cannot undo the restore.
+static SAVED: OnceLock<Saved> = OnceLock::new();
+/// Scry's own non-blocking open of the terminal stdout is, so leaving the alternate screen
+/// from the signal thread cannot block on a terminal that stopped reading.
+static SCREEN: OnceLock<OwnedFd> = OnceLock::new();
+/// Held while raw mode goes on, and by `restore_and_exit` until the exit, so raw mode cannot
+/// come back after the terminal was put back. Only mode changes take it, never a write: a
+/// write blocks while the terminal is not reading, and the signal thread must always get
+/// the lock.
+static MODES: Mutex<()> = Mutex::new(());
+
+/// Remembers the modes of the terminal crossterm uses (stdin when it is one, else /dev/tty)
+/// before Scry changes any, and opens the terminal stdout is, for `restore_and_exit`.
+pub fn save() {
+    let input = name_of(libc::STDIN_FILENO);
+    let path = input.as_deref().unwrap_or(c"/dev/tty");
+    if let Some(saved) = Saved::of(open(path, libc::O_RDWR)) {
+        // A second save keeps the first and closes its own descriptor.
+        let _ = SAVED.set(saved);
+    }
+    if let Some(screen) = name_of(libc::STDOUT_FILENO).and_then(|name| open(&name, libc::O_WRONLY))
+    {
+        let _ = SCREEN.set(screen);
+    }
+}
+
+/// The path of the terminal `fd` is, if it is one.
+fn name_of(fd: RawFd) -> Option<CString> {
+    let mut name = [0 as c_char; 128];
+    // SAFETY: isatty accepts any descriptor. ttyname_r writes at most `name.len()` bytes,
+    // NUL-terminated when it returns 0, into a buffer that lives across the call.
+    let named =
+        unsafe { libc::isatty(fd) == 1 && libc::ttyname_r(fd, name.as_mut_ptr(), name.len()) == 0 };
+    // SAFETY: ttyname_r returned 0, so `name` holds a NUL-terminated string.
+    named.then(|| unsafe { CStr::from_ptr(name.as_ptr()) }.to_owned())
+}
+
+/// Opens the terminal at `path` non-blocking. The descriptor is owned, so it is closed on
+/// every path that does not keep it.
+fn open(path: &CStr, access: libc::c_int) -> Option<OwnedFd> {
+    let flags = access | libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    // SAFETY: `path` is NUL-terminated and outlives the call.
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    // SAFETY: open returned a new descriptor that nothing else owns.
+    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Runs `f`, which puts the terminal in raw mode. Once `restore_and_exit` has started it
+/// waits for the exit instead, so raw mode cannot come back after the restore. Leaving raw
+/// mode needs no lock: landing after the restore changes nothing.
 pub fn change<T>(f: impl FnOnce() -> T) -> T {
     let _held = MODES.lock().unwrap_or_else(PoisonError::into_inner);
     f()
 }
 
-/// Puts back the saved modes, leaves the alternate screen, shows the cursor and exits.
-/// Safe from the signal thread: plain syscalls, and on a hung-up terminal each fails at
-/// once with EIO instead of blocking. A second caller waits here until the first exits.
+/// Puts back the saved modes, then leaves the alternate screen and shows the cursor if the
+/// terminal takes those bytes at once, and exits. Nothing here waits on the terminal, so one
+/// that stopped reading or hung up cannot keep Scry from exiting. A second caller waits here
+/// until the first exits.
 pub fn restore_and_exit(code: i32) -> ! {
     std::mem::forget(MODES.lock().unwrap_or_else(PoisonError::into_inner));
-    if let Some(t) = TTY.get() {
-        // SAFETY: `t.fd` stays open for the life of the process, and `t.cooked` is the
-        // termios tcgetattr filled in `save`.
-        unsafe { libc::tcsetattr(t.fd, libc::TCSANOW, &t.cooked) };
+    if let Some(saved) = SAVED.get() {
+        saved.put_back();
     }
-    let seq = b"\x1b[?1049l\x1b[?25h";
-    // SAFETY: writes `seq.len()` bytes from a live buffer.
-    unsafe { libc::write(libc::STDOUT_FILENO, seq.as_ptr().cast(), seq.len()) };
-    std::process::exit(code)
+    if let Some(screen) = SCREEN.get() {
+        // SAFETY: writes `LEAVE.len()` bytes from a static buffer to a descriptor that stays
+        // open for the life of the process. It is non-blocking, so a full output queue
+        // fails with EAGAIN instead of waiting.
+        unsafe { libc::write(screen.as_raw_fd(), LEAVE.as_ptr().cast(), LEAVE.len()) };
+    }
+    // SAFETY: _exit ends the process and runs nothing else. `process::exit` would first
+    // flush Rust's stdout buffer, a write that can block on the same full queue.
+    unsafe { libc::_exit(code) }
 }
 
 /// What the terminal said to the colour question.
@@ -109,7 +160,8 @@ pub struct Answer {
     pub colors: Option<(Rgb, Rgb)>,
     /// Keys typed while Scry waited, in order.
     pub typed: Vec<KeyEvent>,
-    /// Set when the wait ended before the DA1 answer, so the rest may still come.
+    /// Set when the wait ended before the DA1 answer, so the rest may still come, or when
+    /// the reads stopped inside a key.
     pub late: Option<LateReply>,
 }
 
@@ -117,58 +169,72 @@ pub struct Answer {
 /// anything else reads the terminal. Stops at the DA1 answer, after `WAIT`, or once
 /// `signal` is set.
 pub fn ask(signal: &AtomicI32) -> Answer {
-    let Some(t) = TTY.get() else {
+    let Some(fd) = SAVED
+        .get()
+        .and_then(|s| s.fd.as_ref())
+        .map(AsRawFd::as_raw_fd)
+    else {
         return Answer::default();
     };
     let deadline = Instant::now() + WAIT;
     let stopped = || signal.load(Ordering::Relaxed) != 0;
-    let sent = send(t.fd, QUERY, deadline, &stopped);
-    if sent == 0 {
+    if send(fd, QUERY, deadline, &stopped) == 0 {
         return Answer::default();
     }
     let mut got = Vec::new();
-    let mut chunk = [0u8; 256];
-    let scan = loop {
-        let scan = Scan::of(&got);
-        let left = deadline.saturating_duration_since(Instant::now());
-        if scan.done || left.is_zero() || stopped() {
-            break scan;
-        }
-        match ready(t.fd, Dir::Read, left.min(SLICE)) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(e) if retry(e.kind()) => continue,
-            Err(_) => break scan,
-        }
-        // SAFETY: reads at most `chunk.len()` bytes into a live buffer.
-        let n = unsafe { libc::read(t.fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-        match n {
-            n if n > 0 => got.extend_from_slice(&chunk[..n as usize]),
-            0 => break Scan::of(&got),
-            _ if retry(std::io::Error::last_os_error().kind()) => {}
-            _ => break Scan::of(&got),
-        }
-    };
-    let late = (!scan.done).then(|| {
-        let (at, held) = scan.open.clone().unwrap_or_default();
-        LateReply::new(at, keys_of(&held), Instant::now() + LATE_FOR)
+    read_until(fd, &mut got, deadline, &stopped, |scan| scan.done);
+    // A terminal writes a key in one go, so when the reads stopped inside one its rest is
+    // on the way. It is read here because crossterm drops the rest of a character whose
+    // first byte it did not see.
+    let scan = read_until(fd, &mut got, Instant::now() + SPLIT, &stopped, |scan| {
+        scan.cut().is_empty()
     });
     Answer {
         colors: scan.bg.zip(scan.fg),
-        typed: keys_of(&scan.typed),
-        late,
+        typed: keys_of(&scan.typed).0,
+        late: LateReply::after(&scan, Instant::now()),
     }
 }
 
-fn retry(kind: std::io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-    )
+/// Reads from `fd` into `got` until its scan is `enough`, `until` passes, the terminal fails
+/// or `stopped` says so. Returns the last scan.
+fn read_until(
+    fd: RawFd,
+    got: &mut Vec<u8>,
+    until: Instant,
+    stopped: &dyn Fn() -> bool,
+    enough: impl Fn(&Scan) -> bool,
+) -> Scan {
+    let mut chunk = [0u8; 256];
+    loop {
+        let scan = Scan::of(got);
+        let left = until.saturating_duration_since(Instant::now());
+        if enough(&scan) || left.is_zero() || stopped() {
+            return scan;
+        }
+        match ready(fd, Dir::Read, left.min(SLICE)) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) if retry(e.kind()) => continue,
+            Err(_) => return scan,
+        }
+        // SAFETY: reads at most `chunk.len()` bytes into a live buffer.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        match n {
+            n if n > 0 => got.extend_from_slice(&chunk[..n as usize]),
+            0 => return scan,
+            _ if retry(io::Error::last_os_error().kind()) => {}
+            _ => return scan,
+        }
+    }
+}
+
+fn retry(kind: io::ErrorKind) -> bool {
+    matches!(kind, io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock)
 }
 
 /// Writes as much of `bytes` as the terminal takes before `deadline`. Returns how much.
-fn send(fd: libc::c_int, bytes: &[u8], deadline: Instant, stopped: &dyn Fn() -> bool) -> usize {
+fn send(fd: RawFd, bytes: &[u8], deadline: Instant, stopped: &dyn Fn() -> bool) -> usize {
     let mut sent = 0;
     while sent < bytes.len() && !stopped() {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -183,12 +249,12 @@ fn send(fd: libc::c_int, bytes: &[u8], deadline: Instant, stopped: &dyn Fn() -> 
             sent += n as usize;
             continue;
         }
-        let kind = std::io::Error::last_os_error().kind();
+        let kind = io::Error::last_os_error().kind();
         if !retry(kind) {
             break;
         }
-        if kind == std::io::ErrorKind::WouldBlock {
-            let _ = ready(fd, Dir::Write, left.min(SLICE));
+        if kind == io::ErrorKind::WouldBlock && ready(fd, Dir::Write, left.min(SLICE)).is_err() {
+            break;
         }
     }
     sent
@@ -199,24 +265,30 @@ enum Dir {
     Write,
 }
 
-/// `select`, because macOS `poll` does not work on /dev/tty.
-fn ready(fd: libc::c_int, dir: Dir, timeout: Duration) -> std::io::Result<bool> {
-    // SAFETY: fd_set is plain data, so all zeroes is a valid empty set.
-    let mut set: libc::fd_set = unsafe { std::mem::zeroed() };
-    // SAFETY: `set` is a valid fd_set, and `fd` is below FD_SETSIZE, checked in `save`.
-    unsafe { libc::FD_SET(fd, &mut set) };
-    let mut tv = libc::timeval {
-        tv_sec: timeout.as_secs() as libc::time_t,
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+/// Waits up to `timeout` for `fd`. `poll` takes a descriptor of any number. macOS answers
+/// POLLNVAL for /dev/tty itself, which Scry opens only when stdin is not a terminal, and
+/// there crossterm cannot read keys either; that is an error here.
+fn ready(fd: RawFd, dir: Dir, timeout: Duration) -> io::Result<bool> {
+    let events = match dir {
+        Dir::Read => libc::POLLIN,
+        Dir::Write => libc::POLLOUT,
     };
-    let (read, write) = match dir {
-        Dir::Read => (&raw mut set, std::ptr::null_mut()),
-        Dir::Write => (std::ptr::null_mut(), &raw mut set),
+    let mut watched = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
     };
-    // SAFETY: the sets are live or null, and `tv` lives across the call.
-    let n = unsafe { libc::select(fd + 1, read, write, std::ptr::null_mut(), &mut tv) };
+    let ms = timeout
+        .as_micros()
+        .div_ceil(1000)
+        .min(libc::c_int::MAX as u128) as libc::c_int;
+    // SAFETY: `watched` is one live pollfd for the length of the call.
+    let n = unsafe { libc::poll(&mut watched, 1, ms) };
     if n < 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
+    }
+    if watched.revents & libc::POLLNVAL != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
     Ok(n > 0)
 }
@@ -326,6 +398,16 @@ impl Scan {
             _ => self.bg = color,
         }
     }
+
+    /// The first bytes of a key the reads stopped inside: the end of what was typed, or an
+    /// answer cut at `ESC [`, which may still turn out to be a key.
+    fn cut(&self) -> &[u8] {
+        let tail = self
+            .open
+            .as_ref()
+            .map_or(self.typed.as_slice(), |(_, bytes)| bytes.as_slice());
+        &tail[keys_of(tail).1..]
+    }
 }
 
 /// Picks the rest of an answer out of the keys after Scry stopped waiting for it.
@@ -337,68 +419,113 @@ pub struct LateReply {
     /// Until when an answer may still start.
     until: Instant,
     at: Grammar,
+    /// Keys that may be part of an answer.
     held: Vec<KeyEvent>,
+    /// The first bytes of a key that Scry read before the event loop. Crossterm reads the
+    /// rest as keys of their own, which complete it here.
+    cut: Vec<u8>,
     last: Instant,
 }
 
 impl LateReply {
-    fn new(at: Grammar, held: Vec<KeyEvent>, until: Instant) -> LateReply {
-        LateReply {
+    /// What still needs picking out after a wait that ended with `scan`: the rest of an
+    /// answer when the wait ended before DA1, and the rest of a key the reads stopped
+    /// inside.
+    fn after(scan: &Scan, now: Instant) -> Option<LateReply> {
+        let cut = scan.cut().to_vec();
+        if scan.done && cut.is_empty() {
+            return None;
+        }
+        let (at, held) = match &scan.open {
+            // An answer cut at `ESC [` is the cut key too, so it stays bytes.
+            Some((at, _)) if !cut.is_empty() => (*at, Vec::new()),
+            Some((at, bytes)) => (*at, keys_of(bytes).0),
+            None => (Grammar::Ground, Vec::new()),
+        };
+        let until = if scan.done { now } else { now + LATE_FOR };
+        Some(LateReply {
             until,
             at,
             held,
-            last: Instant::now(),
-        }
+            cut,
+            last: now,
+        })
     }
 
-    /// The keys to handle now, in order: none while `key` may be part of an answer, else
-    /// any held keys that turned out not to be, then `key`.
+    /// The keys to handle now, in order: none while `key` may be part of an answer or of a
+    /// cut key, else any held keys that turned out not to be, then `key`.
     pub fn feed(&mut self, key: KeyEvent, now: Instant) -> Vec<KeyEvent> {
         self.last = now;
-        if self.at == Grammar::Ground && now >= self.until {
-            return vec![key];
-        }
-        let Some(bytes) = bytes_of(&key) else {
-            return self.release(key, now);
-        };
-        let mut at = self.at;
-        for b in bytes {
-            match at.step(b) {
-                Some(next) => at = next,
-                None => return self.release(key, now),
+        if self.at != Grammar::Ground || now < self.until {
+            let next = bytes_of(&key)
+                .and_then(|bytes| bytes.iter().try_fold(self.at, |at, &b| at.step(b)));
+            match next {
+                Some(Grammar::Ground) => {
+                    // A whole answer, which a cut key was the start of.
+                    self.at = Grammar::Ground;
+                    self.held.clear();
+                    self.cut.clear();
+                    return Vec::new();
+                }
+                Some(at) => {
+                    self.at = at;
+                    self.held.push(key);
+                    return Vec::new();
+                }
+                // Not an answer after all, and `key` may start the next one.
+                None if self.at != Grammar::Ground => {
+                    let mut out = self.release();
+                    out.extend(self.feed(key, now));
+                    return out;
+                }
+                None => {}
             }
         }
-        self.at = at;
-        if at == Grammar::Ground {
-            self.held.clear();
-        } else {
-            self.held.push(key);
-        }
-        Vec::new()
+        self.typed(key)
     }
 
-    fn release(&mut self, key: KeyEvent, now: Instant) -> Vec<KeyEvent> {
-        if self.held.is_empty() && self.at == Grammar::Ground {
+    /// Ends a possible answer, whose held keys were typed after all.
+    fn release(&mut self) -> Vec<KeyEvent> {
+        self.at = Grammar::Ground;
+        let held = std::mem::take(&mut self.held);
+        held.into_iter().flat_map(|k| self.typed(k)).collect()
+    }
+
+    /// `key` as typed. While a cut key waits for its rest, a key that continues it
+    /// completes it instead. One that does not goes through, and the cut key is dropped,
+    /// as crossterm drops a broken sequence.
+    fn typed(&mut self, key: KeyEvent) -> Vec<KeyEvent> {
+        if self.cut.is_empty() {
             return vec![key];
         }
-        let mut out = std::mem::take(&mut self.held);
-        self.at = Grammar::Ground;
-        out.extend(self.feed(key, now));
-        out
+        let mut joined = std::mem::take(&mut self.cut);
+        let Some(bytes) = bytes_of(&key) else {
+            return vec![key];
+        };
+        joined.extend(bytes);
+        match next_key(&joined) {
+            Next::Short => {
+                self.cut = joined;
+                Vec::new()
+            }
+            Next::Key(whole, n) if n == joined.len() => whole.into_iter().collect(),
+            Next::Key(..) => vec![key],
+        }
     }
 
     /// Once the window has passed and no key came for a moment: the keys still held, which
-    /// were typed after all. The guard is done then.
+    /// were typed after all. The guard is done then, and a cut key whose rest never came
+    /// is dropped with it.
     pub fn expire(&mut self, now: Instant) -> Option<Vec<KeyEvent>> {
         if now < self.until || now < self.last + LATE_QUIET {
             return None;
         }
-        self.at = Grammar::Ground;
-        Some(std::mem::take(&mut self.held))
+        Some(self.release())
     }
 }
 
-/// The bytes crossterm read to make `key`, for the keys an answer can turn into.
+/// The bytes crossterm read to make `key`, for the keys an answer or the rest of a key can
+/// turn into.
 fn bytes_of(key: &KeyEvent) -> Option<Vec<u8>> {
     let mods = key.modifiers - KeyModifiers::SHIFT;
     let mut buf = [0u8; 4];
@@ -413,40 +540,140 @@ fn bytes_of(key: &KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
-/// The keys crossterm reads from `bytes`, for what a person types while Scry waits:
-/// characters, enter, tab, backspace, esc, ctrl and alt chords and the arrow keys. Other
-/// sequences are dropped.
-fn keys_of(bytes: &[u8]) -> Vec<KeyEvent> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut chars = text.chars();
-    let mut out = Vec::new();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(key_of(c));
-            continue;
+/// One key read from the front of some bytes.
+#[derive(Debug, PartialEq)]
+enum Next {
+    /// A whole key of this many bytes. `None` for a key Scry has no use for, or for bytes
+    /// that make no key.
+    Key(Option<KeyEvent>, usize),
+    /// The start of a key whose rest has not come.
+    Short,
+}
+
+/// Reads the key at the front of `bytes` as crossterm does, for every key Scry handles:
+/// characters, enter, tab, backspace, esc, ctrl and alt chords, and the arrows, Home, End,
+/// PageUp, PageDown and BackTab with their modifiers. An ESC with nothing after it is Esc,
+/// as crossterm reads one that ends a read.
+fn next_key(bytes: &[u8]) -> Next {
+    match bytes {
+        [] => Next::Short,
+        [ESC] => Next::Key(Some(plain(KeyCode::Esc)), 1),
+        [ESC, ESC, ..] => Next::Key(Some(plain(KeyCode::Esc)), 2),
+        [ESC, b'[', rest @ ..] => csi(rest),
+        [ESC, b'O'] => Next::Short,
+        [ESC, b'O', c, ..] => Next::Key(cursor(*c).map(plain), 3),
+        [ESC, rest @ ..] => match next_key(rest) {
+            Next::Key(key, n) => Next::Key(
+                key.map(|mut k| {
+                    k.modifiers |= KeyModifiers::ALT;
+                    k
+                }),
+                n + 1,
+            ),
+            Next::Short => Next::Short,
+        },
+        [b, ..] if b.is_ascii() => Next::Key(Some(key_of(char::from(*b))), 1),
+        [lead, rest @ ..] => {
+            let len = match lead {
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf7 => 4,
+                _ => return Next::Key(None, 1),
+            };
+            let tail = &rest[..rest.len().min(len - 1)];
+            if tail.iter().any(|b| b & 0xc0 != 0x80) {
+                return Next::Key(None, 1);
+            }
+            if tail.len() < len - 1 {
+                return Next::Short;
+            }
+            let c = std::str::from_utf8(&bytes[..len])
+                .ok()
+                .and_then(|s| s.chars().next());
+            Next::Key(c.map(key_of), len)
         }
-        let key = match chars.next() {
-            None | Some('\x1b') => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-            Some('[') => {
-                let end = chars.by_ref().find(|c| ('@'..='~').contains(c));
-                let code = match end {
-                    Some('A') => KeyCode::Up,
-                    Some('B') => KeyCode::Down,
-                    Some('C') => KeyCode::Right,
-                    Some('D') => KeyCode::Left,
-                    _ => continue,
-                };
-                KeyEvent::new(code, KeyModifiers::NONE)
-            }
-            Some(c) => {
-                let mut key = key_of(c);
-                key.modifiers |= KeyModifiers::ALT;
-                key
-            }
-        };
-        out.push(key);
     }
-    out
+}
+
+/// The key of `ESC [ params final`, read from the bytes after `ESC [`.
+fn csi(rest: &[u8]) -> Next {
+    // Parameter and intermediate bytes, then one final byte.
+    let Some(end) = rest.iter().position(|b| !(0x20..=0x3f).contains(b)) else {
+        return Next::Short;
+    };
+    let last = rest[end];
+    if !(0x40..=0x7e).contains(&last) {
+        // No sequence after all: drop it up to the stray byte, which is read again.
+        return Next::Key(None, end + 2);
+    }
+    let params = std::str::from_utf8(&rest[..end]).unwrap_or_default();
+    let mut fields = params.split(';');
+    let first = fields.next().unwrap_or_default();
+    let mask = fields
+        .next()
+        .and_then(|f| f.split(':').next()?.parse::<u8>().ok());
+    let key = match last {
+        b'Z' if params.is_empty() => Some(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        b'~' => match first.parse::<u8>() {
+            Ok(1 | 7) => Some(KeyCode::Home),
+            Ok(4 | 8) => Some(KeyCode::End),
+            Ok(5) => Some(KeyCode::PageUp),
+            Ok(6) => Some(KeyCode::PageDown),
+            _ => None,
+        }
+        .map(|code| KeyEvent::new(code, modifiers(mask))),
+        // `ESC [ 5 C` carries its modifiers in its only parameter.
+        c => cursor(c).map(|code| {
+            let digit = || params.bytes().last()?.checked_sub(b'0').filter(|d| *d <= 9);
+            KeyEvent::new(code, modifiers(mask.or_else(digit)))
+        }),
+    };
+    Next::Key(key, end + 3)
+}
+
+/// The modifiers in an xterm key parameter: one plus a bit each for shift, alt, ctrl,
+/// super, hyper and meta.
+fn modifiers(mask: Option<u8>) -> KeyModifiers {
+    let bits = mask.unwrap_or(1).saturating_sub(1);
+    [
+        KeyModifiers::SHIFT,
+        KeyModifiers::ALT,
+        KeyModifiers::CONTROL,
+        KeyModifiers::SUPER,
+        KeyModifiers::HYPER,
+        KeyModifiers::META,
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(i, _)| bits & (1 << i) != 0)
+    .fold(KeyModifiers::NONE, |all, (_, m)| all | m)
+}
+
+fn cursor(c: u8) -> Option<KeyCode> {
+    Some(match c {
+        b'A' => KeyCode::Up,
+        b'B' => KeyCode::Down,
+        b'C' => KeyCode::Right,
+        b'D' => KeyCode::Left,
+        b'H' => KeyCode::Home,
+        b'F' => KeyCode::End,
+        _ => return None,
+    })
+}
+
+fn plain(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+/// The keys crossterm reads from `bytes`, and how many bytes they take. Whatever is left is
+/// the start of a key cut off at the end.
+fn keys_of(bytes: &[u8]) -> (Vec<KeyEvent>, usize) {
+    let (mut keys, mut used) = (Vec::new(), 0);
+    while let Next::Key(key, n) = next_key(&bytes[used..]) {
+        keys.extend(key);
+        used += n;
+    }
+    (keys, used)
 }
 
 fn key_of(c: char) -> KeyEvent {
@@ -502,7 +729,7 @@ mod tests {
 
     /// The keys crossterm makes of `bytes` when they arrive in one read.
     fn read(bytes: &[u8]) -> Vec<KeyEvent> {
-        keys_of(bytes)
+        keys_of(bytes).0
     }
 
     fn feed_all(late: &mut LateReply, keys: &[KeyEvent], now: Instant) -> Vec<KeyEvent> {
@@ -519,12 +746,18 @@ mod tests {
             .collect()
     }
 
-    fn guard() -> (LateReply, Instant) {
+    fn codes(keys: &[KeyEvent]) -> Vec<(KeyCode, KeyModifiers)> {
+        keys.iter().map(|k| (k.code, k.modifiers)).collect()
+    }
+
+    /// The guard after a wait that ended with `bytes`.
+    fn after(bytes: &[u8]) -> (LateReply, Instant) {
         let now = Instant::now();
-        (
-            LateReply::new(Grammar::Ground, Vec::new(), now + LATE_FOR),
-            now,
-        )
+        (LateReply::after(&Scan::of(bytes), now).unwrap(), now)
+    }
+
+    fn guard() -> (LateReply, Instant) {
+        after(b"")
     }
 
     #[test]
@@ -533,6 +766,7 @@ mod tests {
         assert_eq!(s.fg, Some(Rgb(0xc5, 0xc8, 0xc6)));
         assert_eq!(s.bg, Some(Rgb(0x1d, 0x1f, 0x21)));
         assert!(s.done && s.typed.is_empty() && s.open.is_none());
+        assert!(LateReply::after(&s, Instant::now()).is_none());
         // A terminal without the colour query answers DA1 alone.
         let s = Scan::of(DA1);
         assert!(s.done && s.fg.is_none() && s.bg.is_none());
@@ -543,11 +777,11 @@ mod tests {
         let s = Scan::of(&[b"3".as_slice(), FG, b"/x", BG, DA1, b"j\x1b"].concat());
         assert!(s.done);
         assert_eq!(s.bg, Some(Rgb(0x1d, 0x1f, 0x21)));
-        assert_eq!(chars(&keys_of(&s.typed)), "3/xj⎋");
+        assert_eq!(chars(&read(&s.typed)), "3/xj⎋");
         // An escape that starts no answer is a key too.
         let s = Scan::of(b"\x1bj\x1b]1x");
         assert_eq!(s.typed, b"\x1bj\x1b]1x");
-        assert_eq!(keys_of(b"\x1bj")[0].modifiers, KeyModifiers::ALT);
+        assert_eq!(read(b"\x1bj")[0].modifiers, KeyModifiers::ALT);
     }
 
     #[test]
@@ -557,6 +791,8 @@ mod tests {
         assert_eq!(s.fg, Some(Rgb(0xc5, 0xc8, 0xc6)));
         assert_eq!(s.open, Some((Grammar::Spec(7), BG[..12].to_vec())));
         assert!(s.typed.is_empty());
+        // The cut answer is no key cut in two, so there is nothing more to read for it.
+        assert!(s.cut().is_empty());
     }
 
     #[test]
@@ -584,10 +820,7 @@ mod tests {
 
     #[test]
     fn the_rest_of_an_answer_cut_at_the_deadline_is_swallowed() {
-        let s = Scan::of(&BG[..12]);
-        let (at, held) = s.open.unwrap();
-        let now = Instant::now();
-        let mut late = LateReply::new(at, keys_of(&held), now + LATE_FOR);
+        let (mut late, now) = after(&BG[..12]);
         assert!(feed_all(&mut late, &read(&[&BG[12..], DA1].concat()), now).is_empty());
         assert_eq!(chars(&late.feed(read(b"/")[0], now)), "/");
     }
@@ -620,23 +853,97 @@ mod tests {
 
     #[test]
     fn typed_bytes_become_the_keys_crossterm_reads() {
-        let keys = keys_of(b"a\r\t\x7f\x03G\x1b[A\x1b[1;5C\x1bx");
-        let codes: Vec<(KeyCode, KeyModifiers)> =
-            keys.iter().map(|k| (k.code, k.modifiers)).collect();
+        let typed = [
+            b"a\r\t\x7f\x03G\x1bx\x1b\x1b".as_slice(),
+            b"\x1b[A\x1b[1;5C\x1b[1;2B\x1b[1;3D\x1b[5D\x1bOA",
+            b"\x1b[H\x1b[F\x1b[1~\x1b[4~\x1b[5~\x1b[6~\x1b[6;5~\x1b[Z",
+            "é\x1bé".as_bytes(),
+            b"\x1b[15~\x1b[?62;22c\x1b[I",
+        ]
+        .concat();
+        let (keys, used) = keys_of(&typed);
+        assert_eq!(used, typed.len());
+        use KeyCode::*;
+        let (none, shift, alt, ctrl) = (
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+        );
         assert_eq!(
-            codes,
+            codes(&keys),
             [
-                (KeyCode::Char('a'), KeyModifiers::NONE),
-                (KeyCode::Enter, KeyModifiers::NONE),
-                (KeyCode::Tab, KeyModifiers::NONE),
-                (KeyCode::Backspace, KeyModifiers::NONE),
-                (KeyCode::Char('c'), KeyModifiers::CONTROL),
-                (KeyCode::Char('G'), KeyModifiers::SHIFT),
-                (KeyCode::Up, KeyModifiers::NONE),
-                (KeyCode::Right, KeyModifiers::NONE),
-                (KeyCode::Char('x'), KeyModifiers::ALT),
+                (Char('a'), none),
+                (Enter, none),
+                (Tab, none),
+                (Backspace, none),
+                (Char('c'), ctrl),
+                (Char('G'), shift),
+                (Char('x'), alt),
+                (Esc, none),
+                (Up, none),
+                (Right, ctrl),
+                (Down, shift),
+                (Left, alt),
+                (Left, ctrl),
+                (Up, none),
+                (Home, none),
+                (End, none),
+                (Home, none),
+                (End, none),
+                (PageUp, none),
+                (PageDown, none),
+                (PageDown, ctrl),
+                (BackTab, shift),
+                (Char('é'), none),
+                (Char('é'), alt),
+                // F5, a DA1 answer and focus: read whole, and dropped.
             ]
         );
+    }
+
+    #[test]
+    fn a_key_cut_at_the_end_waits_for_its_rest() {
+        for (bytes, keys, cut) in [
+            (b"j\x1b[1;5".as_slice(), "j", b"\x1b[1;5".as_slice()),
+            (b"/\xc3", "/", b"\xc3"),
+            (b"\x1b\xe2\x82", "", b"\x1b\xe2\x82"),
+            (b"\x1bO", "", b"\x1bO"),
+            // A lone ESC is Esc, as when it ends crossterm's read.
+            (b"\x1b", "⎋", b""),
+        ] {
+            let (read, used) = keys_of(bytes);
+            assert_eq!((chars(&read).as_str(), &bytes[used..]), (keys, cut));
+        }
+        // The first byte of a character never becomes U+FFFD.
+        assert_eq!(read(b"\xc3j"), read(b"j"));
+    }
+
+    #[test]
+    fn a_key_split_where_scry_stopped_reading_is_finished_by_the_keys_after_it() {
+        // BackTab cut at the 1 s deadline: `ESC [` could have been DA1, so it is held.
+        let (mut late, now) = after(b"\x1b[");
+        assert_eq!(
+            codes(&late.feed(read(b"Z")[0], now)),
+            [(KeyCode::BackTab, KeyModifiers::SHIFT)]
+        );
+        // The late answer that follows is still swallowed.
+        assert!(feed_all(&mut late, &read(&[FG, BG].concat()), now).is_empty());
+
+        // Ctrl-Right cut after DA1: crossterm reads `5C` as two characters.
+        let (mut late, now) = after(&[DA1, b"\x1b[1;"].concat());
+        let out = feed_all(&mut late, &read(b"5C"), now);
+        assert_eq!(codes(&out), [(KeyCode::Right, KeyModifiers::CONTROL)]);
+        assert_eq!(chars(&late.feed(read(b"j")[0], now)), "j");
+
+        // A key that does not continue the cut one goes through.
+        let (mut late, now) = after(&[DA1, b"\xc3"].concat());
+        assert_eq!(chars(&late.feed(read(b"j")[0], now)), "j");
+
+        // DA1 cut at `ESC [`: its rest is the answer, not keys.
+        let (mut late, now) = after(b"\x1b[");
+        assert!(feed_all(&mut late, &read(&DA1[2..]), now).is_empty());
+        assert_eq!(chars(&late.feed(read(b"q")[0], now)), "q");
     }
 
     #[test]
@@ -647,5 +954,90 @@ mod tests {
         assert_eq!(parse_color("#fdf6e3"), Some(Rgb(0xfd, 0xf6, 0xe3)));
         assert_eq!(parse_color("rgb:12345/0/0"), None);
         assert_eq!(parse_color("cmyk:0/0/0/0"), None);
+    }
+
+    /// A new pty: the terminal emulator's end, then the program's end.
+    fn pty() -> (OwnedFd, OwnedFd) {
+        let (mut ours, mut theirs) = (0, 0);
+        let none = std::ptr::null_mut();
+        // SAFETY: openpty writes two descriptors into live integers. Null name, modes and
+        // size are allowed and mean the defaults.
+        let made = unsafe { libc::openpty(&mut ours, &mut theirs, none, none.cast(), none.cast()) };
+        assert_eq!(made, 0, "openpty: {}", io::Error::last_os_error());
+        // SAFETY: openpty returned two new descriptors that nothing else owns.
+        unsafe { (OwnedFd::from_raw_fd(ours), OwnedFd::from_raw_fd(theirs)) }
+    }
+
+    /// Which file `fd` is open on, or `None` when it is closed.
+    fn identity(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t, libc::dev_t)> {
+        // SAFETY: stat is plain data, so all zeroes is a valid value for fstat to fill.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat accepts any descriptor and writes into a live stat.
+        (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev, st.st_ino, st.st_rdev))
+    }
+
+    #[test]
+    fn a_terminal_numbered_above_fd_setsize_is_kept_and_watched() {
+        let floor = libc::FD_SETSIZE as libc::c_int + 1;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit and setrlimit read and write a live rlimit.
+        unsafe {
+            libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+            if limit.rlim_cur <= floor as libc::rlim_t {
+                limit.rlim_cur = (2 * floor as libc::rlim_t).min(limit.rlim_max);
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+            }
+        }
+        let (ours, theirs) = pty();
+        // SAFETY: F_DUPFD_CLOEXEC makes a new descriptor numbered `floor` or above.
+        let high = unsafe { libc::fcntl(theirs.as_raw_fd(), libc::F_DUPFD_CLOEXEC, floor) };
+        assert!(high >= floor, "dup: {}", io::Error::last_os_error());
+        // SAFETY: fcntl returned a new descriptor that nothing else owns.
+        let high = unsafe { OwnedFd::from_raw_fd(high) };
+        let saved = Saved::of(Some(high)).expect("the modes are kept whatever the number");
+        let fd = saved.raw_fd();
+
+        assert!(!ready(fd, Dir::Read, Duration::ZERO).unwrap());
+        // A whole line, since the new terminal is in canonical mode.
+        // SAFETY: writes two bytes from a live buffer.
+        unsafe { libc::write(ours.as_raw_fd(), b"x\n".as_ptr().cast(), 2) };
+        assert!(ready(fd, Dir::Read, Duration::from_secs(1)).unwrap());
+
+        // Raw mode through the shell's descriptor, then the saved modes back through ours.
+        let mut raw = saved.cooked;
+        // SAFETY: cfmakeraw and tcsetattr take a live termios and an open descriptor.
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+            libc::tcsetattr(theirs.as_raw_fd(), libc::TCSANOW, &raw);
+        }
+        saved.put_back();
+        // SAFETY: as for `saved.cooked`, tcgetattr fills a zeroed termios.
+        let mut now: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `theirs` is open, and `now` is a valid termios to write into.
+        unsafe { libc::tcgetattr(theirs.as_raw_fd(), &mut now) };
+        assert_ne!(now.c_lflag & libc::ICANON, 0, "cooked again");
+    }
+
+    #[test]
+    fn a_terminal_that_is_not_kept_is_closed() {
+        // tcgetattr fails on a file that is not a terminal.
+        let file = OwnedFd::from(tempfile::tempfile().unwrap());
+        let fd = file.as_raw_fd();
+        let was = identity(fd);
+        assert!(Saved::of(Some(file)).is_none());
+        assert_ne!(identity(fd), was, "descriptor {fd} is still open");
+
+        // A second save keeps the first terminal and closes the one it brought.
+        let slot = OnceLock::new();
+        let (_a, first) = pty();
+        let (_b, second) = pty();
+        let fd = second.as_raw_fd();
+        let was = identity(fd);
+        assert!(slot.set(Saved::of(Some(first)).unwrap()).is_ok());
+        assert!(slot.set(Saved::of(Some(second)).unwrap()).is_err());
+        assert_ne!(identity(fd), was, "descriptor {fd} is still open");
     }
 }
