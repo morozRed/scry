@@ -144,17 +144,20 @@ impl ProcWatch {
     }
 }
 
-/// One process watched for its exit, so a signal can be bound to the process that was
-/// checked. The kernel attaches the watch to the process that holds the pid when it is
-/// made, not to the number: once that process exits the watch says so, even after the pid
-/// is given to another.
-pub struct ExitWatch {
+/// One process watched for its exit or an exec, so a signal can be bound to the process
+/// that was checked. The kernel attaches the watch to the process that holds the pid when
+/// it is made, not to the number: once that process exits the watch says so, even after
+/// the pid is given to another. An exec keeps the pid and the start time but runs another
+/// program, so the watch reports that too.
+pub struct ChangeWatch {
     kq: OwnedFd,
+    /// A notice was read already. The watch is one-shot, so it is not delivered twice.
+    seen: std::cell::Cell<bool>,
 }
 
-impl ExitWatch {
-    /// Watches `pid`. Fails with `ESRCH` when no process has it.
-    pub fn new(pid: i32) -> io::Result<ExitWatch> {
+impl ChangeWatch {
+    /// Watches `pid` for its exit or an exec. Fails with `ESRCH` when no process has it.
+    pub fn new(pid: i32) -> io::Result<ChangeWatch> {
         let fd = unsafe { libc::kqueue() };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -164,7 +167,7 @@ impl ExitWatch {
             pid as usize,
             libc::EVFILT_PROC,
             libc::EV_ADD | libc::EV_ONESHOT,
-            libc::NOTE_EXIT,
+            libc::NOTE_EXIT | libc::NOTE_EXEC,
         );
         let rc = unsafe {
             libc::kevent(
@@ -179,11 +182,18 @@ impl ExitWatch {
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(ExitWatch { kq })
+        Ok(ChangeWatch {
+            kq,
+            seen: std::cell::Cell::new(false),
+        })
     }
 
-    /// Whether the watched process has exited since the watch was made. Does not wait.
-    pub fn exited(&self) -> io::Result<bool> {
+    /// Whether the watched process has exited or exec'd since the watch was made. Does not
+    /// wait. Once it says so, it keeps saying so.
+    pub fn changed(&self) -> io::Result<bool> {
+        if self.seen.get() {
+            return Ok(true);
+        }
         let zero = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -194,6 +204,7 @@ impl ExitWatch {
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        self.seen.set(n > 0);
         Ok(n > 0)
     }
 }
@@ -254,14 +265,40 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as i32;
-        let w = ExitWatch::new(pid).unwrap();
-        assert!(!w.exited().unwrap(), "still running");
+        let w = ChangeWatch::new(pid).unwrap();
+        assert!(!w.changed().unwrap(), "still running");
         drop(child.stdin.take());
         child.wait().unwrap();
         // Reaped, so the pid is free for another process: the watch still says it exited.
-        assert!(w.exited().unwrap());
-        let gone = ExitWatch::new(pid).map(|_| ()).unwrap_err();
+        assert!(w.changed().unwrap());
+        assert!(w.changed().unwrap(), "and keeps saying so");
+        let gone = ChangeWatch::new(pid).map(|_| ()).unwrap_err();
         assert_eq!(gone.raw_os_error(), Some(libc::ESRCH));
+    }
+
+    #[test]
+    fn a_change_watch_sees_an_exec_that_keeps_the_pid() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read go; exec /bin/sleep 30"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let w = ChangeWatch::new(pid).unwrap();
+        assert!(!w.changed().unwrap(), "still the shell");
+        use std::io::Write;
+        writeln!(child.stdin.take().unwrap(), "go").unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !w.changed().unwrap() {
+            assert!(std::time::Instant::now() < until, "the exec was never seen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the pid runs on, as sleep"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

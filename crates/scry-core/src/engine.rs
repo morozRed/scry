@@ -44,6 +44,8 @@ struct Args {
     /// For an interpreter, the real path of its script, resolved against the working
     /// directory it had when the arguments were read.
     script: Option<String>,
+    /// For any other program, whether an argument names an existing file.
+    file_args: bool,
     /// The label and the listening ports it was built with. It is built again when they change.
     label: Option<(Vec<u16>, CommandLabel)>,
 }
@@ -117,22 +119,18 @@ impl Engine {
                         .as_deref()
                         .and_then(|exe| catalog::classify(exe, &read.argv))
                         .map(|r| r.role);
-                    let script = p
-                        .exe
-                        .as_deref()
-                        .filter(|exe| keep::is_runner(exe))
-                        .and_then(|_| {
-                            keep::script_of(
-                                &read.argv,
-                                p.cwd.as_deref().map(Path::new),
-                                &self.files,
-                            )
-                        });
+                    let cwd = p.cwd.as_deref().map(Path::new);
+                    let runner = p.exe.as_deref().is_some_and(keep::is_runner);
+                    let script = runner
+                        .then(|| keep::script_of(&read.argv, cwd, &self.files))
+                        .flatten();
+                    let file_args = !runner && keep::has_file_arg(&read.argv, cwd, &self.files);
                     self.args.insert(
                         p.id,
                         Args {
                             role,
                             script,
+                            file_args,
                             exe: p.exe.clone(),
                             worker: label::multiprocessing_worker(&read.argv),
                             argv: read.argv,
@@ -159,6 +157,7 @@ impl Engine {
                 p.worker = a.worker;
                 p.role = a.role;
                 p.script = a.script.clone();
+                p.file_args = a.file_args;
             }
             if let Some(cwd) = &p.cwd {
                 p.project = roots

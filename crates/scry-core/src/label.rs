@@ -651,6 +651,38 @@ impl LiveFiles {
         }
     }
 
+    /// Where `path` would be as a file that is gone: the real path of its directory joined
+    /// with its name while that directory is there, else `path` with `.` and `..` resolved
+    /// lexically. `None` when something is at that path, or it is on a volume that is not
+    /// local.
+    pub fn gone_file(&self, path: &Path) -> Option<PathBuf> {
+        if !path.is_absolute() {
+            return None;
+        }
+        let mut lexical = PathBuf::from("/");
+        for c in path.components() {
+            match c {
+                Component::Normal(n) => lexical.push(n),
+                Component::ParentDir => {
+                    lexical.pop();
+                }
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+            }
+        }
+        let name = lexical.file_name()?.to_os_string();
+        if self.remote(&lexical) {
+            return None;
+        }
+        match self.resolve(lexical.parent()?, true) {
+            Some((Kind::Dir, dir)) => {
+                let full = dir.join(name);
+                matches!(self.look(&full), Seen::Missing).then_some(full)
+            }
+            Some(_) => None,
+            None => Some(lexical),
+        }
+    }
+
     /// What `path` is after its symlinks, or only those before its last component when
     /// `follow` is false. `None` when it is missing or reaches a volume that is not local.
     fn kind(&self, path: &Path, follow: bool) -> Option<Kind> {

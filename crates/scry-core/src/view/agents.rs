@@ -619,6 +619,7 @@ mod tests {
                 tty: None,
                 role: None,
                 script: None,
+                file_args: false,
             }
         }
 

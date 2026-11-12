@@ -28,6 +28,7 @@ fn proc(pid: i32, ppid: i32, name: &str) -> Process {
         tty: None,
         role: None,
         script: None,
+        file_args: false,
     }
 }
 

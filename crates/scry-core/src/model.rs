@@ -56,6 +56,11 @@ pub struct Process {
     /// to match the keep list and never written to a snapshot or JSON.
     #[serde(skip)]
     pub script: Option<String>,
+    /// For a program that is not an interpreter, whether an argument names an existing
+    /// file, such as a config or a script it runs. Its executable alone would then keep it
+    /// whatever file it is given; see [`crate::keep::entry_for`]. Never written out.
+    #[serde(skip)]
+    pub file_args: bool,
 }
 
 /// The allowlisted agent keys from a process's environment. Every other variable is dropped

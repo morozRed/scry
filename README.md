@@ -110,17 +110,21 @@ full command line as text on request; it is never part of `--json`.
 100, not launchd, not anything that runs from `/System/`, `/usr/libexec/`,
 `/usr/sbin/` or `/sbin/`. Right before each signal, SIGKILL included, it reads the
 config and the process again, writes a row saying what it is about to send to an
-audit table in Scry's store, and checks that the pid still belongs to the process
-it chose. When the row cannot be written, nothing is sent. It exits 0 when the
+audit table in Scry's store, synced to disk, reads `destructive` once more, and
+checks that the pid still belongs to the process it chose. When the row cannot be
+written, nothing is sent. A process named by `:port` must still hold that port
+before each signal: one that lets go of it after SIGTERM gets no SIGKILL, and the
+report says why. It exits 0 when the
 process stopped, 1 when nothing was signalled and 2 when the process is still
 running. Every command exits 64 when its arguments are wrong. `destructive = false`
 in the config refuses every stop and reap, naming the line, also when it is saved
 while a confirmation waits or between two signals.
 
 The pid check is as close to the signal as macOS allows. Scry watches the process
-with kqueue before reading its start time, and asks the watch whether that process
-exited just before `kill(2)`, so a pid handed to another process meanwhile is never
-signalled. What is left is the few microseconds between that question and the
+with kqueue before it checks anything, and asks the watch whether that process
+exited or exec'd another program just before `kill(2)`, so a pid handed to another
+process meanwhile, or a process that became something else while it was judged, is
+never signalled. What is left is the few microseconds between that question and the
 signal: the process would have to exit and macOS give its pid to a new one in that
 time, which takes the pid counter going all the way round.
 
@@ -171,7 +175,8 @@ Scry reads the config and the machine again, with nothing kept from the listing:
 arguments, environment stamps and role are read afresh, so a process that exec'd
 into something else is judged as what it is now. It must still be a leftover of
 the session it was listed under, not on the keep list, not a system process, and
-still the same process by pid and start time, or it is skipped. Each gets SIGTERM
+still the same process by pid and start time, or it is skipped. After the audit row
+is written, `destructive` and the keep list are read once more. Each gets SIGTERM
 and up to 3 s to exit; the ones still running are reported, and SIGKILL follows
 only with `--kill`, or after a second confirmation in the TUI, with the same
 checks. The TUI's SIGKILL sheet lists exactly what outlived SIGTERM in the reap or
@@ -181,17 +186,21 @@ start that several share, it lists them and signals nothing. `reap` exits as
 `stop` does.
 
 `K` in the TUI and `scry keep <pid>` add a process to the keep list in the config,
-after showing the whole change, and touch nothing else in the file. A program is
-kept by its executable's path (`~/bin/tunnel`). A script run by an interpreter or
-shell (`node`, `python3`, `bash`, …) is kept by the script's real path
-(`~/acme/server.js`), since the interpreter's path would keep every script it
+after showing the whole change, and touch nothing else in the file. A program given
+no file is kept by its executable's path (`~/bin/tunnel`). A script run by an
+interpreter or shell (`node`, `python3`, `bash`, …) is kept by the script's real
+path (`~/acme/server.js`), since the interpreter's path would keep every script it
 runs; a script that lives outside the working directory, such as a tool installed
 once and run in many projects, is kept in that directory only
-(`/opt/homebrew/lib/node_modules/vite/bin/vite.js in ~/acme`). Code that is not a
-file, such as `python3 -c …` or `node -e …`, has no entry that would keep it and
-nothing else, so `K` and `scry keep` say so and write nothing: add one by hand. A
-keep entry matches a process's name, its executable's path, its script's real
-path, or that script in one directory. Keeping only ever spares processes, so it
+(`/opt/homebrew/lib/node_modules/vite/bin/vite.js in ~/acme`). The script is the
+first file argument after the interpreter's own flags and their values, so the
+module in `node -r ./preload.js server.js` is not taken for it, and a script deleted
+while it runs keeps the path it had, so its entry goes on matching. Code that is not
+a file, such as `python3 -c …` or `node -e …`, and any other program given a file,
+such as a config, have no entry that would keep them and nothing else, so `K` and
+`scry keep` say so and write nothing: add one by hand. A keep entry matches a
+process's name, its executable's path, its script's path, or that script in one
+directory. Keeping only ever spares processes, so it
 works under `destructive = false` too; like every action it is written to the audit
 table first. The config is written through a symlink to its target, with a lock
 against a second Scry, and not at all if the file changed since the change was

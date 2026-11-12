@@ -20,7 +20,7 @@ use crate::control::{self, Gate, Host, Outcome, Refusal, StopTarget};
 use crate::engine::{Engine, Labels};
 use crate::home::Home;
 use crate::live::Collector;
-use crate::model::{ProcId, Snapshot};
+use crate::model::{ProcId, Process, Snapshot};
 use crate::paths::Paths;
 use crate::store::{AuditRow, Store};
 use crate::view::Evidence;
@@ -126,22 +126,31 @@ fn children_first(snap: &Snapshot, list: &mut [Leftover]) {
 /// The check right before each signal, ahead of the audit row and the identity check.
 pub trait Judge {
     fn check(&mut self, t: &ReapTarget) -> Result<(), Refusal>;
+    /// After the audit row, right before the signal: `destructive` and, for a reap, the
+    /// keep list, read from the config once more.
+    fn confirm(&mut self, t: &ReapTarget) -> Result<(), Refusal>;
 }
 
 /// The judge for a reap: the config and the machine read afresh for each question, by an
 /// engine of its own, so no argument, stamp or role cached from the listing is used.
 pub struct LiveJudge {
     paths: Paths,
+    /// The process as the last check read it, for the keep list's last word.
+    checked: Option<Process>,
 }
 
 impl LiveJudge {
     pub fn new(paths: Paths) -> LiveJudge {
-        LiveJudge { paths }
+        LiveJudge {
+            paths,
+            checked: None,
+        }
     }
 }
 
 impl Judge for LiveJudge {
     fn check(&mut self, t: &ReapTarget) -> Result<(), Refusal> {
+        self.checked = None;
         allowed(&self.paths)?;
         // A new collector reads the keep list and grace period again, and its engine has
         // never seen the process.
@@ -150,7 +159,28 @@ impl Judge for LiveJudge {
             pid: t.id.pid,
             why: format!("the processes could not be read again: {e:#}"),
         })?;
-        verdict_of(&r.snap, &r.lineage, t.id, t.session_id.as_deref())
+        verdict_of(&r.snap, &r.lineage, t.id, t.session_id.as_deref())?;
+        self.checked = r.snap.process(t.id.pid).cloned();
+        Ok(())
+    }
+
+    fn confirm(&mut self, t: &ReapTarget) -> Result<(), Refusal> {
+        let config = allowed(&self.paths)?;
+        let Some(p) = self.checked.as_ref().filter(|p| p.id == t.id) else {
+            return Err(Refusal::Changed { pid: t.id.pid });
+        };
+        let kept = config
+            .keep
+            .iter()
+            .map(|k| crate::keep::expand(k, &self.paths))
+            .find(|k| crate::keep::matches(p, k));
+        match kept {
+            Some(entry) => Err(Refusal::NotLeftover {
+                pid: t.id.pid,
+                why: crate::attribution::Spare::Kept { entry }.sentence(),
+            }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -182,6 +212,12 @@ impl Judge for StopJudge {
         } else {
             Err(Refusal::Changed { pid: t.id.pid })
         }
+    }
+
+    /// A stop names its process itself, so the keep list, which only spares processes from
+    /// the leftover rule, does not refuse it. `destructive` does.
+    fn confirm(&mut self, _: &ReapTarget) -> Result<(), Refusal> {
+        allowed(&self.paths).map(|_| ())
     }
 }
 
@@ -292,6 +328,11 @@ impl<J: Judge, A: Audit + ?Sized> Gate for Step<'_, J, A> {
 
     fn intend(&mut self, _: ProcId, signal: &str) -> Result<(), Refusal> {
         self.audit.intent(self.target, signal)
+    }
+
+    fn confirm(&mut self, id: ProcId) -> Result<(), Refusal> {
+        debug_assert_eq!(id, self.target.id);
+        self.judge.confirm(self.target)
     }
 }
 
@@ -524,10 +565,11 @@ fn finish(
     done
 }
 
-/// Refuses when the config turns destructive actions off, or cannot be read.
-pub fn allowed(paths: &Paths) -> Result<(), Refusal> {
+/// The config, read now, or a refusal when it turns destructive actions off or cannot be
+/// read.
+pub fn allowed(paths: &Paths) -> Result<crate::config::Config, Refusal> {
     match crate::config::Config::load(paths) {
-        Ok((c, _)) if c.destructive => Ok(()),
+        Ok((c, _)) if c.destructive => Ok(c),
         Ok((c, _)) => Err(Refusal::Disabled {
             config: paths.tilde(&paths.config),
             line: c.destructive_line,
@@ -539,11 +581,13 @@ pub fn allowed(paths: &Paths) -> Result<(), Refusal> {
     }
 }
 
-/// The store, opened for audit rows before anything is signalled.
+/// The store, opened for audit rows before anything is signalled. Each row is synced to
+/// disk before `append_audit` returns, so an intent row survives a crash or power loss
+/// right after the signal it announces.
 pub fn audit_store(paths: &Paths) -> Result<Store, Refusal> {
     paths
         .ensure_state()
-        .and_then(|_| Store::open(&paths.db()))
+        .and_then(|_| Store::open_durable(&paths.db()))
         .map_err(|e| Refusal::Unaudited {
             error: format!("{e:#}"),
         })
@@ -592,7 +636,7 @@ mod tests {
     struct Running;
 
     impl control::Watch for Running {
-        fn exited(&self) -> bool {
+        fn changed(&self) -> bool {
             false
         }
     }
@@ -647,6 +691,11 @@ mod tests {
                     why: "Its agent process 900 is still running.".into(),
                 })
             }
+        }
+
+        fn confirm(&mut self, t: &ReapTarget) -> Result<(), Refusal> {
+            self.log.borrow_mut().push(format!("confirm {}", t.id.pid));
+            Ok(())
         }
     }
 
@@ -720,11 +769,13 @@ mod tests {
             [
                 "judge 10",
                 "audit 10 SIGTERM",
+                "confirm 10",
                 "liveness 10",
                 "TERM 10",
                 "liveness 10",
                 "judge 11",
                 "audit 11 SIGTERM",
+                "confirm 11",
                 "liveness 11",
                 "TERM 11",
                 "liveness 11",
@@ -823,11 +874,13 @@ mod tests {
             [
                 "judge 10",
                 "audit 10 SIGTERM",
+                "confirm 10",
                 "liveness 10",
                 "TERM 10",
                 "liveness 10",
                 "judge 10",
                 "audit 10 SIGKILL",
+                "confirm 10",
                 "liveness 10",
                 "KILL 10",
                 "liveness 10",
@@ -856,6 +909,9 @@ mod tests {
                     })
                 }
             }
+            fn confirm(&mut self, _: &ReapTarget) -> Result<(), Refusal> {
+                Ok(())
+            }
         }
         let mut audit = Rows::new(&host.log);
         let report = run_on(
@@ -875,17 +931,9 @@ mod tests {
         assert_eq!(report.exit_code(), 2);
     }
 
-    /// `sleep` under `sh`, ready once the shell has set its trap.
+    /// `sleep`, exec'd already when `spawn` returns, so no later exec reads as a change.
     fn spawn() -> (Child, ProcId) {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "echo ready; exec sleep 30"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut ready = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
+        let child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pid = child.id() as i32;
         let start_us = sys::liveness(pid).unwrap().start_us;
         (child, ProcId { pid, start_us })
@@ -894,6 +942,9 @@ mod tests {
     struct Everything;
     impl Judge for Everything {
         fn check(&mut self, _: &ReapTarget) -> Result<(), Refusal> {
+            Ok(())
+        }
+        fn confirm(&mut self, _: &ReapTarget) -> Result<(), Refusal> {
             Ok(())
         }
     }
@@ -1210,6 +1261,83 @@ mod tests {
             StopJudge::new(paths.clone()).check(&t),
             Err(Refusal::Disabled { .. })
         ));
+    }
+
+    /// Audit rows kept in memory, saving `text` as the config while each intent row is
+    /// written, as an editor could.
+    struct SavesConfig<'a> {
+        config: &'a std::path::Path,
+        text: String,
+        rows: Vec<String>,
+    }
+
+    impl Audit for SavesConfig<'_> {
+        fn intent(&mut self, t: &ReapTarget, signal: &str) -> Result<(), Refusal> {
+            std::fs::write(self.config, &self.text).unwrap();
+            self.rows.push(format!("{} sending {signal}", t.id.pid));
+            Ok(())
+        }
+
+        fn outcome(&mut self, d: &Done) -> Result<(), String> {
+            self.rows
+                .push(format!("{} {}", d.target.id.pid, d.result()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_config_saved_while_the_intent_row_is_written_still_refuses_the_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = "leftover_grace_secs = 0\n";
+        let paths = paths_with(tmp.path(), base);
+        let d = Detached::start(tmp.path());
+        let t = target(d.id.pid, d.id.start_us);
+        let exe = std::env::current_exe().unwrap().display().to_string();
+        for (saved, refused) in [
+            (format!("{base}destructive = false\n"), "turned off"),
+            (format!("{base}keep = [{exe:?}]\n"), "on your keep list"),
+        ] {
+            for sigkill_only in [false, true] {
+                std::fs::write(&paths.config, base).unwrap();
+                let mut audit = SavesConfig {
+                    config: &paths.config,
+                    text: saved.clone(),
+                    rows: Vec::new(),
+                };
+                let mut judge = LiveJudge::new(paths.clone());
+                let report = if sigkill_only {
+                    kill_all(
+                        std::slice::from_ref(&t),
+                        &mut judge,
+                        &mut audit,
+                        &mut |_| {},
+                    )
+                } else {
+                    run(
+                        std::slice::from_ref(&t),
+                        true,
+                        Duration::from_millis(200),
+                        &mut judge,
+                        &mut audit,
+                        &mut |_| {},
+                    )
+                };
+                let why = report.done[0].result();
+                assert!(why.contains(refused), "{why}");
+                assert_eq!(audit.rows.len(), 2, "the intent row, then the refusal");
+                let live = sys::liveness(d.id.pid).expect("never signalled");
+                assert_eq!(live.start_us, d.id.start_us);
+            }
+        }
+    }
+
+    #[test]
+    fn the_audit_store_flushes_each_row_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with(tmp.path(), "");
+        let store = audit_store(&paths).unwrap();
+        // 2 is FULL: each commit is synced before the signal that follows it.
+        assert_eq!(store.synchronous().unwrap(), 2);
     }
 
     #[test]

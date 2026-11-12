@@ -6,15 +6,18 @@
 //! `<script> in <dir>`. `~` stands for the home directory in each path. `K` and
 //! `scry keep` pick the narrowest that is stable:
 //!
-//! - for a program that runs on its own, its executable path, such as `~/bin/tunnel`, which
-//!   keeps that program however it is started;
+//! - for a program that runs on its own and is given no file, its executable path, such as
+//!   `~/bin/tunnel`, which keeps that program however it is started;
 //! - for an interpreter or shell (`node`, `python3`, `bash`, …), the script it runs, since
 //!   its executable would keep every script: `~/acme/server.js`, or for a script outside
 //!   the working directory, such as a tool installed once and run in many projects,
-//!   `/opt/homebrew/lib/node_modules/vite/bin/vite.js in ~/acme`;
+//!   `/opt/homebrew/lib/node_modules/vite/bin/vite.js in ~/acme`. The script is the first
+//!   argument that is a file, after the interpreter's flags and their values (`node -r
+//!   <module>`, `python3 -X <option>`, …). A script deleted while it runs keeps the path
+//!   it had, so its entry goes on matching;
 //! - nothing for code that is not a file, such as `python3 -c …`, `node -e …` or a module
-//!   run with `-m`: no entry would keep that process and not others. Such a process is
-//!   kept by hand.
+//!   run with `-m`, nor for any other program given a file, such as a config: no entry
+//!   would keep that process and not others. Such a process is kept by hand.
 //!
 //! The edit changes only the `keep` array: comments, spacing, key order and the other
 //! settings stay as they were. A config that cannot be read is never edited. A keep edit
@@ -44,6 +47,96 @@ const RUNNERS: [&str; 22] = [
 /// Interpreter flags after which the code or module, not a file, says what runs.
 const NOT_A_FILE: [&str; 7] = ["-c", "-e", "--eval", "-p", "--print", "-m", "--module"];
 
+/// Flags of JavaScript runtimes whose value is the next argument, such as the module
+/// `node -r` loads before the script.
+const JS_VALUE_FLAGS: &[&str] = &[
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--preload",
+    "--env-file",
+    "--env-file-if-exists",
+    "-C",
+    "--conditions",
+    "--title",
+    "--inspect-port",
+    "--input-type",
+    "--redirect-warnings",
+    "--disable-warning",
+    "--watch-path",
+    "--cwd",
+    "--config",
+    "--import-map",
+    "--tsconfig",
+    "-P",
+    "--project",
+];
+
+/// Flags that take the next argument as their value, for each kind of runner, so a value
+/// such as `node -r ./preload.js server.js`'s is not taken for the script.
+fn value_flags(argv0: &str) -> &'static [&'static str] {
+    let file = argv0.rsplit('/').next().unwrap_or(argv0);
+    match file {
+        "node" | "bun" | "deno" | "tsx" | "ts-node" => JS_VALUE_FLAGS,
+        f if f.starts_with("python") || f.starts_with("Python") => {
+            &["-X", "-W", "--check-hash-based-pycs"]
+        }
+        "ruby" => &["-I", "-r", "-C", "-E"],
+        "perl" => &["-I"],
+        "php" => &["-d", "-z", "-t"],
+        "java" => &[
+            "-cp",
+            "-classpath",
+            "--class-path",
+            "--module-path",
+            "--add-modules",
+            "--add-opens",
+            "--add-exports",
+            "--add-reads",
+        ],
+        "sh" | "bash" | "zsh" | "dash" | "fish" => &[
+            "-o",
+            "+o",
+            "-O",
+            "+O",
+            "--rcfile",
+            "--init-file",
+            "-C",
+            "--init-command",
+        ],
+        "npm" | "npx" | "pnpm" | "yarn" => &[
+            "--prefix",
+            "-w",
+            "--workspace",
+            "--filter",
+            "-F",
+            "--cwd",
+            "--dir",
+            "-C",
+            "--package",
+        ],
+        "uv" | "uvx" => &[
+            "--with",
+            "--with-requirements",
+            "--python",
+            "--directory",
+            "--project",
+            "--from",
+            "--index",
+            "--env-file",
+        ],
+        _ => &[],
+    }
+}
+
+/// Whether a missing argument reads as a script's path rather than a word such as the
+/// `run` of `deno run`: it has a directory part or an extension.
+fn looks_like_a_file(arg: &str) -> bool {
+    arg.contains('/') || Path::new(arg).extension().is_some()
+}
+
 /// Splits `<script> in <dir>`.
 const IN: &str = " in ";
 
@@ -54,8 +147,14 @@ pub fn is_runner(exe: &str) -> bool {
 }
 
 /// The real path of the script an interpreter runs: the first argument, after its own
-/// flags, that names an existing file. `None` when the code comes from a flag (`-c`, `-e`,
-/// `-m`, …) first, or no argument is a file. Only local volumes are looked at.
+/// flags and their values, that names an existing file. `None` when the code comes from a
+/// flag (`-c`, `-e`, `-m`, …) first, or no argument is a file. Only local volumes are
+/// looked at.
+///
+/// A script deleted while it runs is still named: the first argument that reads as a path
+/// and is missing gives the path it had, resolved against `cwd`, through the real path of
+/// its directory while that is there and lexically once it is not. A keep entry for the
+/// script then goes on matching.
 pub fn script_of(argv: &[String], cwd: Option<&Path>, files: &LiveFiles) -> Option<String> {
     // A title written over the arguments has no argument boundaries.
     if let [title] = argv
@@ -63,9 +162,15 @@ pub fn script_of(argv: &[String], cwd: Option<&Path>, files: &LiveFiles) -> Opti
     {
         return None;
     }
-    for a in argv.iter().skip(1).take(crate::label::MAX_ARGS) {
+    let takes_value = value_flags(argv.first().map_or("", String::as_str));
+    let mut args = argv.iter().skip(1).take(crate::label::MAX_ARGS);
+    while let Some(a) = args.next() {
         if NOT_A_FILE.contains(&a.as_str()) {
             return None;
+        }
+        if takes_value.contains(&a.as_str()) {
+            args.next();
+            continue;
         }
         if let Some(cluster) = a.strip_prefix('-') {
             // `-uc` is `-u -c`: a cluster that may hold a code or module flag ends the search.
@@ -83,8 +188,47 @@ pub fn script_of(argv: &[String], cwd: Option<&Path>, files: &LiveFiles) -> Opti
         if let Some(real) = files.real_file(&full) {
             return Some(real.display().to_string());
         }
+        if looks_like_a_file(a)
+            && let Some(gone) = files.gone_file(&full)
+        {
+            return Some(gone.display().to_string());
+        }
     }
     None
+}
+
+/// Whether an argument after `argv[0]`, or the value of a `--flag=value`, names an
+/// existing file on a local volume, such as a config or a script a program is given.
+pub fn has_file_arg(argv: &[String], cwd: Option<&Path>, files: &LiveFiles) -> bool {
+    let words: Vec<&str> = match argv {
+        // A title written over the arguments: its words are all there is.
+        [title] if title.contains(char::is_whitespace) => {
+            title.split_whitespace().skip(1).collect()
+        }
+        _ => argv.iter().skip(1).map(String::as_str).collect(),
+    };
+    words.into_iter().take(crate::label::MAX_ARGS).any(|a| {
+        let value = match a.strip_prefix('-') {
+            Some(flag) => match flag.split_once('=') {
+                Some((_, v)) => v,
+                None => return false,
+            },
+            None => a,
+        };
+        if value.is_empty() {
+            return false;
+        }
+        let path = Path::new(value);
+        let full = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            match cwd {
+                Some(dir) => dir.join(path),
+                None => return false,
+            }
+        };
+        files.real_file(&full).is_some()
+    })
 }
 
 /// Whether a process matches a keep entry: its name, its executable's path, its script's
@@ -148,6 +292,13 @@ pub fn entry_for(p: &Process, home: Option<&Path>) -> KeepAs {
         return by_hand("has no executable path Scry can read");
     };
     if !is_runner(exe) {
+        // A program given a file, such as a script or a config, is not told apart from the
+        // same program given another by its executable.
+        if p.file_args {
+            return by_hand(
+                "is given a file, and its executable would keep it with any other file too",
+            );
+        }
         return KeepAs::Entry(tilde(exe));
     }
     let Some(script) = p.script.as_deref() else {
@@ -753,5 +904,152 @@ mod tests {
         ] {
             assert_eq!(script(none), None, "{none:?}");
         }
+    }
+
+    #[test]
+    fn a_flag_value_is_not_taken_for_the_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        for f in ["server.js", "preload.js", "app.py", "app.rb", "init.sh"] {
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        std::fs::create_dir(dir.join("lib")).unwrap();
+        let files = LiveFiles::new();
+        let script = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            script_of(&argv, Some(&dir), &files)
+        };
+        let is = |f: &str| Some(dir.join(f).display().to_string());
+        for (argv, main) in [
+            (
+                &["node", "-r", "./preload.js", "server.js"][..],
+                "server.js",
+            ),
+            (
+                &["node", "--require", "preload.js", "server.js"],
+                "server.js",
+            ),
+            (
+                &[
+                    "/opt/homebrew/bin/node",
+                    "--import",
+                    "./preload.js",
+                    "server.js",
+                ],
+                "server.js",
+            ),
+            (
+                &["bun", "--preload", "preload.js", "server.js"],
+                "server.js",
+            ),
+            (
+                &["python3", "-X", "pycache_prefix=/gone/cache", "app.py"],
+                "app.py",
+            ),
+            (
+                &["python3.12", "-W", "ignore", "-X", "dev", "app.py"],
+                "app.py",
+            ),
+            (
+                &["ruby", "-I", "lib", "-r", "./preload.js", "app.rb"],
+                "app.rb",
+            ),
+            (
+                &["bash", "--rcfile", "init.sh", "-o", "pipefail", "init.sh"],
+                "init.sh",
+            ),
+        ] {
+            assert_eq!(script(argv), is(main), "{argv:?}");
+        }
+        // Not a value flag for Python: `-I` takes none, so `app.py` after it is the script.
+        assert_eq!(script(&["python3", "-I", "app.py"]), is("app.py"));
+    }
+
+    #[test]
+    fn a_script_deleted_while_it_runs_keeps_its_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(dir.join("acme")).unwrap();
+        let acme = dir.join("acme");
+        std::fs::write(acme.join("server.js"), "").unwrap();
+        let tool = dir.join("tool.js");
+        std::fs::write(&tool, "").unwrap();
+        let cwd = acme.display().to_string();
+        let script = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            // A fresh view of the disk, as the check before a signal has.
+            script_of(&argv, Some(&acme), &LiveFiles::new())
+        };
+        let runs = |argv: &[&str]| {
+            process(
+                "node",
+                "/opt/homebrew/bin/node",
+                script(argv).as_deref(),
+                Some(&cwd),
+            )
+        };
+        let in_dir = ["node", "--inspect", "./server.js", "--port", "1"];
+        let outside = ["node", "../tool.js"];
+        let entries: Vec<String> = [&in_dir[..], &outside]
+            .iter()
+            .map(|argv| entry_for(&runs(argv), None).entry().unwrap().to_string())
+            .collect();
+        assert_eq!(entries[0], acme.join("server.js").display().to_string());
+        assert_eq!(entries[1], format!("{} in {cwd}", tool.display()));
+
+        std::fs::remove_file(acme.join("server.js")).unwrap();
+        std::fs::remove_file(&tool).unwrap();
+        for (argv, entry) in [(&in_dir[..], &entries[0]), (&outside, &entries[1])] {
+            let p = runs(argv);
+            assert!(p.script.is_some(), "{argv:?} still names its script");
+            assert!(matches(&p, entry), "{entry} still keeps {argv:?}");
+        }
+        // Another script in the same place is not kept by it.
+        let other = process(
+            "node",
+            "/opt/homebrew/bin/node",
+            Some(&acme.join("worker.js").display().to_string()),
+            Some(&cwd),
+        );
+        assert!(!matches(&other, &entries[0]));
+        // A word that is no path, such as `deno run`'s, is not taken for a deleted script.
+        assert_eq!(script(&["bun", "run", "dev"]), None);
+    }
+
+    #[test]
+    fn a_program_given_a_file_is_not_kept_by_its_executable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(dir.join("redis.conf"), "").unwrap();
+        std::fs::create_dir(dir.join("data")).unwrap();
+        let files = LiveFiles::new();
+        let given = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            has_file_arg(&argv, Some(&dir), &files)
+        };
+        let conf = dir.join("redis.conf").display().to_string();
+        assert!(given(&["redis-server", "redis.conf"]));
+        assert!(given(&["redis-server", &conf, "--port", "6380"]));
+        assert!(given(&["server", &format!("--config={conf}")]));
+        assert!(given(&[&format!("redis-server {conf}")]), "a title's words");
+        assert!(!given(&["redis-server", "--port", "6380"]));
+        assert!(
+            !given(&["postgres", "-D", "data"]),
+            "a directory is not a file"
+        );
+        assert!(!given(&["tunnel"]));
+
+        let mut redis = process("redis-server", "/opt/homebrew/bin/redis-server", None, None);
+        assert_eq!(
+            entry_for(&redis, None),
+            KeepAs::Entry("/opt/homebrew/bin/redis-server".into()),
+            "no file: kept by its executable"
+        );
+        redis.file_args = true;
+        let KeepAs::Refused(why) = entry_for(&redis, None) else {
+            panic!("its executable would keep it with any file");
+        };
+        assert!(why.contains("is given a file"), "{why}");
+        assert!(why.contains("by hand"), "{why}");
     }
 }
