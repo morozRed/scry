@@ -106,6 +106,13 @@ fn main() -> anyhow::Result<()> {
             let name = format!("state-{state}-{p}");
             n += shots.take(&name, &states, theme(), "2", pal, (80, 24))?;
         }
+        for (state, board) in [
+            ("sizing", worktrees(&design, true)),
+            ("empty", worktrees(&design, false)),
+        ] {
+            let name = format!("worktrees-{state}-{p}");
+            n += shots.take(&name, &board, theme(), "5", pal, (80, 24))?;
+        }
     }
     let sol = &SOLARIZED_LIGHT;
     n += shots.take(
@@ -179,6 +186,26 @@ fn with_leftovers(design: &Board, n: usize) -> Board {
             State::Leftover,
             Some(Evidence::Stamp),
         ));
+    }
+    board
+}
+
+/// The design board's worktrees while their sizes are measured, or none found at all.
+fn worktrees(design: &Board, sizing: bool) -> Board {
+    let mut board = design.clone();
+    if let Load::Ready(list) = &mut board.worktrees {
+        list.sizing = sizing;
+        if sizing {
+            for w in &mut list.rows {
+                w.size = None;
+                w.frees = None;
+                for fact in w.detail.facts.iter_mut().filter(|f| f.label == "size") {
+                    fact.value = "measuring…".into();
+                }
+            }
+        } else {
+            list.rows.clear();
+        }
     }
     board
 }

@@ -112,7 +112,8 @@ dark, holds. Without truecolor Scry falls back to exactly that principle, below.
 | Disk | [svg](screens/disk-light-80x24.svg) | [svg](screens/disk-dark-80x24.svg) | [svg](screens/disk-light-120x40.svg) | [svg](screens/disk-dark-120x40.svg) |
 | Worktrees | [svg](screens/worktrees-light-80x24.svg) | [svg](screens/worktrees-dark-80x24.svg) | [svg](screens/worktrees-light-120x40.svg) | [svg](screens/worktrees-dark-120x40.svg) |
 
-Disk and Worktrees are not collected yet, so they show their "not built yet" state.
+Disk is not built yet, so it shows what it will hold and what its history needs. The
+Worktrees fixture rows are synthetic.
 
 From 150 columns the detail pane moves beside the list, which keeps 96 columns:
 [agents light](screens/agents-light-150x40.svg),
@@ -186,7 +187,8 @@ All in `crates/scry/src/tui/kit/`:
   the right when space runs out), the tab bar with attention counts, the footer, rules. The
   footer sits on the plain background, under the detail band rather than in it. Its left
   side shows the filter while it is typed, else a toast, else the filter that is applied,
-  and then the keys that do something on this view as it is.
+  and then the keys that do something on this view as it is, three columns apart, or two
+  when that keeps the last one on screen.
 - `table`: a flattened tree as a table. Columns align across depths; the first column
   carries the tree glyphs (`▾ ▸ ├ └ │`) and a fold count, and any cell shows the characters
   the filter matched. Numbers align right, cut text ends in `…`, and columns hide below a set
@@ -211,7 +213,10 @@ All in `crates/scry/src/tui/kit/`:
   name in each row is bold.
 - `states`: empty, loading, unavailable and failed, each a glyph and a sentence. ✓ is kept
   for an all-clear, a view that read its source and found nothing to show. No rows matching
-  the filter, and an Overview whose sources are not collected yet, get a neutral ○.
+  the filter, and an Overview whose sources are not collected yet, get a neutral ○. Under
+  the sentence a muted hint says what would fill the view on a first run: which folders
+  Worktrees searched and where to change them, the command that starts Disk's history.
+  The text wraps within 64 columns.
 
 ### Modes
 
@@ -219,7 +224,7 @@ The keys mean different things in each mode, so the mode is one value, not a set
 
 | Mode | Keys |
 |---|---|
-| Normal | `j k ↑ ↓ g G` move, `⏎` fold a session or go to its row, `h l` fold and unfold (`h` on a process goes to its parent), `1-5 tab` views, `/` filter, `esc` clear the filter, `s S` sort, `x` stop, `X` reap, `r` rescan, `?` help, `q` quit |
+| Normal | `j k ↑ ↓ g G` move, `⏎` fold a session or go to its row, `h l` fold and unfold (`h` on a process goes to its parent), `1-5 tab` views, `/` filter, `esc` clear the filter, `s S` sort, `x` stop, `X` reap, `r` refresh, `?` help, `q` quit |
 | Filter | type to filter, `⏎` keep, `esc` clear, `↑ ↓` move |
 | Sheet | `⏎` confirm, `j k` scroll, `esc` cancel |
 | Help | `esc ? q` close |
@@ -252,14 +257,33 @@ RAM, do not make a row glow. The effects run only in truecolor, because a fade b
 theme's named colours has no right answer. The loop draws when something changed and, while
 an effect runs, every 16 ms; then it goes back to waiting for input.
 
+### Refresh
+
+Live data comes from two readers off the UI thread. Process snapshots, which carry the
+ports, are read at start and then every `[tui] refresh_secs` (2 s by default, 1 to 60, 0
+for only on `r`). Worktrees are read when their view opens: git state first, then the
+sizes, which take seconds, so the list shows at once with `…` in SIZE and the header says
+"measuring sizes…". Sizing is costly (15 s and 38 s of CPU across cores for 1.6 million
+entries on the reference Mac), so worktrees are never read on a timer: coming back to the
+view reads them again when the last reading is over 10 minutes old, and the header gives
+the age of that reading. `r`
+asks for a process reading at once, and on the Worktrees view for a worktree reading too;
+the footer says "Refreshed." when it lands. The header's right end says how fresh the data
+is, such as "updated 3s ago", or "refreshing…" for a reading `r` asked for or one that has
+taken over 300 ms, so a quick automatic one never flickers. The loop draws when that word
+changes, not on a clock.
+
 ## Data shapes
 
 Plain data in `scry-core` (no terminal types), so the planned menu bar app can draw the same
 values:
 
 - `Board`: every view model at one moment: `pulse: Option<Pulse>`, `overview: Overview`,
-  `ports: Load<Vec<PortRow>>`, `agents: Load<Vec<AgentRow>>`. A recorded board is a design
-  fixture: `scry tui --fixture fixtures/design.json`.
+  `ports: Load<Vec<PortRow>>`, `agents: Load<Vec<AgentRow>>`,
+  `worktrees: Load<WorktreeList>`. A recorded board is a design fixture:
+  `scry tui --fixture fixtures/design.json`.
+- `WorktreeList`: the worktree rows, the folders searched, the config file that sets them,
+  and `sizing` while sizes are still measured.
 - `Load<T>`: `Loading`, `Unavailable(reason)`, `Failed(reason)` or `Ready(T)`. Every view
   draws all four.
 - `AgentRow`: one line of the session tree, flattened depth first with a `depth`, so the

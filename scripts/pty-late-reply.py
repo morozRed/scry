@@ -30,7 +30,7 @@ REPLY = (
     b"\x1b[?62;22c"
 )
 DRAWN = b"not collected yet"
-PORTS = b"Port scanning"
+PORTS = b"is held by"
 TRUECOLOR = b"\x1b[38;2;"
 ROWS, COLS = 30, 100
 # Scry waits this long after SIGTERM for its loop to stop before it restores and exits.
@@ -289,7 +289,7 @@ def typed(name, timeline, text, fixture=FIX, quit_key=b"q"):
 typed(
     "BackTab typed while Scry waits for the answer reaches the TUI",
     [(0.1, b"\x1b[Z"), (0.2, REPLY)],
-    "Worktree scanning",
+    "holds no worktrees",
 )
 # On Agents, h folds the first session and plain Right would unfold it; Ctrl-Right does
 # nothing, so the fold marker stays.
@@ -302,7 +302,7 @@ typed(
 typed(
     "a key split across the 1 s deadline keeps its ESC [ and reaches the TUI",
     [(0.9, b"\x1b["), (1.3, b"Z"), (1.6, REPLY)],
-    "Worktree scanning",
+    "holds no worktrees",
 )
 typed(
     "a character split where Scry hands the terminal to the event loop is typed whole",

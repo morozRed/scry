@@ -8,13 +8,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use scry_core::view::{Board, Load, Tab, Target, Tone};
+use scry_core::engine::{Engine, Labels};
+use scry_core::view::{Board, Load, Tab, Target, Tone, human_age};
 
 use super::theme::Theme;
 use super::ui::MIN_W;
 use super::views::{self, Query, Row, Shown, Sort};
 
 const TOAST_FOR: Duration = Duration::from_secs(4);
+/// A scan shorter than this never shows "refreshing…", so a quick automatic refresh does not
+/// flicker in the header.
+const SHOW_SCAN_AFTER: Duration = Duration::from_millis(300);
 const PAGE: isize = 10;
 
 pub enum Source {
@@ -23,9 +27,13 @@ pub enum Source {
 }
 
 impl Source {
+    /// One reading. The live TUI reads in the background instead; see `tui::run`.
     pub fn load(&self) -> Result<Board> {
         match self {
-            Source::Live => Ok(Board::from_snapshot(&scry_core::sys::scan()?)),
+            Source::Live => {
+                let mut engine = Engine::labelling(Labels::Listeners);
+                Ok(Board::from_snapshot(&engine.snapshot()?))
+            }
             Source::Fixture(path) => load_fixture(path),
         }
     }
@@ -107,6 +115,21 @@ pub struct ViewState {
     pub offset: Cell<usize>,
 }
 
+/// How fresh the live data is, for the header. A fixture never changes, so it has none.
+#[derive(Debug, Default)]
+pub struct Fresh {
+    /// When the last process scan finished.
+    pub updated: Option<Instant>,
+    /// When the process scan in progress started.
+    pub scanning: Option<Instant>,
+    /// `r` asked for the scan in progress: it shows at once and ends with a toast.
+    pub asked: bool,
+    /// A worktree scan is running.
+    pub worktrees: bool,
+    /// When the last worktree scan, sizes included, finished.
+    pub worktrees_at: Option<Instant>,
+}
+
 pub struct Toast {
     pub text: String,
     pub tone: Tone,
@@ -130,6 +153,7 @@ pub struct App {
     pub mode: Mode,
     pub views: [ViewState; 5],
     pub toast: Option<Toast>,
+    pub fresh: Fresh,
     /// How wide the list was last drawn, which decides the columns on screen. Keys act on
     /// what was last drawn.
     pub list_width: Cell<u16>,
@@ -145,6 +169,7 @@ impl App {
             mode: Mode::Normal,
             views: Default::default(),
             toast: None,
+            fresh: Fresh::default(),
             list_width: Cell::new(MIN_W),
         }
     }
@@ -229,11 +254,55 @@ impl App {
     }
 
     pub fn notify(&mut self, text: impl Into<String>, tone: Tone) {
+        self.notify_for(text, tone, TOAST_FOR);
+    }
+
+    pub fn notify_for(&mut self, text: impl Into<String>, tone: Tone, how_long: Duration) {
         self.toast = Some(Toast {
             text: text.into(),
             tone,
-            until: Instant::now() + TOAST_FOR,
+            until: Instant::now() + how_long,
         });
+    }
+
+    /// The header's word on the data: "updated 3s ago", "refreshing…", or what the worktree
+    /// scan is doing while its view is open. `None` for a fixture.
+    pub fn freshness(&self, now: Instant) -> Option<String> {
+        if !matches!(self.source, Source::Live) {
+            return None;
+        }
+        let f = &self.fresh;
+        if self.tab == Tab::Worktrees && f.worktrees {
+            let sizing = self.board.worktrees.ready().is_some_and(|w| w.sizing);
+            let doing = if sizing {
+                "measuring sizes…"
+            } else {
+                "reading worktrees…"
+            };
+            return Some(doing.into());
+        }
+        let shows = |started: Instant| f.asked || now.duration_since(started) >= SHOW_SCAN_AFTER;
+        if f.scanning.is_some_and(shows) {
+            return Some("refreshing…".into());
+        }
+        // The worktree view is as fresh as its own, slower reading.
+        let updated = match self.tab {
+            Tab::Worktrees => f.worktrees_at,
+            _ => f.updated,
+        };
+        Some(match updated {
+            None => "reading…".into(),
+            Some(t) => match now.duration_since(t).as_secs() {
+                0 => "updated just now".into(),
+                s => format!("updated {} ago", human_age(s)),
+            },
+        })
+    }
+
+    /// When `freshness` changes by itself with nothing arriving: a slow scan starts to show.
+    pub fn freshness_due(&self) -> Option<Instant> {
+        let f = &self.fresh;
+        f.scanning.filter(|_| !f.asked).map(|t| t + SHOW_SCAN_AFTER)
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {

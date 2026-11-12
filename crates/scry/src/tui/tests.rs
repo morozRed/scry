@@ -1,12 +1,14 @@
 //! Screen snapshots from fixtures and the key-handling state machine.
 
+use std::time::{Duration, Instant};
+
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier};
 use scry_core::view::agents::AgentRow;
-use scry_core::view::{Board, Detail, Evidence, Load, State, Tab, Tone};
+use scry_core::view::{Board, Detail, Evidence, Load, State, Tab, Tone, WorktreeList};
 
 use super::app::{Action, App, Mode, SheetKind, Source};
 use super::theme::{Colors, Look, Rgb, Theme};
@@ -706,9 +708,12 @@ fn only_a_real_all_clear_gets_a_check_mark() {
     board.overview.attention.clear();
     let a = App::new(board, Source::Fixture("d".into()), mono());
     assert!(screen(&render(&a, 80, 24)).contains("✓  Nothing needs attention."));
-    // Live, where ports and agents are not read, it says so instead.
+    // Live, where agents are not read, it says so instead.
     let text = screen(&render(&typical(), 80, 24));
-    assert!(text.contains("○  Ports and agent sessions are not collected yet"));
+    assert!(
+        text.contains("○  Agent sessions are not collected yet"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -810,4 +815,111 @@ fn filter_matches_are_marked_in_the_accent_not_the_warning() {
     assert_eq!(t.matched.fg, t.accent.fg);
     assert_ne!(t.matched.fg, t.warn.fg);
     assert!(t.matched.add_modifier.contains(Modifier::UNDERLINED));
+}
+
+fn worktrees(f: impl FnOnce(&mut WorktreeList)) -> App {
+    let mut board = design_board();
+    if let Load::Ready(list) = &mut board.worktrees {
+        f(list);
+    }
+    let mut a = App::new(board, Source::Fixture("design.json".into()), mono());
+    press(&mut a, "5");
+    a
+}
+
+#[test]
+fn worktrees_show_state_size_creator_and_the_reason() {
+    let mut a = worktrees(|_| {});
+    insta::assert_snapshot!("design_worktrees_80x24", render(&a, 80, 24));
+    press(&mut a, "j");
+    insta::assert_snapshot!("design_worktrees_120x40", render(&a, 120, 40));
+}
+
+#[test]
+fn worktrees_say_when_sizes_are_still_measured() {
+    let a = worktrees(|list| {
+        list.sizing = true;
+        for w in &mut list.rows {
+            w.size = None;
+            w.frees = None;
+        }
+    });
+    insta::assert_snapshot!("worktrees_sizing", render(&a, 80, 24));
+    let text = screen(&render(&a, 80, 24));
+    assert!(text.contains('…'), "{text}");
+    assert!(!text.contains("1.3G"), "{text}");
+}
+
+#[test]
+fn first_run_states_say_what_would_fill_each_view() {
+    let mut a = worktrees(|list| list.rows.clear());
+    insta::assert_snapshot!("worktrees_empty", render(&a, 80, 24));
+    let text = screen(&render(&a, 80, 24));
+    assert!(text.contains("✓  No linked worktrees."), "{text}");
+    assert!(text.contains("~/sources, ~/work"), "{text}");
+    assert!(text.contains("code_roots"), "{text}");
+
+    // Without roots Codex's own folder is still read, and what it holds is listed.
+    let c = worktrees(|list| list.roots.clear());
+    assert!(screen(&render(&c, 80, 24)).contains("wt-auth"));
+
+    let mut b = worktrees(|list| {
+        list.rows.clear();
+        list.roots.clear();
+    });
+    insta::assert_snapshot!("worktrees_no_roots", render(&b, 80, 24));
+    b.board.worktrees = Load::Loading;
+    insta::assert_snapshot!("worktrees_loading", render(&b, 80, 24));
+
+    press(&mut a, "4");
+    insta::assert_snapshot!("disk_first_run", render(&a, 80, 24));
+    assert!(screen(&render(&a, 80, 24)).contains("scry daemon install"));
+
+    press(&mut a, "2");
+    a.board.ports = Load::Ready(Vec::new());
+    assert!(screen(&render(&a, 80, 24)).contains("No process on this Mac is accepting"));
+}
+
+#[test]
+fn the_header_says_how_fresh_live_data_is() {
+    let mut a = App::new(design_board(), Source::Live, mono());
+    let now = Instant::now();
+    // Wide enough for the design board's pulse and the word on freshness.
+    let header = |a: &App| lines(&render(a, 120, 40)).remove(0);
+    assert!(header(&a).ends_with("reading… "), "{}", header(&a));
+    a.fresh.updated = Some(now);
+    assert!(header(&a).ends_with("updated just now "));
+    a.fresh.updated = now.checked_sub(Duration::from_secs(75));
+    assert!(header(&a).ends_with("updated 1m ago "), "{}", header(&a));
+    // A quick automatic scan never shows; one that `r` asked for shows at once.
+    a.fresh.scanning = Some(now);
+    assert_eq!(a.freshness(now).as_deref(), Some("updated 1m ago"));
+    let later = now + Duration::from_millis(400);
+    assert_eq!(a.freshness(later).as_deref(), Some("refreshing…"));
+    a.fresh.asked = true;
+    assert!(header(&a).ends_with("refreshing… "));
+    // The worktree view tells its own scan apart.
+    press(&mut a, "5");
+    a.fresh.worktrees = true;
+    assert!(header(&a).ends_with("reading worktrees… "));
+    if let Load::Ready(list) = &mut a.board.worktrees {
+        list.sizing = true;
+    }
+    assert!(header(&a).ends_with("measuring sizes… "));
+    // A fixture names itself instead.
+    assert!(header(&design()).ends_with("fixture design.json "));
+}
+
+#[test]
+fn r_refreshes_and_every_footer_lists_it() {
+    let mut a = design();
+    assert_eq!(a.on_key(key(KeyCode::Char('r'))), Action::Rescan);
+    for tab in "12345".chars() {
+        press(&mut a, &tab.to_string());
+        let footer = lines(&render(&a, 80, 24)).pop().unwrap();
+        assert!(footer.contains("r refresh"), "{footer}");
+        assert!(footer.contains("q quit"), "{footer}");
+    }
+    press(&mut a, "?");
+    assert!(screen(&render(&a, 80, 24)).contains("refresh now"));
 }

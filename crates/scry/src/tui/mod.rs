@@ -16,10 +16,10 @@ mod tests;
 
 use std::collections::VecDeque;
 use std::io::{self, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
@@ -30,7 +30,11 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::{DefaultTerminal, Terminal};
-use scry_core::view::{Board, Tone};
+use scry_core::config::Config;
+use scry_core::engine::{Engine, Labels};
+use scry_core::paths::Paths;
+use scry_core::view::{Board, Load, Tab, Tone, WorktreeList};
+use scry_core::worktree::{self, ScanOptions};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
@@ -39,7 +43,8 @@ use motion::Motion;
 use theme::{Colors, Env, SHIPPED, Theme};
 use tty::LateReply;
 
-const SAMPLE_EVERY: Duration = Duration::from_secs(2);
+/// How long "Refreshed." stays in the footer after `r`.
+const REFRESHED_FOR: Duration = Duration::from_millis(1500);
 const INPUT_POLL: Duration = Duration::from_millis(250);
 const FRAME: Duration = Duration::from_millis(16);
 const SIGNAL_GRACE: Duration = Duration::from_secs(1);
@@ -52,8 +57,11 @@ static ALTERNATE: AtomicBool = AtomicBool::new(false);
 
 pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     let source = fixture.map_or(Source::Live, Source::Fixture);
-    let live = matches!(source, Source::Live);
-    let board = source.load()?;
+    // Live data starts loading once the screen is up; a fixture is read before.
+    let (board, live) = match &source {
+        Source::Live => (Board::default(), Some(Live::read()?)),
+        Source::Fixture(_) => (source.load()?, None),
+    };
 
     tty::save();
     watch_signals()?;
@@ -79,30 +87,154 @@ pub fn run(fixture: Option<PathBuf>) -> Result<()> {
     let mut app = App::new(board, source, theme);
 
     let (tx, rx) = mpsc::channel();
-    if live {
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(SAMPLE_EVERY);
-                let Ok(snap) = scry_core::sys::scan() else {
-                    continue;
-                };
-                if tx.send(Board::from_snapshot(&snap)).is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    let workers = live.map(|l| l.spawn(tx));
 
     let result = event_loop(
         &mut terminal,
         &mut app,
         &mut motion,
         &rx,
+        workers.as_ref(),
         answer.typed,
         answer.late,
     );
     exit_on_signal();
     result
+}
+
+/// What the live TUI reads from the config before the screen opens, so a broken file is
+/// reported on the normal screen.
+struct Live {
+    /// `None` refreshes only on `r`.
+    every: Option<Duration>,
+    worktrees: ScanOptions,
+    config: PathBuf,
+}
+
+impl Live {
+    fn read() -> Result<Live> {
+        let paths = Paths::from_env()?;
+        let (config, _) = Config::load(&paths)?;
+        let secs = config.tui.refresh_secs;
+        Ok(Live {
+            every: (secs > 0).then(|| Duration::from_secs(secs)),
+            worktrees: ScanOptions::new(&paths.user_home, config.code_roots),
+            config: paths.config,
+        })
+    }
+
+    /// Starts the two readers off the UI thread: process snapshots, quick and on a timer,
+    /// and worktrees, slow and only when asked.
+    fn spawn(self, tx: mpsc::Sender<Update>) -> Workers {
+        let (now, asks) = mpsc::channel();
+        let every = self.every;
+        let to = tx.clone();
+        std::thread::spawn(move || read_processes(&to, &asks, every));
+        let (worktrees, asks) = mpsc::channel();
+        std::thread::spawn(move || read_worktrees(&tx, &asks, &self.worktrees, &self.config));
+        Workers {
+            now,
+            worktrees,
+            every,
+        }
+    }
+}
+
+/// What the readers send the UI thread.
+enum Update {
+    Started,
+    Board(Box<Board>),
+    Failed(String),
+    Worktrees(Load<WorktreeList>),
+}
+
+/// Where the UI thread asks the readers for a reading.
+struct Workers {
+    now: mpsc::Sender<()>,
+    worktrees: mpsc::Sender<()>,
+    every: Option<Duration>,
+}
+
+impl Workers {
+    /// Coming back to the worktree view reads it again when its last reading is this old.
+    /// Sizing walked 1.6 million entries in 15 s and 38 s of CPU across cores on the
+    /// reference Mac, so it never runs on a timer while the view sits open; `r` reads at once.
+    const WORKTREES_STALE: Duration = Duration::from_secs(600);
+
+    /// `opened` says the view was just switched to.
+    fn worktrees_due(&self, app: &App, opened: bool, now: Instant) -> bool {
+        app.tab == Tab::Worktrees
+            && !app.fresh.worktrees
+            && match app.fresh.worktrees_at {
+                None => true,
+                Some(t) => {
+                    opened && self.every.is_some() && now.duration_since(t) >= Self::WORKTREES_STALE
+                }
+            }
+    }
+}
+
+/// Reads at once, then after each interval or when asked. Asks that arrive during a
+/// reading are answered by the next one.
+fn read_processes(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, every: Option<Duration>) {
+    let mut engine = Engine::labelling(Labels::Listeners);
+    loop {
+        if tx.send(Update::Started).is_err() {
+            return;
+        }
+        let update = match engine.snapshot() {
+            Ok(snap) => Update::Board(Box::new(Board::from_snapshot(&snap))),
+            Err(e) => Update::Failed(format!("{e:#}")),
+        };
+        if tx.send(update).is_err() {
+            return;
+        }
+        let asked = match every {
+            Some(d) => asks
+                .recv_timeout(d)
+                .map_err(|e| e == RecvTimeoutError::Disconnected),
+            None => asks.recv().map_err(|_| true),
+        };
+        if asked == Err(true) {
+            return;
+        }
+        while asks.try_recv().is_ok() {}
+    }
+}
+
+/// Git state first, then sizes, which take seconds: the list shows before it is measured.
+fn read_worktrees(
+    tx: &mpsc::Sender<Update>,
+    asks: &mpsc::Receiver<()>,
+    opts: &ScanOptions,
+    config: &Path,
+) {
+    while asks.recv().is_ok() {
+        while asks.try_recv().is_ok() {}
+        let list = |scan: &worktree::WorktreeScan, sizing| {
+            Update::Worktrees(Load::Ready(WorktreeList::new(
+                scan,
+                unix_now(),
+                &opts.home,
+                sizing,
+                config,
+            )))
+        };
+        let mut scan = worktree::scan(opts);
+        if tx.send(list(&scan, true)).is_err() {
+            return;
+        }
+        worktree::measure(&mut scan, &opts.home);
+        if tx.send(list(&scan, false)).is_err() {
+            return;
+        }
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Raw mode, then the alternate screen. Each step is recorded once it worked, so when a
@@ -164,18 +296,18 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     motion: &mut Motion,
-    rx: &mpsc::Receiver<Board>,
+    rx: &mpsc::Receiver<Update>,
+    workers: Option<&Workers>,
     typed: Vec<KeyEvent>,
     mut late: Option<LateReply>,
 ) -> Result<()> {
     let mut dirty = true;
     let mut keys = VecDeque::from(typed);
+    // What the header said when last drawn; a new word is a reason to draw.
+    let mut said = None;
     while SIGNAL.load(Ordering::Relaxed) == 0 {
-        if let Some(board) = rx.try_iter().last()
-            && board != app.board
-        {
-            motion.rows_changed(app.replace_board(board));
-            dirty = true;
+        for update in rx.try_iter() {
+            dirty |= receive(app, motion, update);
         }
         let now = Instant::now();
         if app.toast.as_ref().is_some_and(|t| now >= t.until) {
@@ -186,17 +318,28 @@ fn event_loop(
             keys.extend(held);
             late = None;
         }
+        let tab = app.tab;
         while let Some(key) = keys.pop_front() {
             let had_sheet = matches!(app.mode, Mode::Sheet(_));
             match app.on_key(key) {
                 Action::Quit => return Ok(()),
                 Action::Suspend => suspend(terminal)?,
-                Action::Rescan => match app.source.load() {
-                    Ok(board) if board == app.board => {
-                        app.notify("No changes since the last scan.", Tone::Ok)
+                Action::Rescan => match workers {
+                    Some(w) => {
+                        app.fresh.asked = true;
+                        let _ = w.now.send(());
+                        if app.tab == Tab::Worktrees && !app.fresh.worktrees {
+                            app.fresh.worktrees = true;
+                            let _ = w.worktrees.send(());
+                        }
                     }
-                    Ok(board) => motion.rows_changed(app.replace_board(board)),
-                    Err(e) => app.notify(format!("Rescan failed: {e:#}"), Tone::Danger),
+                    None => match app.source.load() {
+                        Ok(board) => {
+                            motion.rows_changed(app.replace_board(board));
+                            app.notify_for("Refreshed.", Tone::Ok, REFRESHED_FOR);
+                        }
+                        Err(e) => app.notify(format!("Refresh failed: {e:#}"), Tone::Danger),
+                    },
                 },
                 Action::Redraw => {}
                 Action::None => continue,
@@ -206,7 +349,18 @@ fn event_loop(
                 motion.sheet_opened();
             }
         }
+        if let Some(w) = workers
+            && w.worktrees_due(app, app.tab != tab, now)
+        {
+            app.fresh.worktrees = true;
+            let _ = w.worktrees.send(());
+        }
+        let says = app.freshness(now);
+        if says != said {
+            dirty = true;
+        }
         if dirty || motion.running() {
+            said = says;
             terminal.draw(|f| {
                 let painted = ui::draw(f, app);
                 motion.apply(f.buffer_mut(), &painted);
@@ -216,10 +370,12 @@ fn event_loop(
         let wait = if motion.running() {
             FRAME
         } else {
-            app.toast
-                .as_ref()
-                .map_or(INPUT_POLL, |t| t.until.saturating_duration_since(now))
-                .min(INPUT_POLL)
+            let toast = app.toast.as_ref().map(|t| t.until);
+            [toast, app.freshness_due()]
+                .into_iter()
+                .flatten()
+                .map(|at| at.saturating_duration_since(now))
+                .fold(INPUT_POLL, Duration::min)
         };
         if !event::poll(wait)? {
             continue;
@@ -234,6 +390,63 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Takes in what a reader sent, and says whether the screen changed beyond the header's
+/// word on freshness, which the loop compares on its own. A process board keeps the
+/// worktrees the app already has, since those come from their own reader.
+fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
+    let now = Instant::now();
+    match update {
+        Update::Started => {
+            app.fresh.scanning = Some(now);
+            false
+        }
+        Update::Board(mut board) => {
+            board.worktrees = app.board.worktrees.clone();
+            let changed = *board != app.board;
+            if changed {
+                motion.rows_changed(app.replace_board(*board));
+            }
+            finish_scan(app, now, None) || changed
+        }
+        Update::Failed(why) => {
+            if app.board.ports == Load::Loading {
+                app.board.ports = Load::Failed(why.clone());
+            }
+            finish_scan(app, now, Some(why))
+        }
+        Update::Worktrees(list) => {
+            if list.ready().is_none_or(|l| !l.sizing) {
+                app.fresh.worktrees = false;
+                app.fresh.worktrees_at = Some(now);
+            }
+            let mut board = app.board.clone();
+            board.worktrees = list;
+            motion.rows_changed(app.replace_board(board));
+            true
+        }
+    }
+}
+
+/// Ends a process scan; a toast follows one that `r` asked for, or one that failed.
+fn finish_scan(app: &mut App, now: Instant, failed: Option<String>) -> bool {
+    let f = &mut app.fresh;
+    f.scanning = None;
+    let asked = std::mem::take(&mut f.asked);
+    match failed {
+        None => {
+            f.updated = Some(now);
+            if asked {
+                app.notify_for("Refreshed.", Tone::Ok, REFRESHED_FOR);
+            }
+            asked
+        }
+        Some(why) => {
+            app.notify(format!("Refresh failed: {why}"), Tone::Danger);
+            true
+        }
+    }
 }
 
 /// SIGTERM and SIGINT ask the loop to stop and restore the terminal, and restore it here

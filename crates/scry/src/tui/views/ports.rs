@@ -18,7 +18,8 @@ pub const VIEW: ViewDef = ViewDef {
     rows,
     empty: (
         "No listening ports.",
-        "Nothing on this Mac is accepting connections.",
+        "No process on this Mac is accepting connections. A server you start, such as a dev \
+         server, shows up here with its project and the agent session that started it.",
     ),
     badge,
     hints: &[("x", "stop")],

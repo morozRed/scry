@@ -7,10 +7,11 @@ pub mod worktrees;
 
 use serde::{Deserialize, Serialize};
 
+use crate::home::Home;
 use crate::model::Snapshot;
 pub use agents::AgentRow;
-pub use ports::PortRow;
-pub use worktrees::{WorktreeRow, WorktreesView};
+pub use ports::{PortRow, PortsView};
+pub use worktrees::{WorktreeItem, WorktreeList, WorktreeRow, WorktreesView};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +57,10 @@ pub struct Board {
     pub overview: Overview,
     pub ports: Load<Vec<PortRow>>,
     pub agents: Load<Vec<AgentRow>>,
+    /// Read by a scan of its own, slower than a process snapshot, so a skin keeps it across
+    /// boards made from snapshots.
+    #[serde(default)]
+    pub worktrees: Load<WorktreeList>,
 }
 
 impl Board {
@@ -63,8 +68,9 @@ impl Board {
         Board {
             pulse: None,
             overview: Overview::from_snapshot(s),
-            ports: Load::Unavailable("Port scanning is not built yet.".into()),
+            ports: Load::Ready(PortsView::build(s, Home::from_env().as_ref()).rows),
             agents: Load::Unavailable("Agent sessions are not tracked yet.".into()),
+            worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
         }
     }
 
@@ -140,6 +146,14 @@ pub enum State {
     Filling,
     /// A disk that fills within days.
     Full,
+    /// Worktree states, one per `worktrees::Status`.
+    CanGo,
+    CanPrune,
+    NeedsLook,
+    Dirty,
+    Locked,
+    Active,
+    NotRead,
 }
 
 impl State {
@@ -154,16 +168,24 @@ impl State {
             State::Stale => "stale",
             State::Filling => "filling",
             State::Full => "full",
+            State::CanGo => "can go",
+            State::CanPrune => "can prune",
+            State::NeedsLook => "needs a look",
+            State::Dirty => "dirty",
+            State::Locked => "locked",
+            State::Active => "active",
+            State::NotRead => "not read",
         }
     }
 
     pub fn tone(self) -> Tone {
         match self {
-            State::Live => Tone::Ok,
+            State::Live | State::Active | State::Dirty => Tone::Ok,
             State::Leftover | State::Stale | State::Filling => Tone::Warn,
+            State::CanGo | State::CanPrune | State::NeedsLook => Tone::Warn,
             State::Full => Tone::Danger,
-            State::Kept => Tone::Info,
-            State::Ended | State::Unowned | State::System => Tone::Quiet,
+            State::Kept | State::Locked => Tone::Info,
+            State::Ended | State::Unowned | State::System | State::NotRead => Tone::Quiet,
         }
     }
 }
