@@ -2,6 +2,7 @@
 //! same values later, so nothing here knows about terminals.
 
 pub mod agents;
+pub mod disk;
 pub mod ports;
 pub mod worktrees;
 
@@ -13,6 +14,7 @@ use crate::attribution::{AgentState, Known, Lineage, Policy};
 use crate::home::Home;
 use crate::model::Snapshot;
 pub use agents::AgentRow;
+pub use disk::{DiskItem, DiskList};
 pub use ports::{PortRow, PortsView};
 pub use worktrees::{WorktreeItem, WorktreeList, WorktreeRow, WorktreesView};
 
@@ -64,6 +66,9 @@ pub struct Board {
     /// boards made from snapshots.
     #[serde(default)]
     pub worktrees: Load<WorktreeList>,
+    /// Read with the worktrees, by the same reader.
+    #[serde(default)]
+    pub disk: Load<DiskList>,
 }
 
 impl Board {
@@ -76,6 +81,7 @@ impl Board {
             ports: Load::Ready(PortsView::build(s, Home::from_env().as_ref()).rows),
             agents: Load::Unavailable("Agent sessions are not tracked yet.".into()),
             worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
+            disk: Load::Unavailable("A process snapshot holds no disk reading.".into()),
         }
     }
 
@@ -107,6 +113,7 @@ impl Board {
             ports: Load::Ready(ports),
             agents: Load::Ready(agents),
             worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
+            disk: Load::Unavailable("A process snapshot holds no disk reading.".into()),
         }
     }
 

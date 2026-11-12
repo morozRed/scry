@@ -22,7 +22,7 @@
 mod creator;
 mod discover;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod verdict;
 
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ use serde::Serialize;
 use crate::size::SubtreeSize;
 
 pub use creator::{Agent, Clues, CreatorEvidence, CreatorSource, ProbableCreator};
-pub use discover::{ScanOptions, measure, scan};
+pub use discover::{ScanOptions, apply_sizes, measure, scan};
 pub use verdict::{Finished, KeptBy, NothingLost, Prunable, Safe};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

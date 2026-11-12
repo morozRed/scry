@@ -184,8 +184,17 @@ mod tests {
             first.memory
         );
         assert!(matches!(first.swap, Reading::Ready(_)), "{:?}", first.swap);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        match s.sample().cpu_percent {
+        // The kernel's tick counters can stand still for a moment on a busy machine, as
+        // under a parallel test run, and then a reading still warms up; it never stays so.
+        let mut second = Reading::WarmingUp;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            second = s.sample().cpu_percent;
+            if second != Reading::WarmingUp {
+                break;
+            }
+        }
+        match second {
             Reading::Ready(v) => assert!((0.0..=100.0).contains(&v)),
             other => panic!("second reading {other:?}"),
         }

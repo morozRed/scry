@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{fill, width};
 use crate::tui::theme::{Chrome, Theme, glyph};
+use crate::tui::views::Ink;
 
 /// Up to five eighths of the cell, in the muted ink: a trend beside the number, not the
 /// heaviest thing in the header.
@@ -19,6 +20,32 @@ const SPARK_LEN: usize = 8;
 /// The sparkline scales to its own peak, but never makes a quiet 3% look like a spike.
 const SPARK_FLOOR: u8 = 20;
 const FORECAST_WARN_DAYS: u32 = 30;
+
+/// Lines above a view's list, such as Disk's free space, indented to the list's text.
+pub fn band(f: &mut Frame, area: Rect, theme: &Theme, lines: &[Vec<(String, Ink)>]) {
+    let indent = " ".repeat(theme.cursor.0.width());
+    let lines: Vec<Line> = lines
+        .iter()
+        .map(|segs| {
+            let mut spans = vec![Span::raw(indent.clone())];
+            spans.extend(segs.iter().map(|(text, ink)| {
+                let style = match ink {
+                    Ink::Text => theme.text,
+                    Ink::Strong => theme.strong,
+                    Ink::Muted => theme.muted,
+                    Ink::Faint => theme.faint,
+                    Ink::Tone(t) => theme.tone(*t),
+                };
+                match ink {
+                    Ink::Tone(t) => Span::styled(format!("{} {text}", glyph(*t)), style),
+                    _ => Span::styled(text.clone(), style),
+                }
+            }));
+            super::fit(spans, area.width as usize)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), area);
+}
 
 pub fn rule(f: &mut Frame, area: Rect, theme: &Theme) {
     let line = "─".repeat(area.width as usize);

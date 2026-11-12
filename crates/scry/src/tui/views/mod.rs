@@ -10,7 +10,8 @@ mod worktrees;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use scry_core::view::{Board, Detail, Load, State, Tab, Target, Tone};
+use scry_core::disk::catalog::Kind;
+use scry_core::view::{Board, Detail, DiskItem, Load, State, Tab, Target, Tone};
 
 pub static VIEWS: [ViewDef; 5] = [
     overview::VIEW,
@@ -40,6 +41,38 @@ pub fn empty(view: &ViewDef, board: &Board) -> (String, String) {
 /// about the machine's health, so Agents shows the neutral ○.
 pub fn empty_is_clear(view: &ViewDef) -> bool {
     view.tab != Tab::Agents
+}
+
+/// How a band's text is inked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ink {
+    Text,
+    Strong,
+    Muted,
+    Faint,
+    Tone(Tone),
+}
+
+/// Lines a view shows above its list: Disk's free space and forecast.
+pub fn band(view: &ViewDef, board: &Board) -> Option<Vec<Vec<(String, Ink)>>> {
+    match view.tab {
+        Tab::Disk => disk::band(board),
+        _ => None,
+    }
+}
+
+/// The disk item a row stands for, which `t` cleans up: the row itself on Disk, and the
+/// worktree's item on Worktrees, whose rows are named by their path.
+pub fn disk_item<'a>(tab: Tab, board: &'a Board, row: &str) -> Option<&'a DiskItem> {
+    let list = board.disk.ready()?;
+    match tab {
+        Tab::Disk => list.items.iter().find(|d| d.id == row),
+        Tab::Worktrees => list
+            .items
+            .iter()
+            .find(|d| d.kind == Kind::Worktree && d.path == row),
+        _ => None,
+    }
 }
 
 pub struct ViewDef {

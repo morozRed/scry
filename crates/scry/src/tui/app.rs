@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use scry_core::disk::catalog::Kind;
+use scry_core::disk::clean::{Allows, Plan};
 use scry_core::engine::Labels;
 use scry_core::view::{Board, Load, Tab, Target, Tone};
 
@@ -74,7 +76,19 @@ pub enum Mode {
     /// Typing into the `/` bar of the current view.
     Filter,
     Sheet(Sheet),
+    /// A cleanup waiting for its confirmation; a delete waits for its name to be typed.
+    Clean(CleanSheet),
     Help,
+}
+
+/// What a cleanup will touch, as its confirmation shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CleanSheet {
+    pub plan: Plan,
+    /// The folder as the list shows it, home written as `~`.
+    pub shown: String,
+    /// Typed so far; a delete needs the plan's word.
+    pub typed: String,
 }
 
 /// A confirmation listing exactly what an action would touch.
@@ -124,9 +138,9 @@ pub struct Fresh {
     pub scanning: Option<Instant>,
     /// `r` asked for the scan in progress: it shows at once and ends with a toast.
     pub asked: bool,
-    /// When the worktree scan in progress started.
+    /// When the worktree and disk reading in progress started.
     pub worktrees: Option<Instant>,
-    /// When the last worktree scan, sizes included, finished.
+    /// When the last worktree and disk reading, sizes included, finished.
     pub worktrees_at: Option<Instant>,
 }
 
@@ -143,6 +157,8 @@ pub enum Action {
     Quit,
     Suspend,
     Rescan,
+    /// Run this cleanup, with what was typed to confirm a delete.
+    Clean(Box<(Plan, Option<String>)>),
 }
 
 pub struct App {
@@ -289,14 +305,17 @@ impl App {
     /// once it is slow.
     fn reading(&self) -> Option<(Instant, &'static str)> {
         let f = &self.fresh;
-        if self.tab == Tab::Worktrees
+        if matches!(self.tab, Tab::Worktrees | Tab::Disk)
             && let Some(started) = f.worktrees
         {
-            let sizing = self.board.worktrees.ready().is_some_and(|w| w.sizing);
-            let doing = if sizing {
-                "measuring sizes…"
-            } else {
-                "reading worktrees…"
+            let sizing = match self.tab {
+                Tab::Disk => self.board.disk.ready().is_some_and(|d| d.sizing),
+                _ => self.board.worktrees.ready().is_some_and(|w| w.sizing),
+            };
+            let doing = match (sizing, self.tab) {
+                (true, _) => "measuring sizes…",
+                (false, Tab::Disk) => "reading the disk…",
+                (false, _) => "reading worktrees…",
             };
             return Some((started, doing));
         }
@@ -363,6 +382,7 @@ impl App {
             Mode::Filter if key.modifiers.contains(KeyModifiers::ALT) => Action::None,
             Mode::Filter => self.on_filter(key.code),
             Mode::Sheet(_) => self.on_sheet(key.code),
+            Mode::Clean(_) => self.on_clean(key.code),
             Mode::Help => match key.code {
                 KeyCode::Esc | KeyCode::Char('?' | 'q') | KeyCode::Enter => {
                     self.mode = Mode::Normal;
@@ -410,6 +430,7 @@ impl App {
             }
             KeyCode::Char('x') => self.ask_stop(),
             KeyCode::Char('X') => self.ask_reap(),
+            KeyCode::Char('t') => self.ask_clean(),
             KeyCode::Char('r') => Action::Rescan,
             _ => Action::None,
         }
@@ -478,6 +499,95 @@ impl App {
             KeyCode::Char('G') | KeyCode::End => self.scroll_sheet(isize::MAX / 2),
             _ => Action::None,
         }
+    }
+
+    /// Enter confirms, once a delete's word is typed exactly; esc cancels. A delete's sheet
+    /// takes every other key as typing.
+    fn on_clean(&mut self, code: KeyCode) -> Action {
+        let Mode::Clean(sheet) = &mut self.mode else {
+            return Action::None;
+        };
+        let word = sheet.plan.word.clone();
+        match (code, &word) {
+            (KeyCode::Esc, _) | (KeyCode::Char('n' | 'q'), None) => self.enter(Mode::Normal),
+            (KeyCode::Enter | KeyCode::Char('y'), None) | (KeyCode::Enter, Some(_)) => {
+                if let Some(w) = &word
+                    && sheet.typed.trim() != w
+                {
+                    self.notify(format!("Type {w} exactly to delete it."), Tone::Warn);
+                    return Action::Redraw;
+                }
+                let Mode::Clean(sheet) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+                    return Action::None;
+                };
+                let typed = word.map(|_| sheet.typed);
+                Action::Clean(Box::new((sheet.plan, typed)))
+            }
+            (KeyCode::Backspace, Some(_)) => {
+                sheet.typed.pop();
+                Action::Redraw
+            }
+            (KeyCode::Char(c), Some(_)) => {
+                sheet.typed.push(c);
+                Action::Redraw
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// `t` on Disk or Worktrees: a confirmation for what the item allows, or a word on why
+    /// there is none.
+    fn ask_clean(&mut self) -> Action {
+        if !matches!(self.tab, Tab::Disk | Tab::Worktrees) {
+            return Action::None;
+        }
+        let Some(row) = self.selected_row() else {
+            return Action::None;
+        };
+        let Some(item) = views::disk_item(self.tab, &self.board, &row.id) else {
+            let why = match self.board.disk {
+                Load::Ready(_) => "Only worktrees that can go or can be pruned are cleaned up.",
+                _ => "Still reading the disk.",
+            };
+            self.notify(why, Tone::Quiet);
+            return Action::Redraw;
+        };
+        let (text, tone) = match (&item.plan, &item.allows) {
+            (Some(plan), _) => {
+                let sheet = CleanSheet {
+                    plan: plan.clone(),
+                    shown: item.path.clone(),
+                    typed: String::new(),
+                };
+                return self.enter(Mode::Clean(sheet));
+            }
+            (None, Allows::Command { command }) => (
+                format!("Scry runs nothing here. Run it yourself: {command}"),
+                Tone::Info,
+            ),
+            // A worktree's reason is its label; a catalog entry's is in its detail already.
+            (None, Allows::Never { why }) if item.kind == Kind::Worktree => {
+                (why.clone(), Tone::Quiet)
+            }
+            (None, Allows::Never { .. }) => (
+                "Scry does not clean this up; it shows its size only.".to_string(),
+                Tone::Quiet,
+            ),
+            (None, Allows::Off { .. }) => {
+                let config = self
+                    .board
+                    .disk
+                    .ready()
+                    .map_or("config.toml".to_string(), |l| l.config.clone());
+                (
+                    format!("Cleanup is off: set destructive = true in {config}."),
+                    Tone::Quiet,
+                )
+            }
+            (None, _) => ("It is not measured yet.".to_string(), Tone::Quiet),
+        };
+        self.notify(text, tone);
+        Action::Redraw
     }
 
     fn scroll_sheet(&mut self, by: isize) -> Action {

@@ -10,8 +10,8 @@ session that made it, so you can see what is safe to stop or delete. An MCP serv
 that gives agents the same answers is planned.
 
 > **Status:** early development. The process scan, the terminal UI shell and the
-> `ports`, `why` and `stop` commands work. Agents, disk and worktrees are being
-> built. See the [roadmap](PLAN.md).
+> `ports`, `why`, `stop`, `agents`, `leftovers`, `worktrees`, `disk` and `clean`
+> commands work. See the [roadmap](PLAN.md).
 
 ## Screenshots
 
@@ -40,8 +40,8 @@ Nothing is stopped on one key. Every action opens a sheet that lists each target
 and what it frees.
 
 Scry follows your terminal's light or dark theme. These screens are drawn from a
-synthetic fixture with `cargo run -p scry --example shots`; the Disk and Worktrees
-views show sample data until those parts are built. The design notes are
+synthetic fixture with `cargo run -p scry --example shots`, so every view shows sample
+data. The design notes are
 in [docs/design.md](docs/design.md).
 
 ## Requirements
@@ -152,6 +152,40 @@ drop-ins, merged as Claude Code merges them) would stop user hooks from running,
 and when `claude --version` is older than 2.1.139, which runs a hook's `command`
 without its `args`. The hook prints nothing, always exits 0 and appends one line to
 Scry's spool. It never installs a `WorktreeCreate` hook.
+
+## Disk
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/disk-dark-120x40.svg">
+  <img alt="The Disk view: free space and its forecast, then caches, node_modules and worktrees ranked by what deleting them frees" src="docs/screens/disk-light-120x40.svg">
+</picture>
+
+```sh
+scry disk                       # free space, forecast, and the 15 largest items
+scry disk --top 40 --json
+scry clean npm-cache            # delete a cache after you type its name
+scry clean worktree:~/sources/acme-wt-old --yes
+```
+
+Scry sizes a reviewed list of places developer tools fill: Xcode, simulators,
+Docker's disk, package caches, agent session logs, app caches, every `node_modules`
+under your code roots, and linked worktrees. It never looks inside Desktop,
+Documents or Downloads. Each item shows the space it holds and at least what
+deleting it frees at once, which is less when its files are clones or hard links of
+others, as pnpm and uv make them. Free space is what Finder calls available;
+purgeable space and local snapshots are listed apart. A forecast of when the disk
+fills appears once the background recorder has 48 hours of samples.
+
+Each item allows one cleanup: **trash** (Put Back restores it; space returns when
+the Trash is emptied), **delete** for caches a tool fills again, after you type the
+item's name, **command**, which shows the tool's own cleanup for you to run, or
+**never**. A worktree goes to the Trash only when it is labelled "can go", and git's
+record of it is pruned after. Right before acting Scry checks that the folder is
+still the one it listed and the worktree's label has not changed. Cleanup is off
+until you set `destructive = true`, and every attempt is written to an audit log.
+
+Sizes are kept in Scry's store and checked against FSEvents, so a second run walks
+only what changed since the first.
 
 ## Background recorder
 

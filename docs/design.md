@@ -112,8 +112,14 @@ dark, holds. Without truecolor Scry falls back to exactly that principle, below.
 | Disk | [svg](screens/disk-light-80x24.svg) | [svg](screens/disk-dark-80x24.svg) | [svg](screens/disk-light-120x40.svg) | [svg](screens/disk-dark-120x40.svg) |
 | Worktrees | [svg](screens/worktrees-light-80x24.svg) | [svg](screens/worktrees-dark-80x24.svg) | [svg](screens/worktrees-light-120x40.svg) | [svg](screens/worktrees-dark-120x40.svg) |
 
-Disk is not built yet, so it shows what it will hold and what its history needs. The
-Worktrees fixture rows are synthetic.
+The Disk and Worktrees fixture rows are synthetic. Disk's cleanup sheets, a delete that
+waits for the item's name and a worktree going to the Trash:
+[delete light](screens/disk-delete-light.svg),
+[delete dark](screens/disk-delete-dark.svg),
+[trash light](screens/disk-trash-light.svg),
+[trash dark](screens/disk-trash-dark.svg).
+
+![Disk at 120×40, dark](screens/disk-dark-120x40.svg)
 
 On a first run with nothing to report, a view says what it checked and how to fill it:
 the Overview names the checks behind its all-clear, and an empty Agents view names the
@@ -219,6 +225,14 @@ All in `crates/scry/src/tui/kit/`:
   the title and total stay in view. It keeps its place through a resize. A sheet that would
   leave fewer than four rows of the list above it covers the whole body. Only the command
   name in each row is bold.
+- `band`, in `chrome`: lines above a view's list, indented to its text. Disk shows free
+  space (Finder's "available", then purgeable space and local snapshots) on one line and
+  the forecast, the Trash and how much cleanup could free on the next. The forecast is a
+  glyph and a word like every state: ▲ "full in ~19 days", ● "not filling".
+- The cleanup sheet, in `overlay`: rises like the stop sheet and names the action, the
+  folder as the list shows it, its size and at least what it frees, and for a worktree its
+  repo. A delete waits for the item's name to be typed into the sheet; enter does nothing
+  until it matches.
 - `states`: empty, loading, unavailable and failed, each a glyph and a sentence. ✓ is kept
   for an all-clear, a view that read its source and found nothing to show. No rows matching
   the filter, and an Overview whose sources are not collected yet, get a neutral ○. Under
@@ -232,9 +246,10 @@ The keys mean different things in each mode, so the mode is one value, not a set
 
 | Mode | Keys |
 |---|---|
-| Normal | `j k ↑ ↓ g G` move, `⏎` fold a session or go to its row, `h l` fold and unfold (`h` on a process goes to its parent), `1-5 tab` views, `/` filter, `esc` clear the filter, `s S` sort, `x` stop, `X` reap, `r` refresh, `?` help, `q` quit |
+| Normal | `j k ↑ ↓ g G` move, `⏎` fold a session or go to its row, `h l` fold and unfold (`h` on a process goes to its parent), `1-5 tab` views, `/` filter, `esc` clear the filter, `s S` sort, `x` stop, `X` reap, `t` clean up (Disk and Worktrees), `r` refresh, `?` help, `q` quit |
 | Filter | type to filter, `⏎` keep, `esc` clear, `↑ ↓` move |
 | Sheet | `⏎` confirm, `j k` scroll, `esc` cancel |
+| Clean | `⏎` or `y` confirm, `esc` cancel; for a delete, type the name, then `⏎` |
 | Help | `esc ? q` close |
 
 Only `q` and ctrl-c quit, so one `esc` too many never closes Scry. In the filter, alt chords
@@ -254,7 +269,12 @@ back to its natural order until the column returns. STATE sorts by what it asks 
 full, then leftover, stale and filling, then kept, the quiet states and live last. Rows
 without a value come last whichever way a column sorts.
 
-Stopping and reaping are not wired to signals yet; confirming a sheet says so.
+Stopping and reaping are not wired to signals yet; confirming a sheet says so. Cleanup
+is: `t` on an item opens its sheet when the item allows an action, and otherwise says in
+the footer why not (the command to run yourself, "shows its size only", or that cleanup
+is off). A confirmed cleanup runs off the UI thread; the footer says "Cleaning up…", then
+"Moved 1.3 GB to Trash; the Trash holds at least 3.7 GB. Empty it to free the space." or
+why nothing was done, and the views read the disk again.
 
 ### Motion
 
@@ -269,20 +289,21 @@ an effect runs, every 16 ms; then it goes back to waiting for input.
 
 Live data comes from two readers off the UI thread. Process snapshots, which carry the
 ports, are read at start and then every `[tui] refresh_secs` (5 s by default, 1 to 60, 0
-for only on `r`). Worktrees are read when their view opens: git state first, then the
-sizes, which take seconds, so the list shows at once with `…` in SIZE and the header says
-"measuring sizes…". Sizing is costly (15 s and 38 s of CPU across cores for 1.6 million
-entries on the reference Mac), so worktrees are never read on a timer: coming back to the
-view reads them again when the last reading is over 10 minutes old. `r` asks for a process
-reading at once, and on the Worktrees view for a worktree reading too; the footer says
-"Refreshed." when it lands.
+for only on `r`). Worktrees and the disk are read together when either view opens, from
+the size cache in Scry's store: the catalog's items show at once with their cached
+sizes, the worktrees once git has read them, and then the parts that FSEvents says
+changed are walked again. A size shown while its folder is read again ends in `…`.
+Walking everything once took about 50 s on the reference Mac, so this reading never runs
+on a timer: coming back to the view reads it again when the last reading is over 2
+minutes old. `r` asks for a process reading at once, and on Disk or Worktrees for a disk
+reading too; the footer says "Refreshed." when it lands.
 
 The header shows no clock. Its right end is empty while nothing is read, and holds a muted
 braille spinner (`⠋⠙⠹…`, 10 frames a second) while a reading the view waits on is in
 flight: one that `r` asked for at once, an automatic one only after 300 ms, so a quick
 refresh (about 70 ms on the reference Mac) never blinks. A reading past one second says
-what it is doing beside the spinner: "refreshing…", or on the Worktrees view
-"reading worktrees…" and "measuring sizes…". A fixture shows its name there instead.
+what it is doing beside the spinner: "refreshing…", or on Disk and Worktrees
+"reading the disk…", "reading worktrees…" and "measuring sizes…". A fixture shows its name there instead.
 
 A reading that changes nothing on screen draws nothing. A new board is compared with the
 old by what the view shows, the header pulse, the tab counts and each row's text and
@@ -297,8 +318,11 @@ values:
 
 - `Board`: every view model at one moment: `pulse: Option<Pulse>`, `overview: Overview`,
   `ports: Load<Vec<PortRow>>`, `agents: Load<Vec<AgentRow>>`,
-  `worktrees: Load<WorktreeList>`. A recorded board is a design fixture:
-  `scry tui --fixture fixtures/design.json`.
+  `worktrees: Load<WorktreeList>`, `disk: Load<DiskList>`. A recorded board is a design
+  fixture: `scry tui --fixture fixtures/design.json`.
+- `DiskList`: free space, the forecast, the Trash, and the items ranked by what deleting
+  them frees. Each `DiskItem` carries what it allows (`Allows`: trash, delete, prune,
+  command, never, or off) and, when that is an action, the exact `Plan` its sheet shows.
 - `WorktreeList`: the worktree rows, the folders searched, the config file that sets them,
   and `sizing` while sizes are still measured.
 - `Load<T>`: `Loading`, `Unavailable(reason)`, `Failed(reason)` or `Ready(T)`. Every view
@@ -317,8 +341,8 @@ set of folded rows.
 Each view is one file in `crates/scry/src/tui/views/` that fills a `ViewDef`: its columns, a
 function from `Board` to rows, its empty text, its tab badge, its key hints and what `X`
 reaps. `views/mod.rs` lists them in `VIEWS`, one line each; all five are registered already.
-To fill Disk, add its model in `scry-core/src/view/disk.rs` with a field on `Board`, then
-replace the rows function in `views/disk.rs`.
+A view's model lives in `scry-core/src/view/` with a field on `Board`; `views::band` and
+`views::empty` name the views with a band or an empty text that only the board knows.
 
 ## Rerunning the pictures and the numbers
 

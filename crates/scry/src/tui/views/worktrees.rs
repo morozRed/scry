@@ -21,7 +21,7 @@ pub const VIEW: ViewDef = ViewDef {
     // `empty` below says which folders were searched.
     empty: ("No linked worktrees.", ""),
     badge,
-    hints: &[],
+    hints: &[("t", "clean up")],
     reap: None,
 };
 

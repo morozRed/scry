@@ -22,7 +22,7 @@ use super::{
 };
 use crate::git::{self, Ref};
 use crate::protected::{FileId, Protected, Resolved, file_id, read_no_follow};
-use crate::size::Walker;
+use crate::size::{SubtreeSize, Walker};
 
 pub struct ScanOptions {
     pub home: PathBuf,
@@ -233,7 +233,17 @@ pub fn measure(scan: &mut WorktreeScan, home: &Path) {
     let start = Instant::now();
     let roots: Vec<PathBuf> = scan.worktrees.iter().map(|w| w.path.clone()).collect();
     let sizes = Walker::new(home).exclude(roots.clone()).measure(&roots);
+    apply_sizes(scan, sizes.into_iter().map(Some).collect());
+    scan.timings.size_ms = ms(start);
+    scan.timings.total_ms += scan.timings.size_ms;
+}
+
+/// Takes in sizes measured elsewhere, such as from the size cache, one per worktree in
+/// order, and judges again each worktree that got one. A worktree whose size is `None`
+/// keeps its state, which is never "can go" before its folder was walked.
+pub fn apply_sizes(scan: &mut WorktreeScan, sizes: Vec<Option<SubtreeSize>>) {
     for (w, size) in scan.worktrees.iter_mut().zip(sizes) {
+        let Some(size) = size else { continue };
         if let Some(facts) = w.state.facts() {
             let mut facts = facts.clone();
             facts.per_worktree.repos_inside = match size.error {
@@ -247,8 +257,6 @@ pub fn measure(scan: &mut WorktreeScan, home: &Path) {
         }
         w.size = Some(size);
     }
-    scan.timings.size_ms = ms(start);
-    scan.timings.total_ms += scan.timings.size_ms;
 }
 
 fn ms(since: Instant) -> f64 {
