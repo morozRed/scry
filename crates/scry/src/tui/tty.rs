@@ -62,7 +62,13 @@ pub fn save() {
     // SAFETY: `path` points to a NUL-terminated string that outlives the call. The
     // descriptor stays open for the life of the process.
     let fd = unsafe { libc::open(path, flags) };
-    if fd < 0 || fd >= libc::FD_SETSIZE as libc::c_int {
+    if fd < 0 {
+        return;
+    }
+    // `select` cannot watch a descriptor this high, so Scry does without one.
+    if fd >= libc::FD_SETSIZE as libc::c_int {
+        // SAFETY: `fd` was opened above and is not used again.
+        unsafe { libc::close(fd) };
         return;
     }
     // SAFETY: termios is plain data, so all zeroes is a valid value for tcgetattr to fill.
@@ -128,8 +134,11 @@ pub fn ask(signal: &AtomicI32) -> Answer {
         if scan.done || left.is_zero() || stopped() {
             break scan;
         }
-        if !matches!(ready(t.fd, Dir::Read, left.min(SLICE)), Ok(true)) {
-            continue;
+        match ready(t.fd, Dir::Read, left.min(SLICE)) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) if retry(e.kind()) => continue,
+            Err(_) => break scan,
         }
         // SAFETY: reads at most `chunk.len()` bytes into a live buffer.
         let n = unsafe { libc::read(t.fd, chunk.as_mut_ptr().cast(), chunk.len()) };
