@@ -23,6 +23,23 @@ pub fn width(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.content.width()).sum()
 }
 
+/// Lines `text` takes when word-wrapped to `width` columns.
+pub fn wrapped_lines(text: &str, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let mut lines = 1;
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let w = word.width();
+        if used > 0 && used + 1 + w > width {
+            lines += 1;
+            used = w;
+        } else {
+            used += w + usize::from(used > 0);
+        }
+    }
+    lines
+}
+
 /// Pads `text` with spaces to `cols` display columns.
 pub fn pad(text: &str, cols: usize) -> String {
     format!("{text}{}", " ".repeat(cols.saturating_sub(text.width())))
@@ -112,6 +129,14 @@ mod tests {
             line(fit(vec![Span::raw("cafe\u{301}st")], 5)),
             "cafe\u{301}…"
         );
+    }
+
+    #[test]
+    fn wrapped_lines_breaks_between_words() {
+        assert_eq!(wrapped_lines("one two three", 13), 1);
+        assert_eq!(wrapped_lines("one two three", 12), 2);
+        assert_eq!(wrapped_lines("東京 東京", 4), 2);
+        assert_eq!(wrapped_lines("", 10), 1);
     }
 
     #[test]

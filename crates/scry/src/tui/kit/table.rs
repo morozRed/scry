@@ -18,9 +18,15 @@ use crate::tui::views::{self, CellKind, Column, Hits, Shown, Sort, Width, is_num
 const GAP: u16 = 2;
 /// ` ↓` after a sorted column's title.
 const ARROW: u16 = 2;
+/// A text column grows to its longest cell up to this, and no further while the numbers
+/// beside it have room: past it, long cells end in `…` rather than push the numbers away.
+const FILL_MAX: u16 = 48;
 
 pub struct ListView<'a> {
     pub columns: &'a [Column],
+    /// Every row of the view, filtered or not, so widths and alignment hold still while a
+    /// filter or a fold changes what is shown.
+    pub rows: &'a [views::Row],
     pub shown: &'a [Shown<'a>],
     pub cursor: usize,
     pub sort: Option<Sort>,
@@ -37,32 +43,8 @@ pub fn table(
     let cursor_w = theme.cursor.0.width() as u16;
     let inner = area.width.saturating_sub(cursor_w);
     let visible = views::visible(list.columns, area.width);
-    let constraints: Vec<Constraint> = visible
-        .iter()
-        .map(|&i| {
-            let c = &list.columns[i];
-            // A sortable column keeps room for its arrow, so the title is never cut.
-            let title = if c.sortable {
-                c.title.width() as u16 + ARROW
-            } else {
-                0
-            };
-            match c.width {
-                Width::Fixed(w) => Constraint::Length(w.max(title)),
-                Width::Fill(min) => Constraint::Min(min.max(title)),
-            }
-        })
-        .collect();
-    let widths: Vec<u16> = Layout::horizontal(constraints)
-        .spacing(GAP)
-        .split(Rect::new(0, 0, inner, 1))
-        .iter()
-        .map(|r| r.width)
-        .collect();
-    let numeric: Vec<bool> = visible
-        .iter()
-        .map(|&i| is_numeric(list.shown.iter().map(|s| s.row), i))
-        .collect();
+    let widths = widths(list, &visible, inner);
+    let numeric: Vec<bool> = visible.iter().map(|&i| is_numeric(list.rows, i)).collect();
 
     let header = Row::new(visible.iter().enumerate().map(|(n, &i)| {
         let mut title = list.columns[i].title.to_string();
@@ -124,6 +106,74 @@ pub fn table(
             (s.row.id.clone(), Rect::new(area.x, y, area.width, 1))
         })
         .collect()
+}
+
+/// Column widths: text columns as wide as their longest cell (at most `FILL_MAX`), with the
+/// spare width left at the right. When that does not fit, text columns share what the
+/// fixed ones leave.
+fn widths(list: &ListView, visible: &[usize], inner: u16) -> Vec<u16> {
+    // A sortable column keeps room for its arrow, so the title is never cut.
+    let title = |c: &Column| {
+        if c.sortable {
+            c.title.width() as u16 + ARROW
+        } else {
+            0
+        }
+    };
+    let natural: Vec<u16> = visible
+        .iter()
+        .map(|&i| {
+            let c = &list.columns[i];
+            match c.width {
+                Width::Fixed(w) => w.max(title(c)),
+                Width::Fill(min) => longest(list.rows, i).min(FILL_MAX).max(min).max(title(c)),
+            }
+        })
+        .collect();
+    let gaps = GAP * visible.len().saturating_sub(1) as u16;
+    if natural.iter().sum::<u16>() + gaps <= inner {
+        return natural;
+    }
+    let constraints = visible.iter().zip(&natural).map(|(&i, &w)| {
+        let c = &list.columns[i];
+        match c.width {
+            Width::Fixed(_) => Constraint::Length(w),
+            Width::Fill(min) => Constraint::Min(min.max(title(c))),
+        }
+    });
+    Layout::horizontal(constraints)
+        .spacing(GAP)
+        .split(Rect::new(0, 0, inner, 1))
+        .iter()
+        .map(|r| r.width)
+        .collect()
+}
+
+/// The widest cell of column `i` across `rows`, with the tree guides and fold count the
+/// first column adds.
+fn longest(rows: &[views::Row], i: usize) -> u16 {
+    rows.iter()
+        .enumerate()
+        .map(|(n, r)| {
+            let Some(cell) = r.cells.get(i) else {
+                return 0;
+            };
+            let context = cell.context.as_ref().map_or(0, |c| 2 + c.width());
+            let mut w = cell.text.width() + context;
+            if i == 0 {
+                w += 2 + 2 * r.depth as usize;
+                let below = rows[n + 1..]
+                    .iter()
+                    .take_while(|c| c.depth > r.depth)
+                    .count();
+                if below > 0 {
+                    w += 3 + below.to_string().len();
+                }
+            }
+            w as u16
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn first_cell<'a>(theme: &Theme, s: &Shown<'a>, hits: &Hits) -> Vec<Span<'a>> {

@@ -10,7 +10,7 @@ mod worktrees;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use scry_core::view::{Board, Detail, Load, State, Tab, Target};
+use scry_core::view::{Board, Detail, Load, State, Tab, Target, Tone};
 
 pub static VIEWS: [ViewDef; 5] = [
     overview::VIEW,
@@ -168,10 +168,19 @@ impl Cell {
         }
     }
 
+    /// Sorts by how much the state asks of the user: full, then leftover, stale and
+    /// filling, then kept, the quiet ones, and live last.
     pub fn state(state: Option<State>) -> Cell {
         match state {
             Some(s) => Cell {
                 kind: CellKind::State(s),
+                key: SortKey::Num(match s.tone() {
+                    Tone::Danger => 0,
+                    Tone::Warn => 1,
+                    Tone::Info => 2,
+                    Tone::Quiet => 3,
+                    Tone::Ok => 4,
+                }),
                 ..Cell::text(s.word())
             },
             None => Cell::empty(),
@@ -384,11 +393,19 @@ fn sorted(rows: &[Row], sort: Option<Sort>) -> Vec<usize> {
     let Some(sort) = sort else {
         return (0..rows.len()).collect();
     };
-    let cmp = |a: &Row, b: &Row| {
-        let ka = a.cells.get(sort.column).map(|c| &c.key);
-        let kb = b.cells.get(sort.column).map(|c| &c.key);
-        let o = ka.partial_cmp(&kb).unwrap_or(Ordering::Equal);
-        if sort.descending { o.reverse() } else { o }
+    // Rows without a value come last whichever way the column sorts.
+    fn key(r: &Row, column: usize) -> Option<&SortKey> {
+        r.cells
+            .get(column)
+            .map(|c| &c.key)
+            .filter(|k| **k != SortKey::None)
+    }
+    let cmp = |a: &Row, b: &Row| match (key(a, sort.column), key(b, sort.column)) {
+        (Some(ka), Some(kb)) => {
+            let o = ka.partial_cmp(kb).unwrap_or(Ordering::Equal);
+            if sort.descending { o.reverse() } else { o }
+        }
+        (a, b) => b.is_some().cmp(&a.is_some()),
     };
     let mut out = Vec::with_capacity(rows.len());
     sort_level(rows, 0, rows.len(), &cmp, &mut out);

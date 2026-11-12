@@ -10,17 +10,34 @@ use scry_core::view::Detail;
 
 use unicode_width::UnicodeWidthStr;
 
-use super::{fill, pad, width};
+use super::{fill, pad, width, wrapped_lines};
 use crate::tui::theme::{Chrome, Theme};
 
-pub fn detail(f: &mut Frame, area: Rect, theme: &Theme, d: &Detail, beside: bool) {
-    let block = match theme.chrome {
-        Chrome::Bands => {
-            fill(f, area, theme.surface);
-            Block::new().padding(Padding::new(2, 2, u16::from(beside), 0))
-        }
+const EVIDENCE: &str = "evidence  ";
+
+fn block(theme: &Theme, beside: bool) -> Block<'static> {
+    match theme.chrome {
+        Chrome::Bands => Block::new().padding(Padding::new(2, 2, u16::from(beside), 0)),
         Chrome::Rules => Block::new().padding(Padding::horizontal(1)),
-    };
+    }
+}
+
+/// Rows the pane needs to show `d` whole below a list `width` columns wide.
+pub fn height(theme: &Theme, d: &Detail, width: u16) -> u16 {
+    let room = block(theme, false).inner(Rect::new(0, 0, width, 1)).width;
+    let evidence: u16 = d
+        .evidence
+        .iter()
+        .map(|e| wrapped_lines(&format!("{EVIDENCE}{e}"), room))
+        .sum();
+    1 + wrapped_lines(&d.sentence, room) + evidence
+}
+
+pub fn detail(f: &mut Frame, area: Rect, theme: &Theme, d: &Detail, beside: bool) {
+    if theme.chrome == Chrome::Bands {
+        fill(f, area, theme.surface);
+    }
+    let block = block(theme, beside);
     let lines = if beside {
         tall(theme, d)
     } else {
@@ -55,7 +72,7 @@ fn wide<'a>(theme: &Theme, d: &'a Detail, room: usize) -> Vec<Line<'a>> {
     ];
     for e in &d.evidence {
         lines.push(Line::from(vec![
-            Span::styled("evidence  ", theme.muted),
+            Span::styled(EVIDENCE, theme.muted),
             Span::styled(e.as_str(), theme.text.add_modifier(Modifier::ITALIC)),
         ]));
     }

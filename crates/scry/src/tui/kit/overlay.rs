@@ -2,23 +2,39 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Row, Table, Wrap};
 use scry_core::view::{human_age, human_bytes};
-use unicode_width::UnicodeWidthStr;
 
+use super::wrapped_lines;
 use crate::tui::app::{Sheet, SheetKind};
 use crate::tui::theme::{Chrome, Theme};
 
-fn card(theme: &Theme, borders: Borders) -> Block<'static> {
-    let block = Block::new()
-        .borders(borders)
-        .border_style(theme.border)
-        .style(theme.surface);
+/// A sheet that would leave fewer rows than this of the list above it covers the body, so
+/// no lone row peeks out above its edge.
+const PEEK_MIN: u16 = 4;
+/// The plain background kept around the help card, so nothing under it touches its edge.
+const MARGIN: (u16, u16) = (2, 1);
+
+/// Raised above the screen on its own surface. In the tinted look the fill is the edge, so
+/// it ends on a cell boundary; a line through the edge cells would leave half a cell of
+/// fill outside it. The ANSI look has no fill and draws `lines` instead.
+fn card(theme: &Theme, lines: Borders) -> Block<'static> {
+    let block = Block::new().style(theme.raised);
     match theme.chrome {
-        Chrome::Rules => block,
-        Chrome::Bands => block.border_type(BorderType::Rounded),
+        Chrome::Rules => block.borders(lines).border_style(theme.border),
+        Chrome::Bands => block,
     }
+}
+
+/// Fades what an overlay covers to the faint ink, so the overlay is the one thing to read
+/// and the edges of the text under it do not compete with it.
+pub fn scrim(f: &mut Frame, area: Rect, theme: &Theme) {
+    let style = theme
+        .faint
+        .remove_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::UNDERLINED);
+    f.buffer_mut().set_style(area, style);
 }
 
 /// The key that confirms a sheet, worded for what it sends.
@@ -56,16 +72,34 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
         ]));
     }
 
-    let block = card(theme, Borders::TOP).padding(Padding::new(2, 2, 1, 1));
-    let probe = block.inner(body);
-    let head = text.len() as u16 + wrapped_extra(what, probe.width) + 1;
-    let height = ((body.height - probe.height) + head + 1 + n as u16).min(body.height);
+    let padding = Padding::new(2, 2, 1, 1);
+    let probe = card(theme, Borders::TOP).padding(padding).inner(body);
+    let head = text.len() as u16 + wrapped_lines(what, probe.width);
+    let mut height = ((body.height - probe.height) + head + 1 + n as u16).min(body.height);
+    if body.height - height < PEEK_MIN {
+        height = body.height;
+    }
+    // A sheet as tall as the body sits right under the ANSI look's rule, which is its edge.
+    let lines = if height == body.height {
+        Borders::NONE
+    } else {
+        Borders::TOP
+    };
+    let block = card(theme, lines).padding(padding);
     let area = Rect {
         y: body.bottom() - height,
         height,
         ..body
     };
     let inner = block.inner(area);
+    // A row of plain background keeps the list off the sheet's edge.
+    let above = area.y.saturating_sub(1).max(body.y);
+    let gap = Rect {
+        y: above,
+        height: area.y - above,
+        ..area
+    };
+    f.render_widget(Clear, gap);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
     let [head, list] =
@@ -111,10 +145,15 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
     widths.push(Constraint::Length(6));
     titles.push(Line::from("FREES").right_aligned());
     let rows = sheet.targets[top..top + rows_shown].iter().map(|t| {
+        let (name, args) = t.command.split_once(' ').unwrap_or((&t.command, ""));
+        let mut command = vec![Span::styled(name.to_string(), theme.strong)];
+        if !args.is_empty() {
+            command.push(Span::styled(format!(" {args}"), theme.text));
+        }
         let mut cells = vec![
             Line::styled(t.pid.to_string(), theme.text),
             Line::styled(human_age(t.age_s), theme.text),
-            Line::styled(t.command.clone(), theme.strong),
+            Line::from(command),
         ];
         if wide {
             cells.push(Line::styled(
@@ -144,23 +183,6 @@ pub fn sheet(f: &mut Frame, body: Rect, theme: &Theme, sheet: &Sheet) -> Rect {
     area
 }
 
-/// Lines a sentence gains when word-wrapped to `width`.
-fn wrapped_extra(text: &str, width: u16) -> u16 {
-    let width = width.max(1) as usize;
-    let mut lines = 1;
-    let mut used = 0;
-    for word in text.split_whitespace() {
-        let w = word.width();
-        if used > 0 && used + 1 + w > width {
-            lines += 1;
-            used = w;
-        } else {
-            used += w + usize::from(used > 0);
-        }
-    }
-    lines - 1
-}
-
 const KEYS: [(&str, &str, &str); 14] = [
     ("Move", "j k ↑ ↓", "up and down, ctrl-d ctrl-u by page"),
     ("", "g G", "first and last row"),
@@ -178,29 +200,40 @@ const KEYS: [(&str, &str, &str); 14] = [
     ("", "q", "quit"),
 ];
 
+/// The keys, centred over the body on a raised card with a margin of plain background.
 pub fn help(f: &mut Frame, body: Rect, theme: &Theme) {
-    let w = 58.min(body.width);
-    let h = (KEYS.len() as u16 + 4).min(body.height);
+    let mut lines = vec![Line::styled("Keys", theme.strong), Line::raw("")];
+    lines.extend(KEYS.iter().map(|(group, keys, what)| {
+        Line::from(vec![
+            Span::styled(format!("{group:<7}"), theme.heading),
+            Span::styled(format!("{keys:<10}"), theme.key),
+            Span::styled(*what, theme.text),
+        ])
+    }));
+    // The same outer size in both looks: in the ANSI look a line takes the outer cell on
+    // each side.
+    let block = match theme.chrome {
+        Chrome::Bands => card(theme, Borders::NONE).padding(Padding::new(3, 3, 1, 1)),
+        Chrome::Rules => card(theme, Borders::ALL).padding(Padding::horizontal(2)),
+    };
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (widest + 6).min(body.width);
+    let h = (lines.len() as u16 + 2).min(body.height);
     let area = Rect {
         x: body.x + (body.width - w) / 2,
         y: body.y + (body.height - h) / 2,
         width: w,
         height: h,
     };
-    let lines: Vec<Line> = KEYS
-        .iter()
-        .map(|(group, keys, what)| {
-            Line::from(vec![
-                Span::styled(format!("{group:<7}"), theme.heading),
-                Span::styled(format!("{keys:<10}"), theme.key),
-                Span::styled(*what, theme.text),
-            ])
-        })
-        .collect();
-    let block = card(theme, Borders::ALL)
-        .title(Span::styled(" Keys ", theme.strong))
-        .padding(Padding::uniform(1));
-    f.render_widget(Clear, area);
+    let (mx, my) = MARGIN;
+    let margin = Rect {
+        x: area.x.saturating_sub(mx).max(body.x),
+        y: area.y.saturating_sub(my).max(body.y),
+        width: w + 2 * mx,
+        height: h + 2 * my,
+    }
+    .intersection(body);
+    f.render_widget(Clear, margin);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 

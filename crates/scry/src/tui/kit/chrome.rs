@@ -10,7 +10,9 @@ use scry_core::view::{Board, Pulse, Tab, Tone, human_bytes};
 use super::{fill, width};
 use crate::tui::theme::{Chrome, Theme, glyph};
 
-const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Up to five eighths of the cell, in the muted ink: a trend beside the number, not the
+/// heaviest thing in the header.
+const SPARK: [char; 5] = ['▁', '▂', '▃', '▄', '▅'];
 const SPARK_LEN: usize = 8;
 /// The sparkline scales to its own peak, but never makes a quiet 3% look like a spike.
 const SPARK_FLOOR: u8 = 20;
@@ -69,7 +71,7 @@ fn pulse<'a>(theme: &Theme, p: &Pulse) -> Vec<Vec<Span<'a>>> {
                 .collect();
             vec![
                 label("cpu "),
-                Span::styled(spark, theme.accent),
+                Span::styled(spark, theme.muted),
                 Span::styled(format!(" {}%", cpu.now), theme.text),
             ]
         }
@@ -132,11 +134,9 @@ pub fn tabs(f: &mut Frame, area: Rect, theme: &Theme, active: Tab, badges: [usiz
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// The bottom line: a toast or the filter on the left, key hints after it.
+/// The bottom line: a toast or the filter on the left, key hints after it. It sits on the
+/// plain background, so it never reads as one more line of the detail band above it.
 pub fn footer(f: &mut Frame, area: Rect, theme: &Theme, left: Vec<Span>, hints: &[(&str, &str)]) {
-    if theme.chrome == Chrome::Bands {
-        fill(f, area, theme.surface);
-    }
     let mut spans = vec![Span::raw(" ")];
     if !left.is_empty() {
         spans.extend(left);

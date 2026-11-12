@@ -10,7 +10,16 @@ use scry_core::view::Tone;
 use crate::tui::theme::{Theme, glyph};
 
 pub enum Status<'a> {
-    Empty { title: &'a str, hint: &'a str },
+    /// Nothing there, and the view knows it: the only state with a ✓.
+    Clear {
+        title: &'a str,
+        hint: &'a str,
+    },
+    /// Nothing to show, which says nothing about what is running.
+    Empty {
+        title: &'a str,
+        hint: &'a str,
+    },
     Loading,
     Unavailable(&'a str),
     Failed(&'a str),
@@ -18,7 +27,13 @@ pub enum Status<'a> {
 
 pub fn status(f: &mut Frame, area: Rect, theme: &Theme, view: &str, s: Status) {
     let (mark, tone, title, hint) = match s {
-        Status::Empty { title, hint } => ("✓", Tone::Ok, title.to_string(), hint.to_string()),
+        Status::Clear { title, hint } => ("✓", Tone::Ok, title.to_string(), hint.to_string()),
+        Status::Empty { title, hint } => (
+            glyph(Tone::Quiet),
+            Tone::Quiet,
+            title.to_string(),
+            hint.to_string(),
+        ),
         Status::Loading => (
             "◌",
             Tone::Quiet,

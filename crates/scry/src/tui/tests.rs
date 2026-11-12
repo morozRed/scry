@@ -4,6 +4,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::{Color, Modifier};
 use scry_core::view::agents::AgentRow;
 use scry_core::view::{Board, Detail, Evidence, Load, State, Tab, Tone};
 
@@ -630,4 +631,183 @@ fn reaping_where_agents_are_not_tracked_says_so_neutrally() {
     let toast = a.toast.as_ref().unwrap();
     assert_eq!(toast.text, "Agent sessions are not tracked yet.");
     assert_eq!(toast.tone, Tone::Quiet);
+}
+
+fn header_x(b: &TestBackend, title: &str) -> u16 {
+    find(b.buffer(), title).unwrap().0
+}
+
+#[test]
+fn column_titles_hold_still_while_a_filter_hides_their_numbers() {
+    let mut a = design();
+    press(&mut a, "3");
+    let all = render(&a, 80, 24);
+    // Neither row uvx keeps (its session and itself) has a port.
+    press(&mut a, "/uvx");
+    let few = render(&a, 80, 24);
+    assert!(!screen(&few).contains(":3000"), "{}", screen(&few));
+    for title in ["RAM", "PORT", "AGE", "STATE"] {
+        assert_eq!(header_x(&all, title), header_x(&few, title), "{title}");
+    }
+}
+
+#[test]
+fn text_columns_take_their_content_and_leave_the_spare_width_at_the_right() {
+    let mut a = design();
+    press(&mut a, "3");
+    for w in [120, 149] {
+        let b = render(&a, w, 40);
+        let (name, y) = find(b.buffer(), "node mcp-server-github").unwrap();
+        let (pid, _) = find_from(b.buffer(), "48190", y).unwrap();
+        let gap = pid - (name + "node mcp-server-github".len() as u16);
+        assert!(gap <= 4, "{gap} columns between name and pid at {w}");
+        let header = &lines(&b)[3];
+        assert!(
+            header.trim_end().len() < w as usize - 30,
+            "the table ends well before the edge at {w}:\n{header}"
+        );
+    }
+}
+
+#[test]
+fn the_detail_sits_under_the_list_and_the_footer_off_its_band() {
+    let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
+    press(&mut a, "3jj");
+    let b = render(&a, 120, 40);
+    let buf = b.buffer();
+    let surface = a.theme.surface.bg.unwrap();
+    let (_, last) = find(buf, "python3 -m http.server").unwrap();
+    assert_eq!(
+        buf[(5, last + 1)].bg,
+        surface,
+        "the pane follows the last row"
+    );
+    assert!(screen(&b).contains(":3000 is held by next dev"));
+    // Sized to the tallest detail in the view, then plain background down to the footer.
+    let pane = (last + 1..40)
+        .take_while(|&y| buf[(5, y)].bg == surface)
+        .count();
+    assert!((3..=7).contains(&pane), "pane is {pane} rows");
+    for y in last + 1 + pane as u16..40 {
+        assert_ne!(buf[(5, y)].bg, surface, "row {y} is off the band");
+    }
+    assert!(lines(&b)[39].contains("quit"));
+}
+
+#[test]
+fn only_a_real_all_clear_gets_a_check_mark() {
+    let mut a = design();
+    press(&mut a, "3/zzzz");
+    let text = screen(&render(&a, 80, 24));
+    assert!(text.contains("○  No rows match the filter."), "{text}");
+    assert!(!text.contains('✓'));
+    // Every source read and nothing flagged: that is an all-clear.
+    let mut board = design_board();
+    board.overview.attention.clear();
+    let a = App::new(board, Source::Fixture("d".into()), mono());
+    assert!(screen(&render(&a, 80, 24)).contains("✓  Nothing needs attention."));
+    // Live, where ports and agents are not read, it says so instead.
+    let text = screen(&render(&typical(), 80, 24));
+    assert!(text.contains("○  Ports and agent sessions are not collected yet"));
+}
+
+#[test]
+fn the_help_card_is_raised_with_a_plain_margin() {
+    let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
+    press(&mut a, "3?");
+    let b = render(&a, 80, 24);
+    let buf = b.buffer();
+    let raised = a.theme.raised.bg.unwrap();
+    assert_ne!(Some(raised), a.theme.surface.bg);
+    let (x, y) = find(buf, "Keys").unwrap();
+    // Three columns of padding inside the card, then two of plain background outside it.
+    assert_eq!(buf[(x - 3, y)].bg, raised);
+    for dx in [4, 5] {
+        assert_eq!(buf[(x - dx, y)].bg, Color::Reset);
+    }
+    // The longest line keeps its padding before the right edge.
+    let text = "fold and unfold; h goes to the parent";
+    let (lx, ly) = find(buf, text).unwrap();
+    let end = lx + text.len() as u16;
+    for dx in 0..3 {
+        assert_eq!(buf[(end + dx, ly)].bg, raised);
+        assert_eq!(buf[(end + dx, ly)].symbol(), " ");
+    }
+}
+
+#[test]
+fn a_sheet_never_leaves_a_lone_list_row_above_it() {
+    for n in 18..=26 {
+        let mut a = App::new(with_leftovers(n), Source::Fixture("d".into()), tinted());
+        press(&mut a, "3X");
+        let b = render(&a, 150, 40);
+        let (_, title) = find(b.buffer(), "Reap ").unwrap();
+        // Below the tab bar and above the sheet's gap row and top padding.
+        let above = lines(&b)[3..(title - 2).max(3) as usize]
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert!(
+            above == 0 || above >= 3,
+            "{n} workers leave {above} rows:\n{}",
+            screen(&b)
+        );
+    }
+}
+
+#[test]
+fn the_sheet_bolds_the_command_name_only() {
+    let mut a = App::new(design_board(), Source::Fixture("d".into()), tinted());
+    press(&mut a, "3X");
+    let b = render(&a, 120, 40);
+    let (_, head) = find(b.buffer(), "COMMAND").unwrap();
+    let (x, y) = find_from(b.buffer(), "next dev", head).unwrap();
+    let bold = |x| b.buffer()[(x, y)].modifier.contains(Modifier::BOLD);
+    assert!(bold(x) && !bold(x + 5));
+}
+
+#[test]
+fn a_long_ansi_sheet_has_one_rule_above_it() {
+    let mut a = App::new(
+        with_leftovers(20),
+        Source::Fixture("d".into()),
+        Theme::new(Look::Tinted, Colors::Ansi),
+    );
+    press(&mut a, "3X");
+    let rules = lines(&render(&a, 80, 24))
+        .iter()
+        .filter(|l| l.chars().all(|c| c == '─'))
+        .count();
+    assert_eq!(rules, 2, "the top and bottom rules only");
+}
+
+#[test]
+fn state_sorts_by_what_it_asks_of_you() {
+    let mut a = design();
+    press(&mut a, "3");
+    render(&a, 120, 40);
+    press(&mut a, "sssssss");
+    assert_eq!(sort(&a), Some((6, false)));
+    let Load::Ready(rows) = a.rows() else {
+        unreachable!("the design fixture has agents")
+    };
+    let sessions: Vec<State> = a
+        .shown(&rows)
+        .iter()
+        .filter(|s| s.row.depth == 0)
+        .filter_map(|s| s.row.state())
+        .collect();
+    use State::{Ended, Live};
+    assert_eq!(sessions, [Ended, Ended, Live, Live, Live]);
+    // Leftovers lead within their session; the guess-owned process follows them.
+    let text = screen(&render(&a, 120, 40));
+    assert!(text.find("leftover").unwrap() < text.find("unowned").unwrap());
+}
+
+#[test]
+fn filter_matches_are_marked_in_the_accent_not_the_warning() {
+    let t = tinted();
+    assert_eq!(t.matched.fg, t.accent.fg);
+    assert_ne!(t.matched.fg, t.warn.fg);
+    assert!(t.matched.add_modifier.contains(Modifier::UNDERLINED));
 }

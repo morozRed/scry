@@ -65,10 +65,30 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
     let rows = app.rows();
     match &rows {
         Load::Ready(rows) if !rows.is_empty() => {
-            let (list, pane, beside) = split(f, body, theme);
+            let beside = body.width >= BESIDE_FROM;
+            let (list, pane) = if beside {
+                split_beside(f, body, theme)
+            } else {
+                (body, Rect::default())
+            };
             app.list_width.set(list.width);
             let shown = app.shown(rows);
             count = Some((shown.len(), rows.len()));
+            let (list, pane) = if beside {
+                (list, pane)
+            } else {
+                let tallest = rows
+                    .iter()
+                    .filter_map(|r| r.detail.as_ref())
+                    .map(|d| detail::height(theme, d, body.width))
+                    .max();
+                let cap = if body.height >= 24 { 7 } else { 5 };
+                let pane = match (shown.is_empty(), tallest) {
+                    (false, Some(h)) => h.clamp(1, cap),
+                    _ => 0,
+                };
+                stack(f, body, theme, shown.len(), pane)
+            };
             let cursor = app.cursor(&shown);
             painted.rows = table::table(
                 f,
@@ -76,6 +96,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
                 theme,
                 &ListView {
                     columns: view.columns,
+                    rows,
                     shown: &shown,
                     cursor,
                     sort: app.sort(),
@@ -100,7 +121,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
         }
         other => {
             let status = match other {
-                Load::Ready(_) => Status::Empty {
+                Load::Ready(_) => Status::Clear {
                     title: view.empty.0,
                     hint: view.empty.1,
                 },
@@ -122,8 +143,14 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
     chrome::footer(f, footer, theme, left, &hints);
 
     match &app.mode {
-        Mode::Help => overlay::help(f, body, theme),
-        Mode::Sheet(sheet) => painted.sheet = Some(overlay::sheet(f, body, theme, sheet)),
+        Mode::Help => {
+            overlay::scrim(f, body, theme);
+            overlay::help(f, body, theme);
+        }
+        Mode::Sheet(sheet) => {
+            overlay::scrim(f, body, theme);
+            painted.sheet = Some(overlay::sheet(f, body, theme, sheet));
+        }
         _ => {}
     }
     painted
@@ -153,43 +180,52 @@ fn normal_hints(
     hints
 }
 
-/// Splits the body into list and detail: below the list under `BESIDE_FROM` columns,
-/// beside it from there.
-fn split(f: &mut Frame, body: Rect, theme: &Theme) -> (Rect, Rect, bool) {
+/// From `BESIDE_FROM` columns the detail pane sits beside the list, full height.
+fn split_beside(f: &mut Frame, body: Rect, theme: &Theme) -> (Rect, Rect) {
     let rules = theme.chrome == Chrome::Rules;
-    if body.width >= BESIDE_FROM {
-        // A rule gets a blank column on its list side, so the last column never touches it.
-        let gap = if rules { 2 } else { 1 };
-        let w = (body.width - gap - LIST_BESIDE).min(PANE_MAX);
-        let [list, gap, pane] = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(gap),
-            Constraint::Length(w),
-        ])
-        .areas(body);
-        if rules {
-            let bar = vec![Line::raw("│"); gap.height as usize];
-            let at = Rect {
-                x: gap.right() - 1,
-                width: 1,
-                ..gap
-            };
-            f.render_widget(Paragraph::new(bar).style(theme.border), at);
-        }
-        (list, pane, true)
-    } else {
-        let h = if body.height >= 24 { 7 } else { 5 };
-        let [list, gap, pane] = Layout::vertical([
-            Constraint::Min(0),
-            Constraint::Length(u16::from(rules)),
-            Constraint::Length(h),
-        ])
-        .areas(body);
-        if rules {
-            chrome::rule(f, gap, theme);
-        }
-        (list, pane, false)
+    // A rule gets a blank column on its list side, so the last column never touches it.
+    let gap = if rules { 2 } else { 1 };
+    let w = (body.width - gap - LIST_BESIDE).min(PANE_MAX);
+    let [list, gap, pane] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(gap),
+        Constraint::Length(w),
+    ])
+    .areas(body);
+    if rules {
+        let bar = vec![Line::raw("│"); gap.height as usize];
+        let at = Rect {
+            x: gap.right() - 1,
+            width: 1,
+            ..gap
+        };
+        f.render_widget(Paragraph::new(bar).style(theme.border), at);
     }
+    (list, pane)
+}
+
+/// Below `BESIDE_FROM` columns the pane, `pane` rows tall, sits right under the list, and
+/// the rows the list does not need stay empty below it.
+fn stack(f: &mut Frame, body: Rect, theme: &Theme, rows: usize, pane: u16) -> (Rect, Rect) {
+    let gap = u16::from(theme.chrome == Chrome::Rules && pane > 0);
+    let room = body.height.saturating_sub(pane + gap);
+    // With nothing to list, the list area holds the empty state.
+    let list = if rows == 0 {
+        room
+    } else {
+        (1 + rows).min(room as usize) as u16
+    };
+    let [list, gap, pane, _] = Layout::vertical([
+        Constraint::Length(list),
+        Constraint::Length(gap),
+        Constraint::Length(pane),
+        Constraint::Min(0),
+    ])
+    .areas(body);
+    if gap.height > 0 {
+        chrome::rule(f, gap, theme);
+    }
+    (list, pane)
 }
 
 /// The filter while it is typed, else a toast, else the filter that is applied.

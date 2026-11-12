@@ -68,6 +68,7 @@ fn main() -> anyhow::Result<()> {
             ("sheet-{p}", &design, "3X", (120, 40)),
             ("sheet-long-{p}", &long, "3X", (80, 24)),
             ("sheet-long-end-{p}", &long, "3XG", (80, 24)),
+            ("sheet-long-{p}-150x40", &long, "3X", (150, 40)),
             ("filter-{p}", &design, "3/vite", (80, 24)),
             ("help-{p}", &design, "3?", (80, 24)),
         ] {
@@ -83,6 +84,14 @@ fn main() -> anyhow::Result<()> {
             "3jj",
             pal,
             (150, 40),
+        )?;
+        n += shots.take(
+            &format!("ansi-sheet-long-{p}"),
+            &long,
+            ansi(),
+            "3X",
+            pal,
+            (80, 24),
         )?;
         let mut states = design.clone();
         for (state, load) in [

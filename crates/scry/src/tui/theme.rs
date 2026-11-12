@@ -196,8 +196,10 @@ pub struct Theme {
     pub selection: Style,
     /// Drawn in the column left of the selected row.
     pub cursor: (&'static str, Style),
-    /// Background of bands, sheets and overlays.
+    /// Background of the bands: header and detail pane.
     pub surface: Style,
+    /// Background of what is drawn over the screen: the sheet and the help card.
+    pub raised: Style,
     pub border: Style,
     pub key: Style,
     pub matched: Style,
@@ -264,9 +266,10 @@ fn native(colors: Colors) -> Theme {
         // Reverse video turns this blank into a bar in the accent colour.
         cursor: (" ", paint(Color::Cyan)),
         surface: s,
+        raised: s,
         border: dim,
         key: bold,
-        matched: paint(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        matched: paint(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         tab_active: paint(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         motion: None,
     }
@@ -275,7 +278,7 @@ fn native(colors: Colors) -> Theme {
 /// The selected row's tint against the background: enough to see without the cursor glyph.
 const SELECTION_MIN: f32 = 1.3;
 /// Body text, muted text (labels, context) and faint marks (tree guides, separators), each
-/// against every surface it sits on: background, bands and the selected row.
+/// against every surface it sits on: background, bands, overlays and the selected row.
 const TEXT_MIN: f32 = 6.0;
 const MUTED_MIN: f32 = 4.5;
 const FAINT_MIN: f32 = 3.0;
@@ -306,12 +309,13 @@ fn tinted(bg: Rgb, fg: Rgb) -> Theme {
     };
     let s = Style::new();
     let surface = bg.mix(fg, if dark { 0.07 } else { 0.05 });
+    let raised = bg.mix(fg, if dark { 0.13 } else { 0.09 });
     let mut t = if dark { 0.16 } else { 0.10 };
     while bg.mix(accent, t).contrast(bg) < SELECTION_MIN && t < 1.0 {
         t += 0.01;
     }
     let select = bg.mix(accent, t);
-    let on = [bg, surface, select];
+    let on = [bg, surface, raised, select];
     let text = ink(bg, fg, 0.94, TEXT_MIN, &on);
     let muted = ink(bg, fg, 0.58, MUTED_MIN, &on);
     let faint = ink(bg, fg, 0.34, FAINT_MIN, &on);
@@ -330,9 +334,12 @@ fn tinted(bg: Rgb, fg: Rgb) -> Theme {
         selection: s.bg(select.into()),
         cursor: ("▌", s.fg(accent.into())),
         surface: s.fg(text.into()).bg(surface.into()),
+        raised: s.fg(text.into()).bg(raised.into()),
         border: s.fg(fg.mix(bg, 0.78).into()),
         key: s.fg(accent.into()).add_modifier(Modifier::BOLD),
-        matched: s.fg(warn.into()).add_modifier(Modifier::BOLD),
+        matched: s
+            .fg(accent.into())
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         tab_active: s
             .fg(accent.into())
             .bg(select.into())
@@ -528,7 +535,7 @@ mod tests {
         for (name, bg, fg) in BACKGROUNDS {
             let t = Theme::new(Look::Tinted, Colors::True { bg, fg });
             let select = rgb(t.selection.bg);
-            let surfaces = [bg, rgb(t.surface.bg), select];
+            let surfaces = [bg, rgb(t.surface.bg), rgb(t.raised.bg), select];
             assert!(
                 select.contrast(bg) >= SELECTION_MIN,
                 "{name}: selection {:.2}:1",
