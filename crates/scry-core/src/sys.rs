@@ -246,6 +246,7 @@ pub fn volume_space(path: &Path) -> Result<DiskSample> {
         total_bytes: st.f_blocks * block,
         free_bytes: st.f_bfree * block,
         avail_bytes: st.f_bavail * block,
+        important_bytes: None,
     })
 }
 

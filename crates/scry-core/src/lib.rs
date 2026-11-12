@@ -7,6 +7,7 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod daemon_log;
+pub mod disk;
 pub mod doctor;
 pub mod engine;
 pub mod fixture;

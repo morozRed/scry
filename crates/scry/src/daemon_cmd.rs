@@ -11,7 +11,7 @@ use scry_core::doctor::{human_duration, sample_age};
 use scry_core::launch_agent::{LaunchAgent, Launchd, Step};
 use scry_core::paths::Paths;
 use scry_core::sys;
-use scry_core::view::human_bytes;
+use scry_core::view::disk_bytes;
 
 #[derive(Subcommand)]
 pub enum Action {
@@ -178,8 +178,8 @@ fn status(paths: &Paths, json: bool) -> Result<()> {
                     println!(
                         "samples    {samples}, newest {when} ({} {} available of {})",
                         n.volume,
-                        human_bytes(n.avail_bytes),
-                        human_bytes(n.total_bytes)
+                        disk_bytes(n.important_bytes.unwrap_or(n.avail_bytes)),
+                        disk_bytes(n.total_bytes)
                     )
                 }
                 None => println!("samples    0"),

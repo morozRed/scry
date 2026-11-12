@@ -7,6 +7,8 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier};
+use scry_core::disk::clean::Allows;
+use scry_core::disk::forecast::Forecast;
 use scry_core::view::agents::AgentRow;
 use scry_core::view::{Board, Detail, Evidence, Load, State, Tab, Tone, WorktreeList};
 
@@ -484,13 +486,14 @@ fn folding_waits_until_the_filter_is_cleared() {
 
 #[test]
 fn the_footer_offers_only_keys_that_work_here() {
-    let mut a = design();
+    let mut a = typical();
     press(&mut a, "4");
     let disk = lines(&render(&a, 80, 24)).pop().unwrap();
     for absent in ["move", "filter", "sort"] {
         assert!(!disk.contains(absent), "{disk}");
     }
     assert!(disk.contains("help") && disk.contains("quit"));
+    let mut a = design();
     press(&mut a, "3");
     let agents = lines(&render(&a, 80, 24)).pop().unwrap();
     for present in ["move", "fold", "reap", "keep", "filter", "refresh", "quit"] {
@@ -876,6 +879,10 @@ fn first_run_states_say_what_would_fill_each_view() {
     b.board.worktrees = Load::Loading;
     insta::assert_snapshot!("worktrees_loading", render(&b, 80, 24));
 
+    // Without the recorder there is no history, and the band says how to start it.
+    if let Load::Ready(list) = &mut a.board.disk {
+        list.forecast = Some(Forecast::NoSamples);
+    }
     press(&mut a, "4");
     insta::assert_snapshot!("disk_first_run", render(&a, 80, 24));
     assert!(screen(&render(&a, 80, 24)).contains("scry daemon install"));
@@ -883,6 +890,232 @@ fn first_run_states_say_what_would_fill_each_view() {
     press(&mut a, "2");
     a.board.ports = Load::Ready(Vec::new());
     assert!(screen(&render(&a, 80, 24)).contains("No process on this Mac is accepting"));
+}
+
+fn disk() -> App {
+    let mut a = design();
+    press(&mut a, "4");
+    a
+}
+
+#[test]
+fn disk_shows_free_space_the_forecast_and_what_each_item_frees() {
+    let mut a = disk();
+    insta::assert_snapshot!("design_disk_80x24", render(&a, 80, 24));
+    press(&mut a, "j");
+    insta::assert_snapshot!("design_disk_120x40", render(&a, 120, 40));
+    let text = screen(&render(&a, 120, 40));
+    assert!(
+        text.contains("84 GB available of 926 GB on Macintosh HD"),
+        "{text}"
+    );
+    assert!(text.contains("full in ~19 days"), "{text}");
+    assert!(text.contains("Trash ≥ 2.4 GB"), "{text}");
+    // Ranked by what a delete frees, largest first; a gone worktree last.
+    let rows = a.rows();
+    let Load::Ready(rows) = rows else {
+        unreachable!("the design fixture has a disk reading")
+    };
+    assert_eq!(rows[0].cells[0].text, "Docker.raw");
+    assert_eq!(rows.last().unwrap().cells[0].text, "2c41/billing-api");
+}
+
+#[test]
+fn t_on_a_cache_asks_for_its_name_before_a_delete() {
+    let mut a = disk();
+    press(&mut a, "j");
+    assert_eq!(a.on_key(key(KeyCode::Char('t'))), Action::Redraw);
+    let Mode::Clean(sheet) = &a.mode else {
+        panic!("t should open a cleanup sheet, got {:?}", a.mode);
+    };
+    assert_eq!(sheet.plan.word.as_deref(), Some("Xcode DerivedData"));
+    insta::assert_snapshot!("disk_delete_sheet", render(&a, 80, 24));
+    // Enter before the name is typed does nothing but say so.
+    assert_eq!(a.on_key(key(KeyCode::Enter)), Action::Redraw);
+    assert!(matches!(a.mode, Mode::Clean(_)));
+    assert!(
+        a.toast
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("Type Xcode DerivedData")
+    );
+    press(&mut a, "Xcode DerivedDatx");
+    a.on_key(key(KeyCode::Backspace));
+    press(&mut a, "a");
+    let Action::Clean(job) = a.on_key(key(KeyCode::Enter)) else {
+        panic!("the typed name confirms");
+    };
+    assert_eq!(job.1.as_deref(), Some("Xcode DerivedData"));
+    assert_eq!(job.0.item, "xcode-derived-data");
+    assert_eq!(a.mode, Mode::Normal);
+}
+
+#[test]
+fn t_on_a_worktree_that_can_go_offers_the_trash_from_either_view() {
+    let mut a = disk();
+    let Load::Ready(rows) = a.rows() else {
+        unreachable!()
+    };
+    let at = rows
+        .iter()
+        .position(|r| r.cells[0].text == "wt-auth")
+        .unwrap();
+    press(&mut a, &"j".repeat(at));
+    press(&mut a, "t");
+    let Mode::Clean(sheet) = &a.mode else {
+        panic!("{:?}", a.mode)
+    };
+    assert!(sheet.plan.repo.is_some());
+    insta::assert_snapshot!("disk_trash_sheet", render(&a, 120, 40));
+    // y confirms where nothing needs typing; esc cancels.
+    press(&mut a, "\x1b");
+    assert_eq!(a.mode, Mode::Normal);
+
+    let mut w = design();
+    press(&mut w, "5t");
+    let Mode::Clean(sheet) = &w.mode else {
+        panic!("{:?}", w.mode)
+    };
+    assert_eq!(sheet.shown, "~/sources/acme/.claude/worktrees/wt-auth");
+    assert!(matches!(
+        w.on_key(key(KeyCode::Char('y'))),
+        Action::Clean(_)
+    ));
+    // A worktree that needs a look has nothing to clean.
+    press(&mut w, "jjjt");
+    assert_eq!(w.mode, Mode::Normal);
+    assert!(
+        w.toast
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("labelled \"needs a look\"")
+    );
+}
+
+#[test]
+fn t_says_why_when_an_item_allows_no_action() {
+    let mut a = disk();
+    press(&mut a, "t");
+    assert_eq!(a.mode, Mode::Normal, "Docker.raw is never cleaned");
+    assert!(a.toast.as_ref().unwrap().text.contains("size only"));
+    press(&mut a, "jjt");
+    let toast = &a.toast.as_ref().unwrap().text;
+    assert_eq!(
+        toast,
+        "Scry runs nothing here. Run it yourself: xcrun simctl delete unavailable"
+    );
+    // With cleanup off, nothing opens and the footer says where to turn it on.
+    if let Load::Ready(list) = &mut a.board.disk {
+        list.destructive = false;
+        for d in &mut list.items {
+            if d.plan.take().is_some() {
+                d.allows = Allows::Off {
+                    would: d.allows.word().into(),
+                };
+            }
+        }
+    }
+    press(&mut a, "kt");
+    assert_eq!(a.mode, Mode::Normal);
+    assert!(
+        a.toast
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("destructive = true in ~/.config/scry/config.toml")
+    );
+    assert!(screen(&render(&a, 80, 24)).contains("cleanup off"));
+}
+
+#[test]
+fn a_fixture_never_cleans_anything() {
+    let mut a = disk();
+    press(&mut a, "jjjt");
+    assert!(matches!(a.mode, Mode::Clean(_)));
+    // The event loop answers Action::Clean from a fixture with a toast; nothing runs here.
+    assert!(matches!(
+        a.on_key(key(KeyCode::Char('y'))),
+        Action::Clean(_)
+    ));
+}
+
+#[test]
+fn opening_a_cleanup_sheet_clears_the_footer() {
+    let mut a = disk();
+    a.notify(
+        "Moved 2.1 GB to Trash. Empty it to free the space.",
+        Tone::Ok,
+    );
+    press(&mut a, "jt");
+    assert!(matches!(a.mode, Mode::Clean(_)));
+    assert!(a.toast.is_none());
+}
+
+#[test]
+fn after_a_cleanup_the_cursor_stays_on_the_row_that_took_its_place() {
+    let mut a = disk();
+    press(&mut a, "jj");
+    let Load::Ready(rows) = a.rows() else {
+        unreachable!()
+    };
+    let (gone, next) = (rows[2].id.clone(), rows[3].id.clone());
+    assert_eq!(a.selected_row().unwrap().id, gone);
+    let mut board = a.board.clone();
+    if let Load::Ready(list) = &mut board.disk {
+        list.items.retain(|d| d.id != gone);
+    }
+    a.replace_board(board);
+    assert_eq!(a.selected_row().unwrap().id, next);
+}
+
+#[test]
+fn trashing_agent_sessions_warns_when_that_agent_is_running() {
+    let mut a = disk();
+    a.writer = |item| {
+        (item == "claude-projects").then(|| "Claude Code is running (2 processes).".to_string())
+    };
+    let Load::Ready(rows) = a.rows() else {
+        unreachable!()
+    };
+    let at = rows
+        .iter()
+        .position(|r| r.cells[0].text == "Claude Code sessions")
+        .unwrap();
+    press(&mut a, &"j".repeat(at));
+    press(&mut a, "t");
+    let Mode::Clean(sheet) = &a.mode else {
+        panic!("{:?}", a.mode)
+    };
+    assert!(sheet.warning.is_some());
+    assert!(screen(&render(&a, 120, 40)).contains("Claude Code is running (2 processes)."));
+    // Another item says nothing.
+    press(&mut a, "\x1bgjt");
+    let Mode::Clean(sheet) = &a.mode else {
+        panic!("{:?}", a.mode)
+    };
+    assert_eq!(sheet.warning, None);
+}
+
+#[test]
+fn disk_has_loading_failed_and_first_run_states() {
+    let mut a = disk();
+    a.board.disk = Load::Loading;
+    assert!(screen(&render(&a, 80, 24)).contains("Reading disk…"));
+    a.board.disk = Load::Failed("statfs failed".into());
+    assert!(screen(&render(&a, 80, 24)).contains("Could not read disk."));
+    if let Load::Ready(list) = &mut design_board().disk {
+        let mut list = list.clone();
+        list.items.clear();
+        a.board.disk = Load::Ready(list);
+    }
+    let text = screen(&render(&a, 80, 24));
+    assert!(
+        text.contains("Nothing in the catalog takes space here."),
+        "{text}"
+    );
+    assert!(text.contains("available of"), "the band stays: {text}");
 }
 
 /// The header row, wide enough for the design board's pulse and the spinner's words.

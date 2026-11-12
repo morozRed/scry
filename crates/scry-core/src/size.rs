@@ -15,11 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
 use libc::c_void;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::protected::{FileId, Protected, Resolved, file_id};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Size {
     /// Bytes on disk (`ATTR_FILE_ALLOCSIZE`), each hard-linked file counted once.
     pub allocated: u64,
@@ -31,24 +31,51 @@ pub struct Size {
     pub reclaimable: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtreeSize {
     pub size: Size,
     pub files: u64,
     pub dirs: u64,
     /// Entries that could not be read and are missing from `size`.
     pub skipped: u64,
-    /// Folders below the root that hold a `.git` of their own, relative to the root and
-    /// sorted. A `.git` directly in the root, such as a worktree's own link, is not listed.
+    /// Folders below the root that hold a `.git` of their own or are a git directory
+    /// themselves (see [`git_dir_shape`]), relative to the root and sorted. A `.git` directly
+    /// in the root, such as a worktree's own link, is not listed.
     pub repos: Vec<PathBuf>,
+    /// The root itself holds a `.git` or is a git directory. Which `repos` leaves out, but a
+    /// caller that measures a tree in parts needs it for a part below the tree's root.
+    #[serde(default)]
+    pub git_at_root: bool,
+    /// Folders inside it on another volume, such as a mounted disk image. They are not
+    /// entered, so nothing in them is counted.
+    #[serde(default)]
+    pub mounts: u64,
+    /// It holds a hard-linked file with a link the walk met elsewhere or did not meet at all,
+    /// so its allocated bytes depend on what else was walked with it.
+    #[serde(default)]
+    pub shared_links: bool,
     /// Why the subtree was not walked at all.
     pub error: Option<String>,
+    /// The same walk cut into parts, when [`Walker::parts`] asked for them.
+    #[serde(skip)]
+    pub parts: Vec<Part>,
+}
+
+/// One part of a walked subtree: a folder `depth` levels down, whole, or, with `top`, a
+/// folder above that level with only its own files. The parts add up to the subtree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Part {
+    /// Relative to the subtree's root; empty for the root itself.
+    pub rel: PathBuf,
+    pub top: bool,
+    pub size: SubtreeSize,
 }
 
 pub struct Walker {
     exclude: HashSet<FileId>,
     protected: Protected,
     threads: usize,
+    depth: usize,
 }
 
 impl Walker {
@@ -61,7 +88,14 @@ impl Walker {
             exclude: HashSet::new(),
             protected: Protected::new(home),
             threads,
+            depth: 0,
         }
+    }
+
+    /// Also reports each subtree cut into parts `depth` folders down, from the same walk.
+    pub fn parts(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
     }
 
     /// Folders not to enter when met inside a subtree, such as a worktree nested in another.
@@ -127,32 +161,95 @@ impl Walker {
             links: &links,
             trees: roots.len(),
         };
-        let partials: Vec<Vec<Tally>> = std::thread::scope(|s| {
+        let partials: Vec<Work> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..self.threads).map(|_| s.spawn(|| ctx.work())).collect();
             handles
                 .into_iter()
                 .map(|h| h.join().expect("size worker panicked"))
                 .collect()
         });
-        for part in partials {
-            for (o, t) in out.iter_mut().zip(part) {
+        let mut parts: Vec<HashMap<PartKey, Tally>> = vec![HashMap::new(); roots.len()];
+        for w in partials {
+            for (o, t) in out.iter_mut().zip(w.trees) {
                 o.size.allocated += t.allocated;
                 o.size.reclaimable += t.reclaimable;
                 o.files += t.files;
                 o.dirs += t.dirs;
                 o.skipped += t.skipped;
                 o.repos.extend(t.repos);
+                o.git_at_root |= t.git_at_root;
+                o.mounts += t.mounts;
+                o.shared_links |= t.shared_links;
+            }
+            for (all, mine) in parts.iter_mut().zip(w.parts) {
+                for (k, t) in mine {
+                    all.entry(k).or_default().add(&t);
+                }
             }
         }
         for o in &mut out {
             o.repos.sort();
         }
         for link in links.into_inner().unwrap().into_values() {
+            if link.seen < link.nlink || link.shared || link.part_shared {
+                out[link.tree].shared_links = true;
+                if let Some(k) = &link.part {
+                    parts[link.tree].entry(k.clone()).or_default().shared_links = true;
+                }
+            }
             if link.seen >= link.nlink && !link.shared {
                 out[link.tree].size.reclaimable += link.private;
+                if let (Some(k), false) = (link.part, link.part_shared) {
+                    parts[link.tree].entry(k).or_default().reclaimable += link.private;
+                }
+            }
+        }
+        if self.depth > 0 {
+            for (o, mut p) in out.iter_mut().zip(parts) {
+                if o.error.is_some() {
+                    continue;
+                }
+                p.entry((PathBuf::new(), true)).or_default().dirs += 1;
+                let mut v: Vec<Part> = p
+                    .into_iter()
+                    .map(|((rel, top), t)| Part {
+                        rel,
+                        top,
+                        size: t.into_size(),
+                    })
+                    .collect();
+                v.sort_by(|a, b| (&a.rel, a.top).cmp(&(&b.rel, b.top)));
+                o.parts = v;
             }
         }
         out
+    }
+}
+
+/// A single file, such as Docker's disk image, sized from `lstat`: the blocks it holds, all
+/// of them reclaimable unless the file has another hard link.
+pub fn measure_file(path: &Path) -> SubtreeSize {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => {
+            let allocated = m.blocks() * 512;
+            SubtreeSize {
+                size: Size {
+                    allocated,
+                    reclaimable: if m.nlink() > 1 { 0 } else { allocated },
+                },
+                files: 1,
+                ..SubtreeSize::default()
+            }
+        }
+        Ok(_) => SubtreeSize {
+            error: Some("it is not a regular file".into()),
+            ..SubtreeSize::default()
+        },
+        Err(e) => SubtreeSize {
+            error: Some(e.to_string()),
+            ..SubtreeSize::default()
+        },
     }
 }
 
@@ -247,7 +344,15 @@ struct Link {
     tree: usize,
     /// Links were met in more than one subtree, so deleting any one of them frees nothing.
     shared: bool,
+    /// The part of its subtree it was first met in, when the walk reports parts.
+    part: Option<PartKey>,
+    /// Links were met in more than one part.
+    part_shared: bool,
 }
+
+/// A part's path relative to its subtree's root, and whether it holds only that folder's
+/// own files.
+type PartKey = (PathBuf, bool);
 
 #[derive(Clone, Default)]
 struct Tally {
@@ -257,12 +362,52 @@ struct Tally {
     dirs: u64,
     skipped: u64,
     repos: Vec<PathBuf>,
+    /// For a tree, a `.git` in its root; while one folder is counted, a `.git` in it.
+    git_at_root: bool,
+    /// While one folder is counted: which of a git directory's entries it holds. Never added
+    /// up across folders.
+    git_marks: u8,
+    mounts: u64,
+    shared_links: bool,
+}
+
+impl Tally {
+    fn add(&mut self, o: &Tally) {
+        self.allocated += o.allocated;
+        self.reclaimable += o.reclaimable;
+        self.files += o.files;
+        self.dirs += o.dirs;
+        self.skipped += o.skipped;
+        self.repos.extend(o.repos.iter().cloned());
+        self.git_at_root |= o.git_at_root;
+        self.mounts += o.mounts;
+        self.shared_links |= o.shared_links;
+    }
+
+    fn into_size(mut self) -> SubtreeSize {
+        self.repos.sort();
+        SubtreeSize {
+            size: Size {
+                allocated: self.allocated,
+                reclaimable: self.reclaimable,
+            },
+            files: self.files,
+            dirs: self.dirs,
+            skipped: self.skipped,
+            repos: self.repos,
+            git_at_root: self.git_at_root,
+            mounts: self.mounts,
+            shared_links: self.shared_links,
+            ..SubtreeSize::default()
+        }
+    }
 }
 
 /// The folder whose entries are being counted.
 struct Dir<'a> {
     tree: usize,
     rel: &'a Path,
+    part: Option<&'a PartKey>,
 }
 
 struct Ctx<'a> {
@@ -274,34 +419,115 @@ struct Ctx<'a> {
     trees: usize,
 }
 
+/// What one thread counted: per subtree, and per part of each.
+struct Work {
+    trees: Vec<Tally>,
+    parts: Vec<HashMap<PartKey, Tally>>,
+}
+
 impl Ctx<'_> {
-    fn work(&self) -> Vec<Tally> {
-        let mut tally = vec![Tally::default(); self.trees];
+    fn work(&self) -> Work {
+        let mut w = Work {
+            trees: vec![Tally::default(); self.trees],
+            parts: vec![HashMap::new(); self.trees],
+        };
         let mut buf = vec![0u8; 128 * 1024];
         while let Some(job) = self.queue.next() {
-            let tree = job.tree;
-            let found = self.read_dir(job, &mut buf, &mut tally[tree]);
+            let found = self.read_dir(job, &mut buf, &mut w);
             self.queue.finish(found);
         }
-        tally
+        w
     }
 
-    fn read_dir(&self, job: Job, buf: &mut [u8], t: &mut Tally) -> Vec<Job> {
+    /// The part a folder's own files count toward: the folder itself while it is less than
+    /// `depth` down, else its ancestor at `depth`, which holds it whole.
+    fn part_of(&self, rel: &Path) -> Option<PartKey> {
+        let depth = self.walker.depth;
+        if depth == 0 {
+            return None;
+        }
+        let n = rel.components().count();
+        if n < depth {
+            Some((rel.to_path_buf(), true))
+        } else {
+            Some((rel.components().take(depth).collect(), false))
+        }
+    }
+
+    /// A folder at `rel` that is a part's root: it counts itself as that part's folder.
+    fn part_root(&self, rel: &Path) -> Option<PartKey> {
+        let depth = self.walker.depth;
+        let n = rel.components().count();
+        (depth > 0 && n <= depth).then(|| (rel.to_path_buf(), n < depth))
+    }
+
+    fn read_dir(&self, job: Job, buf: &mut [u8], w: &mut Work) -> Vec<Job> {
         let mut found = Vec::new();
+        let tree = job.tree;
+        let part = self.part_of(&job.rel);
         let at_dir = Dir {
-            tree: job.tree,
+            tree,
             rel: &job.rel,
+            part: part.as_ref(),
         };
+        // Counted for this folder alone, then added to its tree and its part.
+        let mut here = Tally::default();
+        let mut roots = Vec::new();
         let fd = match job.dir {
-            Open::Root(fd) => fd,
-            Open::Child { parent, name, id } => match open_child(&parent, &name, id) {
-                Some(fd) => fd,
-                None => {
-                    t.skipped += 1;
-                    return found;
+            Open::Root(fd) => Some(fd),
+            Open::Child { parent, name, id } => {
+                let fd = open_child(&parent, &name, id);
+                if fd.is_none() {
+                    here.skipped += 1;
                 }
-            },
+                fd
+            }
         };
+        if let Some(fd) = fd {
+            self.list(&at_dir, fd, buf, &mut here, &mut found, &mut roots);
+        }
+        let t = &mut w.trees[tree];
+        // A git directory found by its shape; inside a `.git` the folder above already counts.
+        let marks = std::mem::take(&mut here.git_marks);
+        if git_dir_shape(marks) && !inside_dot_git(&job.rel) {
+            here.git_at_root = true;
+        }
+        let git_here = std::mem::take(&mut here.git_at_root);
+        if git_here {
+            if job.rel.as_os_str().is_empty() {
+                t.git_at_root = true;
+            } else {
+                t.repos.push(job.rel.clone());
+            }
+        }
+        t.add(&here);
+        t.dirs += roots.len() as u64;
+        if let Some(key) = part {
+            let p = w.parts[tree].entry(key.clone()).or_default();
+            if git_here {
+                match job.rel.strip_prefix(&key.0) {
+                    Ok(r) if r.as_os_str().is_empty() => p.git_at_root = true,
+                    Ok(r) => p.repos.push(r.to_path_buf()),
+                    Err(_) => {}
+                }
+            }
+            p.add(&here);
+            for r in roots {
+                w.parts[tree].entry(r).or_default().dirs += 1;
+            }
+        }
+        found
+    }
+
+    fn list(
+        &self,
+        at_dir: &Dir,
+        fd: OwnedFd,
+        buf: &mut [u8],
+        t: &mut Tally,
+        found: &mut Vec<Job>,
+        roots: &mut Vec<PartKey>,
+    ) {
         let fd = Arc::new(fd);
         let mut list = ATTR_LIST;
         loop {
@@ -327,40 +553,52 @@ impl Ctx<'_> {
                     break;
                 };
                 at += entry.len;
-                self.count(&at_dir, &fd, entry, t, &mut found);
+                self.count(at_dir, &fd, entry, t, found, roots);
             }
         }
-        found
     }
 
-    fn count(&self, at: &Dir, dir: &Arc<OwnedFd>, e: Entry, t: &mut Tally, found: &mut Vec<Job>) {
+    fn count(
+        &self,
+        at: &Dir,
+        dir: &Arc<OwnedFd>,
+        e: Entry,
+        t: &mut Tally,
+        found: &mut Vec<Job>,
+        roots: &mut Vec<PartKey>,
+    ) {
         let tree = at.tree;
         if e.error != 0 {
             t.skipped += 1;
             return;
         }
         // APFS ignores case by default, and so does git looking for `.git` there.
-        if e.name.eq_ignore_ascii_case(b".git") && !at.rel.as_os_str().is_empty() {
-            t.repos.push(at.rel.to_path_buf());
+        if e.name.eq_ignore_ascii_case(b".git") {
+            t.git_at_root = true;
         }
-        if e.dev != self.devs[tree] {
+        t.git_marks |= git_mark(e.name, e.objtype == VDIR);
+        let id = (e.dev, e.ino);
+        // Only a volume mounted here has another device; the kernel may not say it is a
+        // folder.
+        if e.dev != self.devs[tree] || (e.objtype == VDIR && e.mount_point) {
+            t.mounts += 1;
             return;
         }
-        let id = (e.dev, e.ino);
         if e.objtype == VDIR {
-            if e.mount_point
-                || self.walker.exclude.contains(&id)
-                || self.walker.protected.folder(id).is_some()
-            {
+            if self.walker.exclude.contains(&id) || self.walker.protected.folder(id).is_some() {
                 return;
             }
             let Ok(name) = CString::new(e.name) else {
                 t.skipped += 1;
                 return;
             };
-            t.dirs += 1;
+            let rel = at.rel.join(OsStr::from_bytes(e.name));
+            match self.part_root(&rel) {
+                Some(key) => roots.push(key),
+                None => t.dirs += 1,
+            }
             found.push(Job {
-                rel: at.rel.join(OsStr::from_bytes(e.name)),
+                rel,
                 dir: Open::Child {
                     parent: Arc::clone(dir),
                     name,
@@ -382,6 +620,9 @@ impl Ctx<'_> {
             Some(link) => {
                 link.seen += 1;
                 link.shared |= link.tree != tree;
+                let elsewhere = link.tree != tree || link.part.as_ref() != at.part;
+                link.part_shared |= elsewhere;
+                t.shared_links |= elsewhere;
             }
             None => {
                 t.allocated += e.alloc;
@@ -393,11 +634,44 @@ impl Ctx<'_> {
                         private,
                         tree,
                         shared: false,
+                        part: at.part.cloned(),
+                        part_shared: false,
                     },
                 );
             }
         }
     }
+}
+
+const MARK_HEAD: u8 = 1;
+const MARK_OBJECTS: u8 = 2;
+const MARK_REFS: u8 = 4;
+const MARK_LINK: u8 = 8;
+
+/// Which entry of a git directory `name` is, by name and kind, ignoring case as APFS does.
+fn git_mark(name: &[u8], dir: bool) -> u8 {
+    let is = |n: &[u8]| name.eq_ignore_ascii_case(n);
+    match dir {
+        false if is(b"HEAD") => MARK_HEAD,
+        false if is(b"gitdir") || is(b"commondir") => MARK_LINK,
+        true if is(b"objects") => MARK_OBJECTS,
+        true if is(b"refs") => MARK_REFS,
+        _ => 0,
+    }
+}
+
+/// A folder that is a git directory whatever its name: a bare repository or a separate git
+/// directory (`HEAD`, `objects/` and `refs/`), or a linked worktree's or a submodule's own
+/// git directory (`HEAD` with a `gitdir` or `commondir` file).
+fn git_dir_shape(marks: u8) -> bool {
+    marks & MARK_HEAD != 0
+        && (marks & (MARK_OBJECTS | MARK_REFS) == MARK_OBJECTS | MARK_REFS
+            || marks & MARK_LINK != 0)
+}
+
+fn inside_dot_git(rel: &Path) -> bool {
+    rel.components()
+        .any(|c| c.as_os_str().as_bytes().eq_ignore_ascii_case(b".git"))
 }
 
 // <sys/attr.h> and <sys/vnode.h> values that libc does not export.
@@ -705,6 +979,99 @@ mod tests {
             r.repos,
             [PathBuf::from("deep/a/b"), PathBuf::from("src/inner")]
         );
+    }
+
+    /// A git directory with its own `HEAD`, `objects/` and `refs/` under any name.
+    fn git_dir(at: &Path) {
+        fs::create_dir_all(at.join("objects/pack")).unwrap();
+        fs::create_dir_all(at.join("refs/heads")).unwrap();
+        fs::write(at.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn finds_bare_repositories_and_separate_git_directories_by_their_shape() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("cache");
+        git_dir(&root.join("pkg/bare.git"));
+        git_dir(&root.join("vendor/sep"));
+        // A linked worktree's own git directory: HEAD and a gitdir file.
+        fs::create_dir_all(root.join("rec/wt")).unwrap();
+        fs::write(root.join("rec/wt/HEAD"), "0123\n").unwrap();
+        fs::write(root.join("rec/wt/gitdir"), "/x/.git\n").unwrap();
+        // Lookalikes that are not.
+        fs::create_dir_all(root.join("half/objects")).unwrap();
+        fs::write(root.join("half/HEAD"), "x\n").unwrap();
+        fs::create_dir_all(root.join("dirs/HEAD")).unwrap();
+        fs::create_dir_all(root.join("dirs/objects")).unwrap();
+        fs::create_dir_all(root.join("dirs/refs")).unwrap();
+        // Inside a `.git`, the folder that holds it is the repository.
+        git_dir(&root.join("normal/.git"));
+        git_dir(&root.join("normal/.git/modules/sub"));
+        let [r] = walker(t.path())
+            .measure(std::slice::from_ref(&root))
+            .try_into()
+            .unwrap();
+        assert!(!r.git_at_root);
+        assert_eq!(
+            r.repos,
+            [
+                PathBuf::from("normal"),
+                "pkg/bare.git".into(),
+                "rec/wt".into(),
+                "vendor/sep".into()
+            ]
+        );
+
+        let bare = t.path().join("bare");
+        git_dir(&bare);
+        let [b] = walker(t.path())
+            .measure(std::slice::from_ref(&bare))
+            .try_into()
+            .unwrap();
+        assert!(b.git_at_root, "a bare repository as the root itself");
+        assert!(b.repos.is_empty(), "{:?}", b.repos);
+    }
+
+    #[test]
+    fn parts_of_one_walk_add_up_to_the_subtree() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("tree");
+        write_mib(&root.join("loose"), 1);
+        write_mib(&root.join("a/x"), 2);
+        write_mib(&root.join("a/b/y"), 3);
+        write_mib(&root.join("c/z"), 4);
+        fs::create_dir_all(root.join("a/b/repo/.git")).unwrap();
+        fs::create_dir_all(root.join("c/.git")).unwrap();
+        // One file linked into two parts: freed by deleting the tree, not either part.
+        fs::hard_link(root.join("a/x"), root.join("c/x-link")).unwrap();
+
+        let [whole] = walker(t.path())
+            .parts(1)
+            .measure(std::slice::from_ref(&root))
+            .try_into()
+            .unwrap();
+        let keys: Vec<(String, bool)> = whole
+            .parts
+            .iter()
+            .map(|p| (p.rel.display().to_string(), p.top))
+            .collect();
+        assert_eq!(
+            keys,
+            [("".into(), true), ("a".into(), false), ("c".into(), false)]
+        );
+        let sum = |f: fn(&Part) -> u64| whole.parts.iter().map(f).sum::<u64>();
+        assert_eq!(sum(|p| p.size.size.allocated), whole.size.allocated);
+        assert_eq!(sum(|p| p.size.files), whole.files);
+        assert_eq!(sum(|p| p.size.dirs), whole.dirs);
+        let shared = MIB;
+        assert!(
+            sum(|p| p.size.size.reclaimable) + shared <= whole.size.reclaimable + 64 * 1024,
+            "{whole:?}"
+        );
+        let a = &whole.parts[1].size;
+        assert_eq!(a.repos, [PathBuf::from("b/repo")]);
+        assert!(whole.parts[2].size.git_at_root, "c holds a .git of its own");
+        assert_eq!(whole.repos, [PathBuf::from("a/b/repo"), "c".into()]);
     }
 
     #[test]

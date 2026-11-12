@@ -2,7 +2,7 @@
 //! roots. Git state comes first and sizes after, so the size column waits with `…`.
 
 use scry_core::config::DEFAULT_CODE_ROOTS;
-use scry_core::view::{Board, Load, Tab, Tone, WorktreeItem, WorktreeList, human_bytes};
+use scry_core::view::{Board, Load, Tab, Tone, WorktreeItem, WorktreeList, disk_bytes};
 
 use super::{Cell, Column, Row, SortKey, ViewDef};
 
@@ -21,7 +21,7 @@ pub const VIEW: ViewDef = ViewDef {
     // `empty` below says which folders were searched.
     empty: ("No linked worktrees.", ""),
     badge,
-    hints: &[],
+    hints: &[("t", "clean up")],
     reap: None,
 };
 
@@ -42,7 +42,11 @@ fn rows(board: &Board) -> Load<Vec<Row>> {
 
 fn row(w: &WorktreeItem, sizing: bool) -> Row {
     let size = match w.size {
-        Some(b) => Cell::num(human_bytes(b), b),
+        Some(b) => Cell::num(disk_bytes(b), b),
+        None if w.gone => Cell {
+            key: SortKey::None,
+            ..Cell::num("gone", 0)
+        },
         // Every row waits for its size together, so all sort alike meanwhile.
         None if sizing => Cell::num("…", 0),
         // Unreadable, or a folder that is gone: sorts last.

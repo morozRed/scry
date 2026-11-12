@@ -184,15 +184,17 @@ mod tests {
             first.memory
         );
         assert!(matches!(first.swap, Reading::Ready(_)), "{:?}", first.swap);
-        // The kernel's tick counters move in steps, and on a loaded machine a fixed wait can
-        // end before the next one. Wait for them to move, then the next reading must be ready.
-        let first_ticks = s.prev.expect("the first reading kept its ticks");
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while s.ticks() == Some(first_ticks) {
-            assert!(std::time::Instant::now() < until, "CPU ticks never moved");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        // The kernel's tick counters can stand still for a moment on a busy machine, as
+        // under a parallel test run, and then a reading still warms up; it never stays so.
+        let mut second = Reading::WarmingUp;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            second = s.sample().cpu_percent;
+            if second != Reading::WarmingUp {
+                break;
+            }
         }
-        match s.sample().cpu_percent {
+        match second {
             Reading::Ready(v) => assert!((0.0..=100.0).contains(&v)),
             other => panic!("second reading {other:?}"),
         }

@@ -6,12 +6,11 @@ your Mac.
 Coding agents such as Claude Code and Codex start dev servers, MCP servers and
 headless browsers, create worktrees and fill caches. When a session ends, much of
 that stays behind. Scry traces each of these back to the project and the agent
-session that made it, so you can see what is safe to stop or delete. An MCP server
-that gives agents the same answers is planned.
+session that made it, so you can see what is safe to stop or delete.
 
 > **Status:** early development. The process scan, the terminal UI shell and the
-> `ports`, `why` and `stop` commands work. Agents, disk and worktrees are being
-> built. See the [roadmap](PLAN.md).
+> `ports`, `why`, `stop`, `agents`, `leftovers`, `worktrees`, `disk` and `clean`
+> commands work. See the [roadmap](PLAN.md).
 
 ## Screenshots
 
@@ -48,8 +47,8 @@ After you confirm, the footer says what happened. Whatever outlived SIGTERM is
 offered SIGKILL on a sheet of its own.
 
 Scry follows your terminal's light or dark theme. These screens are drawn from a
-synthetic fixture with `cargo run -p scry --example shots`; the Disk and Worktrees
-views show sample data until those parts are built. The design notes are
+synthetic fixture with `cargo run -p scry --example shots`, so every view shows sample
+data. The design notes are
 in [docs/design.md](docs/design.md).
 
 ## Requirements
@@ -221,6 +220,68 @@ drop-ins, merged as Claude Code merges them) would stop user hooks from running,
 and when `claude --version` is older than 2.1.139, which runs a hook's `command`
 without its `args`. The hook prints nothing, always exits 0 and appends one line to
 Scry's spool. It never installs a `WorktreeCreate` hook.
+
+## Disk
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/disk-dark-120x40.svg">
+  <img alt="The Disk view: free space and its forecast, then caches, node_modules and worktrees ranked by what deleting them frees" src="docs/screens/disk-light-120x40.svg">
+</picture>
+
+```sh
+scry disk                       # free space, forecast, and the 15 largest items
+scry disk --top 40 --json
+scry clean npm-cache            # delete a cache after you type its name
+scry clean worktree:~/sources/acme-wt-old --yes
+```
+
+Scry sizes a reviewed list of places developer tools fill: Xcode, simulators,
+Docker's disk, package caches, agent session logs, app caches, every `node_modules`
+under your code roots, and linked worktrees. It never looks inside Desktop,
+Documents or Downloads. Each item shows the space it holds and at least what
+deleting it frees at once, which is less when its files are clones or hard links of
+others, as pnpm and uv make them. Sizes are in decimal units, as Finder shows them
+(1 GB is 1,000,000,000 bytes). Free space is what Finder calls available; purgeable
+space and local snapshots are listed apart. A forecast of when that available space
+runs out appears once the background recorder has 48 hours of samples, counts the
+days from now, and is withheld while the newest sample is more than a day old.
+
+Each item allows one cleanup: **trash** (Put Back in Finder restores it; space
+returns when the Trash is emptied), **delete** for caches a tool fills again, after
+you type the item's name, **command**, which shows the tool's own cleanup for you to
+run, or **never**. Scry never removes the home folder, a folder that Desktop,
+Documents, Downloads or Scry's own config or state lies inside, or a cache that
+holds a git repository (a bare one or a separate git directory included), a
+worktree or a mounted volume.
+
+A worktree labelled "can go" goes to the Trash as a folder only: git keeps its record
+in `.git/worktrees/<name>`, so Put Back gives a working checkout with its history,
+and until then the worktree shows as "can prune". **prune** removes that one record
+and nothing else, never `git worktree prune`, which would drop the record of every
+worktree whose folder is missing. It refuses a record that is locked, stages changes
+its HEAD lacks, or has a detached HEAD no branch or tag holds; the record's reflog
+goes with it, and a folder of it still in the Trash then comes back without its
+link to git.
+
+Right before acting, Scry reads `destructive` from the config again, walks the folder
+for repositories, worktrees and mounted volumes, reads a worktree's label again with
+`git status`, and checks that the folder and every folder above it are the ones it
+listed, opening each without following a symlink. A delete goes through the folder
+Scry opened, never into another volume, and stops untouched at a protected folder
+moved inside while it runs. A prune checks the record again after the audit row
+is written. The move to the Trash is the one step macOS takes by path: if something
+else takes that path, or a folder above it becomes a symlink, in the moment between
+Scry's last check and the move, macOS moves that instead. Nothing is deleted that
+way: Scry compares what landed in the Trash with the folder it checked and moves
+anything else back, never over what stands there now; when it cannot, it says
+where the item is in the Trash and where it belongs. Cleanup is off until you set
+`destructive = true`. Every
+attempt writes two rows to the audit log in Scry's store: what it is about to do,
+then what happened, including exactly what changed if it stopped partway. When the
+log cannot be written, nothing is done.
+
+Sizes are kept in Scry's store and checked against FSEvents, so a second run walks
+only what changed since the first.
 
 ## Background recorder
 

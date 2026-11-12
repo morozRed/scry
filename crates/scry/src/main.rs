@@ -1,5 +1,6 @@
 mod agents;
 mod daemon_cmd;
+mod disk;
 mod doctor_cmd;
 mod hook;
 mod ports;
@@ -54,6 +55,8 @@ enum Command {
     Keep(reap::KeepArgs),
     /// List linked worktrees with their state, size and probable creator.
     Worktrees(worktrees::WorktreesArgs),
+    Disk(disk::DiskArgs),
+    Clean(disk::CleanArgs),
     /// Measure Scry itself.
     Bench {
         #[command(subcommand)]
@@ -117,6 +120,8 @@ fn main() -> Result<()> {
         Some(Command::Reap(a)) => reap::run(a),
         Some(Command::Keep(a)) => reap::keep(a),
         Some(Command::Worktrees(args)) => worktrees::run(args),
+        Some(Command::Disk(args)) => disk::run(args),
+        Some(Command::Clean(args)) => disk::clean(args),
         Some(Command::Bench {
             what: BenchWhat::Scan { runs, json },
         }) => bench_scan(runs, json),
