@@ -90,7 +90,7 @@ jobs:
         run: |
           awk -v v="$VERSION" '
             $0 ~ "^## \\[" v "\\]" { on = 1; next }
-            on && /^## \[/ { exit }
+            on && (/^## \[/ || /^\[[^]]+\]: /) { exit }
             on { print }
           ' CHANGELOG.md > notes.md
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then

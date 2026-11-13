@@ -28,7 +28,7 @@ These hold for every release.
 
 | Area | What it does |
 |---|---|
-| Terminal UI | `scry` opens five views: Overview, Ports, Agents, Disk and Worktrees. Each has a detail pane, a fuzzy filter, sorting, guarded actions, and empty, loading and error states that say how to fill the view. It works from 80×24 up, in light and dark terminals. |
+| Terminal UI | `scry` opens six views: Overview, Ports, Agents, Disk, Worktrees and Top. Each has a detail pane, a fuzzy filter, sorting, guarded actions, and empty, loading and error states that say how to fill the view. It works from 80×24 up, in light and dark terminals. |
 | Ports | Every listening port on the Mac, yours and other users', traced to its process, project and agent session. `scry why` explains one port with its evidence. Stop a process with SIGTERM, and SIGKILL after a second confirmation. |
 | Agents | Claude Code, Codex, OpenCode and Gemini CLI sessions as a tree, with RAM and ports. Processes left running after a session ended are flagged as leftovers and can be stopped after review. A keep list spares processes you meant to leave running. |
 | Disk | Free space as Finder counts it, a forecast of when it runs out, and the largest caches, `node_modules` folders and worktrees, ranked by what deleting them frees. Each item allows one cleanup: Trash, delete, a command for you to run, or none. |
