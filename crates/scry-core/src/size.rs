@@ -56,9 +56,57 @@ pub struct SubtreeSize {
     pub shared_links: bool,
     /// Why the subtree was not walked at all.
     pub error: Option<String>,
+    /// With [`Walker::keep_links`]: the files inside it with more than one hard link, which
+    /// `size` leaves out until [`attribute_links`] counts them across subtrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<Linked>>,
     /// The same walk cut into parts, when [`Walker::parts`] asked for them.
     #[serde(skip)]
     pub parts: Vec<Part>,
+}
+
+/// A file with more than one hard link, as one subtree held it: device, inode, its link
+/// count, allocated bytes, private bytes, and how many of its links the subtree holds. A
+/// tuple, so a stored row of thousands of them stays small.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Linked(i32, u64, u32, u64, u64, u32);
+
+impl Linked {
+    fn id(&self) -> FileId {
+        (self.0, self.1)
+    }
+}
+
+/// Counts the hard-linked files that subtrees measured with [`Walker::keep_links`] left out
+/// of their sizes, as one walk of them all would: a file's blocks are allocated to the first
+/// subtree holding a link to it, and reclaimable only from a subtree that holds every link.
+/// Neither depends on when each subtree was walked, so a size kept from an earlier walk and
+/// one walked now add up without counting a file twice. Call it once per set of sizes.
+pub fn attribute_links<'a>(sizes: impl IntoIterator<Item = &'a mut SubtreeSize>) {
+    let mut sizes: Vec<&mut SubtreeSize> = sizes.into_iter().collect();
+    let mut owner: HashMap<FileId, usize> = HashMap::new();
+    for (i, s) in sizes.iter().enumerate() {
+        for l in s.links.iter().flatten() {
+            owner.entry(l.id()).or_insert(i);
+        }
+    }
+    for (i, s) in sizes.iter_mut().enumerate() {
+        let Some(links) = &s.links else { continue };
+        let (mut allocated, mut reclaimable, mut shared) = (0, 0, false);
+        for l in links {
+            if owner[&l.id()] == i {
+                allocated += l.3;
+            }
+            if l.5 >= l.2 {
+                reclaimable += l.4;
+            } else {
+                shared = true;
+            }
+        }
+        s.size.allocated += allocated;
+        s.size.reclaimable += reclaimable;
+        s.shared_links |= shared;
+    }
 }
 
 /// One part of a walked subtree: a folder `depth` levels down, whole, or, with `top`, a
@@ -76,6 +124,7 @@ pub struct Walker {
     protected: Protected,
     threads: usize,
     depth: usize,
+    keep_links: bool,
 }
 
 impl Walker {
@@ -89,7 +138,15 @@ impl Walker {
             protected: Protected::new(home),
             threads,
             depth: 0,
+            keep_links: false,
         }
+    }
+
+    /// Leaves hard-linked files out of each size and lists them in [`SubtreeSize::links`],
+    /// for [`attribute_links`] to count beside sizes from other walks.
+    pub fn keep_links(mut self) -> Self {
+        self.keep_links = true;
+        self
     }
 
     /// Also reports each subtree cut into parts `depth` folders down, from the same walk.
@@ -169,8 +226,10 @@ impl Walker {
                 .collect()
         });
         let mut parts: Vec<HashMap<PartKey, Tally>> = vec![HashMap::new(); roots.len()];
+        let mut kept: Vec<HashMap<FileId, Linked>> = vec![HashMap::new(); roots.len()];
         for w in partials {
-            for (o, t) in out.iter_mut().zip(w.trees) {
+            for ((o, mut t), k) in out.iter_mut().zip(w.trees).zip(&mut kept) {
+                merge_links(k, std::mem::take(&mut t.links));
                 o.size.allocated += t.allocated;
                 o.size.reclaimable += t.reclaimable;
                 o.files += t.files;
@@ -187,8 +246,11 @@ impl Walker {
                 }
             }
         }
-        for o in &mut out {
+        for (o, k) in out.iter_mut().zip(kept) {
             o.repos.sort();
+            if self.keep_links && o.error.is_none() {
+                o.links = Some(sorted_links(k));
+            }
         }
         for link in links.into_inner().unwrap().into_values() {
             if link.seen < link.nlink || link.shared || link.part_shared {
@@ -215,7 +277,7 @@ impl Walker {
                     .map(|((rel, top), t)| Part {
                         rel,
                         top,
-                        size: t.into_size(),
+                        size: t.into_size(self.keep_links),
                     })
                     .collect();
                 v.sort_by(|a, b| (&a.rel, a.top).cmp(&(&b.rel, b.top)));
@@ -239,6 +301,8 @@ pub fn measure_file(path: &Path) -> SubtreeSize {
                     reclaimable: if m.nlink() > 1 { 0 } else { allocated },
                 },
                 files: 1,
+                // Counted whole above, so there is nothing for `attribute_links` to add.
+                links: Some(Vec::new()),
                 ..SubtreeSize::default()
             }
         }
@@ -369,10 +433,25 @@ struct Tally {
     git_marks: u8,
     mounts: u64,
     shared_links: bool,
+    /// With [`Walker::keep_links`], the hard-linked files met, left out of the sizes.
+    links: HashMap<FileId, Linked>,
+}
+
+fn merge_links(into: &mut HashMap<FileId, Linked>, from: HashMap<FileId, Linked>) {
+    for (id, l) in from {
+        into.entry(id).and_modify(|k| k.5 += l.5).or_insert(l);
+    }
+}
+
+fn sorted_links(links: HashMap<FileId, Linked>) -> Vec<Linked> {
+    let mut v: Vec<Linked> = links.into_values().collect();
+    v.sort_unstable_by_key(Linked::id);
+    v
 }
 
 impl Tally {
     fn add(&mut self, o: &Tally) {
+        merge_links(&mut self.links, o.links.clone());
         self.allocated += o.allocated;
         self.reclaimable += o.reclaimable;
         self.files += o.files;
@@ -384,9 +463,10 @@ impl Tally {
         self.shared_links |= o.shared_links;
     }
 
-    fn into_size(mut self) -> SubtreeSize {
+    fn into_size(mut self, keep_links: bool) -> SubtreeSize {
         self.repos.sort();
         SubtreeSize {
+            links: keep_links.then(|| sorted_links(std::mem::take(&mut self.links))),
             size: Size {
                 allocated: self.allocated,
                 reclaimable: self.reclaimable,
@@ -613,6 +693,13 @@ impl Ctx<'_> {
         if e.nlink <= 1 {
             t.allocated += e.alloc;
             t.reclaimable += private;
+            return;
+        }
+        if self.walker.keep_links {
+            t.links
+                .entry(id)
+                .and_modify(|l| l.5 += 1)
+                .or_insert(Linked(id.0, id.1, e.nlink, e.alloc, private, 1));
             return;
         }
         let mut links = self.links.lock().unwrap();
@@ -1072,6 +1159,42 @@ mod tests {
         assert_eq!(a.repos, [PathBuf::from("b/repo")]);
         assert!(whole.parts[2].size.git_at_root, "c holds a .git of its own");
         assert_eq!(whole.repos, [PathBuf::from("a/b/repo"), "c".into()]);
+    }
+
+    #[test]
+    fn subtrees_walked_apart_with_kept_links_add_up_as_one_walk() {
+        let t = tempfile::tempdir().unwrap();
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        write_mib(&a.join("own"), 1);
+        write_mib(&a.join("both"), 2);
+        write_mib(&a.join("inside"), 3);
+        fs::create_dir_all(&b).unwrap();
+        fs::hard_link(a.join("both"), b.join("both")).unwrap();
+        fs::hard_link(a.join("inside"), a.join("inside-too")).unwrap();
+
+        let together = walker(t.path()).threads(1).measure(&[a.clone(), b.clone()]);
+        let mut apart: Vec<SubtreeSize> = [&a, &b]
+            .iter()
+            .map(|r| {
+                let [s] = walker(t.path())
+                    .keep_links()
+                    .measure(std::slice::from_ref(*r))
+                    .try_into()
+                    .unwrap();
+                s
+            })
+            .collect();
+        assert!(
+            near(apart[0].size.allocated, MIB),
+            "links left out: {apart:?}"
+        );
+        assert_eq!(apart[0].links.as_ref().unwrap().len(), 2);
+        attribute_links(apart.iter_mut());
+        for (x, y) in together.iter().zip(&apart) {
+            assert_eq!(x.size, y.size);
+            assert_eq!(x.shared_links, y.shared_links);
+        }
+        assert!(near(apart[0].size.reclaimable, 2 * MIB), "{apart:?}");
     }
 
     #[test]

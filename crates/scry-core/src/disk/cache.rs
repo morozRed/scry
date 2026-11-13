@@ -6,10 +6,10 @@
 //! A single file, such as Docker's disk, is read again with `lstat` every time: it grows in
 //! place, and the events name only its folder.
 //!
-//! A hard-linked file is counted in the first part a walk meets it in. A part walked alone
-//! could count it again while another part keeps a cached size that counts it, so when a
-//! walk meets a hard-linked file with a link outside what it walked, or a part walked again
-//! held one before, every part is walked again together.
+//! A part's stored size leaves out its hard-linked files and lists them instead. Each
+//! reading counts them across every part, cached or walked now, with
+//! [`attribute_links`]: a part walked again alone never counts a file another part holds,
+//! and no other part has to be walked with it.
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
@@ -21,7 +21,7 @@ use serde::Serialize;
 use super::fsevents;
 use crate::paths::Paths;
 use crate::protected::file_id;
-use crate::size::{SubtreeSize, Walker, measure_file};
+use crate::size::{SubtreeSize, Walker, attribute_links, measure_file};
 use crate::store::{SizeRow, Store};
 
 /// How long the FSEvents history may take before every size counts as stale.
@@ -52,7 +52,10 @@ impl Part {
 /// What the cache held for each part, and whether it must be measured again.
 #[derive(Clone, Debug, Default)]
 pub struct Look {
+    /// The cached size of each part, its hard-linked files counted.
     pub cached: Vec<Option<SubtreeSize>>,
+    /// The same as stored, hard-linked files only listed, for `measure` to count again.
+    base: Vec<Option<SubtreeSize>>,
     /// Measured again by `measure`.
     pub stale: Vec<bool>,
     /// Changed, but held back: a folder with tens of thousands of files of its own, read
@@ -84,9 +87,6 @@ pub struct CacheStats {
     /// FSEvents lost events, its log was reset, or its counter went backwards: everything
     /// was measured.
     pub lost: bool,
-    /// A part walked again shares hard-linked files with parts that were not, so every part
-    /// was walked again together.
-    pub relinked: bool,
     pub history_ms: f64,
     pub walk_ms: f64,
 }
@@ -142,10 +142,19 @@ impl SizeCache {
     /// The cached size of each part and whether it is stale. Parts that no change touched
     /// are marked good up to now, so the next look reads only the history after this one.
     pub fn look(&self, parts: &[Part], home: &Path) -> Look {
+        let mut look = self.look_stored(parts, home);
+        look.base = look.cached.clone();
+        attribute_links(look.cached.iter_mut().flatten());
+        look
+    }
+
+    /// [`Self::look`], with sizes as stored.
+    fn look_stored(&self, parts: &[Part], home: &Path) -> Look {
         let start = Instant::now();
         let n = parts.len();
         let mut look = Look {
             cached: vec![None; n],
+            base: Vec::new(),
             stale: vec![true; n],
             held: vec![false; n],
             stats: CacheStats {
@@ -187,6 +196,10 @@ impl SizeCache {
             let Some(row) = rows.remove(&(p.path.clone(), p.top)) else {
                 continue;
             };
+            // An older Scry counted hard-linked files into the size and kept no list of them.
+            if row.size.links.is_none() {
+                continue;
+            }
             let meta = std::fs::symlink_metadata(&p.path);
             let same = meta
                 .as_ref()
@@ -289,14 +302,14 @@ impl SizeCache {
         let event_id = fsevents::current_id();
         let now = crate::sys::now_ms();
         let mut out: Vec<SubtreeSize> = look
-            .cached
+            .base
             .iter()
             .map(|c| c.clone().unwrap_or_default())
             .collect();
         let mut rows = Vec::new();
         let is_file =
             |i: usize| std::fs::symlink_metadata(&parts[i].path).is_ok_and(|m| m.is_file());
-        let (files, mut folders): (Vec<usize>, Vec<usize>) = (0..parts.len())
+        let (files, folders): (Vec<usize>, Vec<usize>) = (0..parts.len())
             .filter(|&i| look.stale[i])
             .partition(|&i| is_file(i));
         for &i in &files {
@@ -314,20 +327,7 @@ impl SizeCache {
                 });
             }
         }
-        let held_links = folders
-            .iter()
-            .any(|&i| look.cached[i].as_ref().is_some_and(|c| c.shared_links));
-        let mut walked = self.walk(parts, &folders, home, exclude);
-        let met_links = walked.iter().any(|(_, s)| s.shared_links);
-        if !folders.is_empty() && (held_links || met_links) {
-            let every: Vec<usize> = (0..parts.len()).filter(|&i| !is_file(i)).collect();
-            if every.len() > folders.len() {
-                folders = every;
-                walked = self.walk(parts, &folders, home, exclude);
-                stats.relinked = true;
-            }
-        }
-        for (i, size) in walked {
+        for (i, size) in self.walk(parts, &folders, home, exclude) {
             let big = size.files + size.dirs > self.split_above;
             if size.error.is_none() && big && !parts[i].top {
                 // The same walk, in parts: stored so the next layout measures them apart.
@@ -371,6 +371,7 @@ impl SizeCache {
         if let Some(store) = &self.store {
             let _ = store.put_size_rows(&rows);
         }
+        attribute_links(out.iter_mut());
         stats.measured = files.len() + folders.len();
         stats.walk_ms = ms(start);
         (out, stats)
@@ -392,7 +393,11 @@ impl SizeCache {
         // no folder is counted twice. A walk still enters its own root.
         let mut fence: Vec<PathBuf> = parts.iter().map(|p| p.path.clone()).collect();
         fence.extend(exclude.iter().cloned());
-        let sizes = Walker::new(home).exclude(fence).parts(1).measure(&folders);
+        let sizes = Walker::new(home)
+            .keep_links()
+            .exclude(fence)
+            .parts(1)
+            .measure(&folders);
         which.iter().copied().zip(sizes).collect()
     }
 }
@@ -641,12 +646,30 @@ mod tests {
         let l = look_until(&c, &parts, &home, &want);
         assert_eq!(l.stale, want);
         let (warm, stats) = c.measure(&parts, &l, &home, &[]);
-        assert!(stats.relinked, "{stats:?}");
-        assert_eq!(stats.measured, 2);
+        assert_eq!(stats.measured, 1, "the other part stays cached");
         let second = total(&warm);
         assert!(
             second < first + (1 << 19),
             "still counted once: {first} then {second}"
+        );
+        assert!(
+            warm[1 - zero].size.allocated >= 1 << 20 && warm[zero].size.allocated < 1 << 19,
+            "the link stays where it was counted: {warm:?}"
+        );
+        assert!(
+            warm.iter()
+                .all(|s| s.shared_links && s.size.reclaimable < 1 << 19)
+        );
+        // A look shows the same, without walking anything.
+        let l = c.look(&parts, &home);
+        let shown: Vec<u64> = l
+            .cached
+            .iter()
+            .map(|s| s.as_ref().unwrap().size.allocated)
+            .collect();
+        assert_eq!(
+            shown,
+            warm.iter().map(|s| s.size.allocated).collect::<Vec<_>>()
         );
     }
 

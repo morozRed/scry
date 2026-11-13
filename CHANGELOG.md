@@ -14,6 +14,12 @@ All notable changes to Scry are listed here. The format follows
 
 ### Fixed
 
+- A Disk reading walked every folder again whenever a changed one held a hard-linked file,
+  which local git clones and pnpm make common, so cached sizes rarely helped: on the
+  reference Mac a reading with 60 changed folders of 37,000 took 105 s. Cached sizes now
+  keep their hard-linked files apart and count them across all folders on each reading,
+  so only the changed folders are walked; the same reading takes 9–18 s. The first reading
+  after updating walks everything once.
 - The pulse never reached a live board, so the Overview's CPU and memory gauges stayed on
   "warming up" and the header showed process counts. CPU, memory pressure, swap and free
   disk now show, CPU from the second reading a second after start.
