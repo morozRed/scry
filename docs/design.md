@@ -47,7 +47,7 @@ it only from 150 columns. Its pictures are at commit `ee8318b`.
 D replaced it, modelled on [ghui](https://github.com/kitlangton/ghui)'s list and detail, and
 for Disk on [disktree](https://github.com/tobi/disktree)'s treemap:
 
-- **One header line and a rule.** `SCRY`, the views by name with their counts, the pulse on
+- **One header line and a rule.** The mark `(▮)` and `SCRY`, the views by name with their counts, the pulse on
   the right. The Overview shows the pulse as gauges instead.
 - **Lists without column titles.** The list's name is the section title (`AGENT SESSIONS`,
   in the warn hue), with a note of what asks for something and, when sorted, what orders it
@@ -248,7 +248,7 @@ the glyph, so nothing depends on colour alone.
 
 All in `crates/scry/src/tui/kit/`:
 
-- `chrome`: the header line (`SCRY`, the views with their counts, and on the right the
+- `chrome`: the header line (`(▮) SCRY`, the views with their counts, and on the right the
   pulse, which drops segments from the right when space runs out, then the activity), rules,
   the section title over a list, and the footer. The footer's left side shows the filter
   while it is typed, else a toast, else the filter that is applied, and then the keys that do

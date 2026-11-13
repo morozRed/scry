@@ -2,7 +2,7 @@
 source: crates/scry/src/tui/tests.rs
 expression: "render(&a, 120, 40)"
 ---
-" SCRY   Overview 5   Ports 1   Agents 4   Disk 1   Worktrees 4              cpu ▃▅▄▃▂▃▄▃ 23%   mem ● normal   swap 1.2G "
+" (▮) SCRY   Overview 5   Ports 1   Agents 4   Disk 1   Worktrees 4          cpu ▃▅▄▃▂▃▄▃ 23%   mem ● normal   swap 1.2G "
 "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 "                                                                       │                                                "
 "  AGENT SESSIONS   4 leftovers                                         │  next dev                                      "

@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/scry-dark.svg">
+    <img alt="Scry's logo: an eye whose pupil is a terminal block cursor" src="docs/logo/scry.svg" width="112">
+  </picture>
+</p>
+
 # Scry
 
 **See what your coding agents left running on your Mac.**

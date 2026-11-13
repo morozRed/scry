@@ -2,7 +2,7 @@
 source: crates/scry/src/tui/tests.rs
 expression: "render(&a, 80, 24)"
 ---
-" SCRY   Overview 5   Ports   Agents 4   Disk 1   Worktrees 4                    "
+" (▮) SCRY   Overview 5   Ports   Agents 4   Disk 1   Worktrees 4                "
 "────────────────────────────────────────────────────────────────────────────────"
 "                                                                                "
 " LISTENING PORTS                                                                "

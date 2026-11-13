@@ -11,6 +11,9 @@ use super::width;
 use crate::tui::theme::{Theme, glyph};
 use unicode_width::UnicodeWidthStr;
 
+/// The cursor eye from `docs/logo/scry.svg`: an eye whose pupil is a block cursor.
+const PUPIL: &str = "▮";
+
 /// Up to five eighths of the cell, in the muted ink: a trend beside the number, not the
 /// heaviest thing in the header.
 const SPARK: [char; 5] = ['▁', '▂', '▃', '▄', '▅'];
@@ -47,9 +50,10 @@ pub fn section(f: &mut Frame, area: Rect, theme: &Theme, title: &str, note: &str
     f.render_widget(Paragraph::new(super::fit(spans, room)), area);
 }
 
-/// One line: `SCRY`, then the views by name with their counts, the active one in the
-/// accent; on the right the pulse, when `pulse` is set, and the activity. Segments that do
-/// not fit are dropped from the right, the activity last. Returns where each tab landed.
+/// One line: the mark and `SCRY`, then the views by name with their counts, the active one
+/// in the accent; on the right the pulse, when `pulse` is set, and the activity. Segments
+/// that do not fit are dropped from the right, the activity last. Returns where each tab
+/// landed.
 pub fn header(
     f: &mut Frame,
     area: Rect,
@@ -62,7 +66,9 @@ pub fn header(
     let (active, badges) = tabs;
     let mut spans = vec![
         Span::raw(" "),
-        Span::styled("SCRY", theme.strong),
+        Span::styled("(", theme.strong),
+        Span::styled(PUPIL, theme.accent),
+        Span::styled(") SCRY", theme.strong),
         Span::raw("   "),
     ];
     let mut at = Vec::new();
