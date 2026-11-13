@@ -321,11 +321,11 @@ def typed(name, timeline, text, fixture=FIX, quit_key=b"q"):
     t.close()
 
 
-# BackTab from Overview wraps to Worktrees.
+# BackTab from Overview wraps to Top, the last tab, which says the fixture has no usage.
 typed(
     "BackTab typed while Scry waits for the answer reaches the TUI",
     [(0.1, b"\x1b[Z"), (0.2, REPLY)],
-    "holds no worktrees",
+    "recorded without CPU and memory use",
 )
 # On Agents, h folds the first session and plain Right would unfold it; Ctrl-Right does
 # nothing, so the fold marker stays.
@@ -338,7 +338,7 @@ typed(
 typed(
     "a key split across the 1 s deadline keeps its ESC [ and reaches the TUI",
     [(0.9, b"\x1b["), (1.3, b"Z"), (1.6, REPLY)],
-    "holds no worktrees",
+    "recorded without CPU and memory use",
 )
 typed(
     "a character split where Scry hands the terminal to the event loop is typed whole",

@@ -8,6 +8,11 @@ All notable changes to Scry are listed here. The format follows
 
 ### Added
 
+- **Homebrew:** `brew install morozRed/tap/scry` installs a prebuilt binary. Each tagged
+  release builds it, publishes it on GitHub and updates the tap.
+- After an upgrade, the daemon restarts itself on the new binary within a minute, instead
+  of running the old one until `scry daemon install`.
+
 - **Top** (`6`, and `scry top`): what uses the CPU and memory. Your processes are grouped by
   the app or program they belong to, ranked by load, with CPU and memory bars over the list
   and a meter on each row; groups open with `space`, and `x` stops a process. Without root

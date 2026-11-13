@@ -67,7 +67,6 @@ time from click to first frame and the idle cost before work starts.
 
 ### Distribution
 
-- A Homebrew tap with the formula in [`packaging/homebrew/scry.rb`](../packaging/homebrew/scry.rb).
 - Release binaries signed with a Developer ID.
 
 ### Linux

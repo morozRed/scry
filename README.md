@@ -39,8 +39,16 @@ you clean up after a confirmation that lists exactly what will happen.
 
 ## Install
 
-You need [Rust](https://rustup.rs) 1.89 or later and the Xcode Command Line Tools
-(`xcode-select --install`).
+With [Homebrew](https://brew.sh):
+
+```sh
+brew install morozRed/tap/scry
+```
+
+`brew upgrade scry` updates it, and a running daemon restarts itself on the new binary.
+
+From source, with [Rust](https://rustup.rs) 1.89 or later and the Xcode Command Line Tools
+(`xcode-select --install`):
 
 ```sh
 git clone https://github.com/morozRed/scry.git
@@ -48,9 +56,7 @@ cd scry
 cargo install --path crates/scry
 ```
 
-This puts `scry` in `~/.cargo/bin`. A Homebrew formula is ready in
-[`packaging/homebrew`](packaging/homebrew/scry.rb) and will be published with the first
-tagged release.
+This puts `scry` in `~/.cargo/bin`.
 
 Scry needs no root access and no special permissions.
 
@@ -332,8 +338,10 @@ comes first; see [Performance](#performance).
 
 `install` writes `~/Library/LaunchAgents/com.morozred.scry.daemon.plist`. macOS then shows
 a "Background Items Added" notice, and Scry appears under System Settings > General > Login
-Items & Extensions. Run `install` again after you upgrade Scry or change the config: it
-restarts the daemon when either changed, and `scry daemon status` says when that is needed.
+Items & Extensions. When the binary the LaunchAgent runs is replaced, as by
+`brew upgrade scry` or `cargo install`, the daemon notices within a minute and exits, and
+launchd starts the new one. Run `install` again after you change the config: it restarts
+the daemon when anything changed, and `scry daemon status` says when that is needed.
 
 ## Claude Code hooks
 
@@ -455,6 +463,11 @@ give way to what you are doing.
 
 Bug reports and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers how
 to build, test and send a change.
+
+## Sponsor
+
+Scry is free and MIT licensed. If it saves you time, you can
+[sponsor its development](https://github.com/sponsors/morozRed).
 
 ## License
 

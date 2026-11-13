@@ -1,0 +1,144 @@
+name: release
+
+# Pushing a tag vX.Y.Z releases that commit:
+# 1. build: checks the tag against Cargo.toml and the CHANGELOG, runs the checks, builds
+#    scry for Apple silicon and uploads scry-X.Y.Z-darwin-arm64.tar.gz and its .sha256.
+# 2. release: creates the GitHub release with the CHANGELOG's notes for X.Y.Z.
+# 3. homebrew: renders packaging/homebrew/scry.rb for the release, installs, tests and
+#    audits it from the tap, and pushes it to morozRed/homebrew-tap. Needs the
+#    HOMEBREW_TAP_TOKEN secret: a fine-grained token with Contents read and write on that
+#    repository only.
+# Re-run a failed job from the Actions page; every step can run twice.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # `brew tap morozRed/tap` clones github.com/morozRed/homebrew-tap.
+  TAP: morozRed/tap
+  TAP_REPO: morozRed/homebrew-tap
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Check the tag against Cargo.toml and the CHANGELOG
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "$version" = "$crate" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $crate"; exit 1; }
+          grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no [$version] section"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - name: Build
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: cargo build --release --locked -p scry
+      - id: pack
+        name: Pack
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          [ "$(target/release/scry --version)" = "scry $VERSION" ] || { target/release/scry --version; exit 1; }
+          codesign --verify target/release/scry
+          name="scry-$VERSION-darwin-arm64.tar.gz"
+          mkdir dist
+          tar -czf "dist/$name" -C target/release scry -C "$GITHUB_WORKSPACE" LICENSE README.md
+          (cd dist && shasum -a 256 "$name" > "$name.sha256")
+          echo "sha256=$(cut -d' ' -f1 "dist/$name.sha256")" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            prerelease=
+            case "$VERSION" in *-*) prerelease=--prerelease ;; esac
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag $prerelease \
+              --title "Scry $VERSION" --notes-file notes.md
+          fi
+
+  homebrew:
+    needs: [build, release]
+    if: ${{ !contains(needs.build.outputs.version, '-') }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render the formula
+        run: scripts/render-formula.sh "${{ needs.build.outputs.version }}" "${{ needs.build.outputs.sha256 }}" "$RUNNER_TEMP/scry.rb"
+      - name: Install, test and audit it from the tap
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+          HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
+        run: |
+          brew tap "$TAP"
+          tap=$(brew --repo "$TAP")
+          mkdir -p "$tap/Formula"
+          cp "$RUNNER_TEMP/scry.rb" "$tap/Formula/scry.rb"
+          if brew trust --help >/dev/null 2>&1; then brew trust "$TAP"; fi
+          brew install "$TAP/scry"
+          brew test "$TAP/scry"
+          brew audit --strict --online "$TAP/scry"
+      - name: Push it to the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          : "${GH_TOKEN:?Add the HOMEBREW_TAP_TOKEN secret: a token with Contents write on $TAP_REPO}"
+          gh auth setup-git
+          gh repo clone "$TAP_REPO" "$RUNNER_TEMP/tap" -- -q
+          cd "$RUNNER_TEMP/tap"
+          mkdir -p Formula
+          cp "$RUNNER_TEMP/scry.rb" Formula/scry.rb
+          git add Formula/scry.rb
+          if git diff --cached --quiet; then echo "the tap already has scry $VERSION"; exit 0; fi
+          git -c user.name="github-actions[bot]" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "scry $VERSION"
+          git push -q origin HEAD

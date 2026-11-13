@@ -38,11 +38,14 @@ pub fn run(action: Action) -> Result<()> {
         Action::Status { json } => status(&paths, json),
         Action::Run => {
             // Under launchd stderr is the log, so the error gets a timestamp like every line.
-            if let Err(e) = daemon::run(&paths) {
-                daemon_log::line(&format!("error: {e:#}"));
-                std::process::exit(1);
+            match daemon::run(&paths) {
+                Ok(daemon::Stopped::Signal(_)) => Ok(()),
+                Ok(daemon::Stopped::Replaced(_)) => std::process::exit(daemon::REPLACED_EXIT),
+                Err(e) => {
+                    daemon_log::line(&format!("error: {e:#}"));
+                    std::process::exit(1);
+                }
             }
-            Ok(())
         }
     }
 }

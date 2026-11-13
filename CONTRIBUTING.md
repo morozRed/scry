@@ -28,7 +28,7 @@ change. To learn how the code fits together, start with
 | `crates/scry` | The `scry` binary: the CLI commands and the terminal UI. |
 | `docs/` | Architecture, design and roadmap notes, and the README's screenshots in `docs/screens/`. |
 | `fixtures/` | Synthetic snapshots that tests and screenshots draw from. |
-| `packaging/` | The Homebrew formula. |
+| `packaging/` | The template for the Homebrew formula the release workflow publishes. |
 | `scripts/` | Checks that tests alone cannot run, such as the terminal smoke test. |
 
 ## Build and test
@@ -89,6 +89,23 @@ common formats. It cannot read binary files, so check those by hand.
 - Update the README, the docs and `--help` text when behaviour changes, and add a line
   to the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md).
 - Keep code comments for a reason the code cannot show.
+
+## Releasing
+
+Maintainers release from `main`:
+
+1. Set `version` in the workspace `Cargo.toml` (and the `scry-core` dependency's
+   `version`), run `cargo build` to update `Cargo.lock`, and rename the CHANGELOG's
+   `Unreleased` section to `[X.Y.Z] - YYYY-MM-DD`. Merge that as one pull request.
+2. Tag the merged commit and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+The [release workflow](.github/workflows/release.yml) then checks the tag against
+`Cargo.toml` and the CHANGELOG, runs the checks, builds the Apple silicon binary, creates
+the GitHub release with that version's CHANGELOG notes, and installs, tests and pushes the
+formula rendered from [`packaging/homebrew/scry.rb`](packaging/homebrew/scry.rb) to
+[morozRed/homebrew-tap](https://github.com/morozRed/homebrew-tap). A tag with a suffix,
+such as `v0.2.0-rc.1`, makes a prerelease and leaves the tap alone. Change the formula
+in `packaging/`, never in the tap.
 
 ## License
 

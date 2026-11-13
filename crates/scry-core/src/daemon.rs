@@ -355,8 +355,22 @@ fn audit(store: &Store, action: &str, target: &str, steps: &[Step]) -> Result<()
     })
 }
 
-/// Runs the daemon in the foreground until SIGTERM or SIGINT.
-pub fn run(paths: &Paths) -> Result<()> {
+/// Why `run` returned.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stopped {
+    /// SIGTERM or SIGINT, or 0 if the signal thread went away.
+    Signal(i32),
+    /// The program launchd starts is now another binary, as after `brew upgrade`. The
+    /// caller exits non-zero so launchd's `KeepAlive` starts the new one.
+    Replaced(String),
+}
+
+/// The exit code for `Stopped::Replaced`: non-zero, so launchd restarts the job.
+pub const REPLACED_EXIT: i32 = 75;
+
+/// Runs the daemon in the foreground until SIGTERM or SIGINT, or until the program it was
+/// started as is replaced.
+pub fn run(paths: &Paths) -> Result<Stopped> {
     daemon_log::attach(&paths.log());
     std::panic::set_hook(Box::new(|info| daemon_log::line(&format!("panic: {info}"))));
     let (config, _) = Config::load(paths)?;
@@ -382,32 +396,67 @@ pub fn run(paths: &Paths) -> Result<()> {
         interval.as_secs(),
         paths.db().display()
     ));
+    // launchd starts the job by an absolute path, Homebrew's stable `bin/scry` link when
+    // installed from a tap. An upgrade repoints that link and leaves this process on the
+    // old keg, so the loop checks where it points now.
+    let started_as = std::env::args_os().next().map(PathBuf::from);
+    let started_as = started_as.filter(|p| p.is_absolute());
     let (recorder, recording) = recorder::spawn(paths.clone())?;
-    let sig = sample_until_stopped(&store, interval, &rx, || {
-        let volume = Path::new(SAMPLED_VOLUME);
-        sys::volume_space(volume).map(|mut s| {
-            s.important_bytes = crate::disk::space::important(volume);
-            s
-        })
-    });
+    let stopped = sample_until_stopped(
+        &store,
+        interval,
+        &rx,
+        || {
+            let volume = Path::new(SAMPLED_VOLUME);
+            sys::volume_space(volume).map(|mut s| {
+                s.important_bytes = crate::disk::space::important(volume);
+                s
+            })
+        },
+        || replaced(me.binary.as_ref(), started_as.as_deref(), paths),
+    );
     recorder.stop();
     let _ = recording.join();
     handle.close();
     let _ = waiter.join();
     drop(store);
     drop(lock);
-    daemon_log::line(&format!("stopped by signal {sig}"));
-    Ok(())
+    match &stopped {
+        Stopped::Signal(sig) => daemon_log::line(&format!("stopped by signal {sig}")),
+        Stopped::Replaced(why) => daemon_log::line(&format!(
+            "stopped because {why}; launchd starts the new one"
+        )),
+    }
+    Ok(stopped)
 }
 
-/// Samples now and then once per `interval` until a signal number arrives on `stop`.
-/// Returns that signal, or 0 if the sender went away.
+/// Why the binary at `started_as` is no longer the one this process runs, or `None` while
+/// it is, or while it cannot be read (an upgrade may be relinking it right now).
+fn replaced(running: Option<&Binary>, started_as: Option<&Path>, paths: &Paths) -> Option<String> {
+    let now = Binary::of(started_as?)?;
+    let running = running?;
+    if now.path != running.path {
+        Some(format!(
+            "{} now points to {}",
+            paths.tilde(started_as?),
+            paths.tilde(&now.path)
+        ))
+    } else if &now != running {
+        Some(format!("{} was replaced", paths.tilde(&now.path)))
+    } else {
+        None
+    }
+}
+
+/// Samples now and then once per `interval` until a signal number arrives on `stop`, or
+/// until `replaced`, asked on every wake (at least once a minute), gives a reason.
 pub fn sample_until_stopped(
     store: &Store,
     interval: Duration,
     stop: &Receiver<i32>,
     mut sample: impl FnMut() -> Result<DiskSample>,
-) -> i32 {
+    mut replaced: impl FnMut() -> Option<String>,
+) -> Stopped {
     // Waits are capped and measured on the wall clock because the monotonic clock stops
     // while the Mac sleeps, which would push the next sample a whole interval past wake.
     const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -428,9 +477,12 @@ pub fn sample_until_stopped(
             .unwrap_or_default()
             .min(MAX_WAIT);
         match stop.recv_timeout(wait) {
-            Ok(sig) => return sig,
+            Ok(sig) => return Stopped::Signal(sig),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return 0,
+            Err(RecvTimeoutError::Disconnected) => return Stopped::Signal(0),
+        }
+        if let Some(why) = replaced() {
+            return Stopped::Replaced(why);
         }
     }
 }
@@ -685,15 +737,70 @@ mod tests {
         let store = Store::open(&tmp.path().join("scry.db")).unwrap();
         let (tx, rx) = mpsc::channel();
         let mut calls = 0;
-        let sig = sample_until_stopped(&store, Duration::from_millis(20), &rx, || {
-            calls += 1;
-            if calls == 3 {
-                tx.send(SIGTERM).unwrap();
-            }
-            sys::volume_space(Path::new("/"))
-        });
-        assert_eq!(sig, SIGTERM);
+        let stopped = sample_until_stopped(
+            &store,
+            Duration::from_millis(20),
+            &rx,
+            || {
+                calls += 1;
+                if calls == 3 {
+                    tx.send(SIGTERM).unwrap();
+                }
+                sys::volume_space(Path::new("/"))
+            },
+            || None,
+        );
+        assert_eq!(stopped, Stopped::Signal(SIGTERM));
         assert_eq!(store.sample_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn stops_when_the_binary_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("scry.db")).unwrap();
+        let (_tx, rx) = mpsc::channel();
+        let mut asked = 0;
+        let stopped = sample_until_stopped(
+            &store,
+            Duration::from_millis(10),
+            &rx,
+            || sys::volume_space(Path::new("/")),
+            || {
+                asked += 1;
+                (asked == 2).then(|| "upgraded".to_string())
+            },
+        );
+        assert_eq!(stopped, Stopped::Replaced("upgraded".into()));
+    }
+
+    #[test]
+    fn a_repointed_homebrew_link_counts_as_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let paths = Paths::new(root.clone(), None);
+        for v in ["0.1.0", "0.2.0"] {
+            let bin = root.join(format!("Cellar/scry/{v}/bin"));
+            fs::create_dir_all(&bin).unwrap();
+            fs::write(bin.join("scry"), v).unwrap();
+        }
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let link = root.join("bin/scry");
+        std::os::unix::fs::symlink("../Cellar/scry/0.1.0/bin/scry", &link).unwrap();
+        let running = Binary::of(&link).unwrap();
+        assert_eq!(replaced(Some(&running), Some(&link), &paths), None);
+
+        fs::remove_file(&link).unwrap();
+        assert_eq!(
+            replaced(Some(&running), Some(&link), &paths),
+            None,
+            "mid-relink"
+        );
+
+        std::os::unix::fs::symlink("../Cellar/scry/0.2.0/bin/scry", &link).unwrap();
+        let why = replaced(Some(&running), Some(&link), &paths).unwrap();
+        assert!(why.contains("0.2.0"), "{why}");
+        assert_eq!(replaced(None, Some(&link), &paths), None);
+        assert_eq!(replaced(Some(&running), None, &paths), None);
     }
 
     #[test]
