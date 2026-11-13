@@ -426,7 +426,10 @@ mod tests {
 
     use super::*;
 
+    /// A cache over `dir`, once fseventsd has taken in the test's setup, so the setup
+    /// never shows up as a change since the first reading.
     fn cache(dir: &Path) -> SizeCache {
+        fsevents::settle();
         SizeCache::new(Some(Store::open(&dir.join("scry.db")).unwrap()))
     }
 

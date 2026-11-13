@@ -280,6 +280,32 @@ unsafe fn cf_string(p: &Path) -> CFTypeRef {
     unsafe { CFStringCreateWithBytes(std::ptr::null(), b.as_ptr(), b.len() as CFIndex, UTF8, 0) }
 }
 
+/// Waits until fseventsd has taken in every write made before the call, so `current_id()`
+/// is past their ids. fseventsd stamps a write when it reads it, which on a loaded machine
+/// can be after a reading taken right away, and such a write would show up as a change
+/// since that reading. Events are stamped in order, so a marker written now being in the
+/// history means everything before it is too.
+#[cfg(test)]
+pub(crate) fn settle() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    let before = current_id();
+    std::fs::write(root.join("marker"), b"x").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let h = since(std::slice::from_ref(&root), before, Duration::from_secs(5));
+        if h.changed
+            .iter()
+            .chain(&h.rescan)
+            .any(|(p, _)| p.starts_with(&root))
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("fseventsd took in no write within 10 s");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +345,7 @@ mod tests {
     #[test]
     fn nothing_since_now_is_an_empty_history() {
         let t = tempfile::tempdir().unwrap();
+        settle();
         let h = since(
             &[t.path().to_path_buf()],
             current_id(),
