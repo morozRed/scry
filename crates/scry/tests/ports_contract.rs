@@ -12,10 +12,12 @@ fn netstat(proto: &str) -> BTreeSet<Key> {
         .output()
         .expect("netstat");
     assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (pid_at, named) = pid_column(&text, proto);
     let mut set = BTreeSet::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in text.lines() {
         let t: Vec<&str> = line.split_whitespace().collect();
-        if t.len() < 8 || !t[0].starts_with(proto) {
+        if t.len() <= pid_at || !t[0].starts_with(proto) {
             continue;
         }
         let listening = match proto {
@@ -28,13 +30,44 @@ fn netstat(proto: &str) -> BTreeSet<Key> {
         if !listening {
             continue;
         }
-        let pid = t[5..]
-            .iter()
-            .find_map(|w| w.rsplit_once(':').and_then(|(_, p)| p.parse().ok()))
-            .expect("process:pid column");
+        let pid = if named {
+            // `process:pid`, where the name may hold spaces.
+            t[pid_at..]
+                .iter()
+                .find_map(|w| w.rsplit_once(':').and_then(|(_, p)| p.parse().ok()))
+        } else {
+            t[pid_at].parse().ok()
+        };
+        let pid = pid.unwrap_or_else(|| panic!("no pid in {line:?}"));
         set.insert((proto.to_string(), port, pid));
     }
     set
+}
+
+/// Where the pid sits in a row, from netstat's header, and whether it comes as
+/// `process:pid` (macOS 26) or bare (earlier releases). UDP rows leave `(state)` empty, so
+/// their fields sit one to the left.
+fn pid_column(text: &str, proto: &str) -> (usize, bool) {
+    let header = text
+        .lines()
+        .find(|l| l.starts_with("Proto"))
+        .expect("netstat header");
+    let names: Vec<String> = header
+        .replace("Local Address", "Local-Address")
+        .replace("Foreign Address", "Foreign-Address")
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let (at, named) = names
+        .iter()
+        .enumerate()
+        .find_map(|(i, n)| match n.as_str() {
+            "process:pid" => Some((i, true)),
+            "pid" => Some((i, false)),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no pid column in {header:?}"));
+    (if proto == "udp" { at - 1 } else { at }, named)
 }
 
 fn scry_ports() -> BTreeSet<Key> {
