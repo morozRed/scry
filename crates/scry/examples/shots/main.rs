@@ -1,4 +1,4 @@
-//! Renders TUI frames from fixtures as SVG into docs/screens.
+//! Renders TUI frames from fixtures as SVG into target/shots, for looking at, not committing.
 //! `cargo run -p scry --example shots`; `scripts/shots.sh` also makes PNGs.
 
 mod svg;
@@ -24,7 +24,7 @@ const PALETTES: [&Palette; 2] = [&TERMINAL_BASIC, &TOMORROW_NIGHT];
 
 fn main() -> anyhow::Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let out = root.join("docs/screens");
+    let out = root.join("target/shots");
     std::fs::create_dir_all(out.join("compare"))?;
     let design = Board::parse(&std::fs::read_to_string(root.join("fixtures/design.json"))?)?;
     let long = with_leftovers(&design, 20);

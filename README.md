@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/scry-dark.svg">
-    <img alt="Scry's logo: an eye whose pupil is a terminal block cursor" src="docs/logo/scry.svg" width="112">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/scry-dark.svg">
+    <img alt="Scry's logo: an eye whose pupil is a terminal block cursor" src="assets/scry.svg" width="112">
   </picture>
 </p>
 
@@ -12,11 +12,6 @@
 Scry is a system monitor for macOS that traces every process, port, git worktree and
 gigabyte back to the project and the agent session that made it. It runs in your terminal,
 and every view is also a command with `--json` output for scripts and agents.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/agents-dark-120x40.svg">
-  <img alt="Scry's Agents view: agent sessions as a tree with their processes, ports, RAM and age. Four processes of an ended Claude Code session are flagged as leftovers, and the pane beside the list explains the selected one: why it is there, its details and the evidence." src="docs/screens/agents-light-120x40.svg">
-</picture>
 
 ## Why
 
@@ -87,30 +82,15 @@ and evidence; `enter` opens it over the whole screen.
 
 ### 1 Overview
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/overview-dark-80x24.svg">
-  <img alt="The Overview: gauges for CPU, memory pressure and free disk, then a ranked list of leftovers, a port held by an ended session, a filling disk and stale worktrees" src="docs/screens/overview-light-80x24.svg">
-</picture>
-
 Gauges for CPU, memory and the disk, then one ranked list of what needs attention across
 all views. `Enter` jumps to the row it is about. When nothing needs attention, it says so.
 
 ### 2 Ports
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/ports-dark-80x24.svg">
-  <img alt="The Ports view: every listening port with its process, project, agent session, age and state" src="docs/screens/ports-light-80x24.svg">
-</picture>
-
 Every listening port on the Mac, yours and the system's, with the process, project and
 agent session behind it. `x` stops the selected process.
 
 ### 3 Agents
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/agents-dark-80x24.svg">
-  <img alt="The Agents view: sessions as a tree, with leftovers flagged" src="docs/screens/agents-light-80x24.svg">
-</picture>
 
 Agent sessions as a tree, each with the processes it started, their ports, RAM and age, and
 in the pane the evidence that ties them to the session. `space` folds a session. Processes left running after their session ended
@@ -118,11 +98,6 @@ are flagged as **leftovers**. `X` stops them all after a confirmation, and `K` p
 your keep list so Scry never selects it again.
 
 ### 4 Disk
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/disk-dark-80x24.svg">
-  <img alt="The Disk view: the volume as a bar with its forecast, then caches, node_modules and worktrees as a treemap coloured by kind, with what Scry can clean up hatched" src="docs/screens/disk-light-80x24.svg">
-</picture>
 
 Free space as Finder counts it, a forecast of when it runs out, and the caches, simulator
 data, `node_modules` folders and worktrees that fill it, as a treemap sized by what each
@@ -132,18 +107,13 @@ selected item in the one way it allows.
 
 ### 5 Worktrees
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/worktrees-dark-80x24.svg">
-  <img alt="The Worktrees view: each linked git worktree with its repo, size, probable creator and state such as can go, dirty or locked" src="docs/screens/worktrees-light-80x24.svg">
-</picture>
-
 Every linked git worktree under your code roots, with its state, size and the agent that
 probably made it. A worktree is "can go" only when removing it loses nothing and its work is
 merged or pushed.
 
 Scry follows your terminal's light or dark theme and honours `NO_COLOR`. It needs a
-terminal of at least 80×24. These screens are drawn from a synthetic fixture, so every
-name in them is made up; [docs/design.md](docs/design.md) explains how the look was chosen.
+terminal of at least 80×24. [docs/design.md](docs/design.md) explains how the look was
+chosen.
 
 ## The CLI
 
@@ -250,12 +220,9 @@ has the full rules.
 
 ## Safety
 
-Scry is built to be safe to point at a busy machine.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screens/sheet-dark-80x24.svg">
-  <img alt="The reap confirmation sheet: four leftover processes listed with pid, age, command and the memory each frees, children first, with enter to reap and esc to cancel" src="docs/screens/sheet-light-80x24.svg">
-</picture>
+Scry is built to be safe to point at a busy machine. Every action opens a confirmation
+sheet in the UI, or a prompt in the CLI, that lists each target with its pid, age, command
+and the memory it frees, children first, before anything is signalled.
 
 **What Scry never does**
 

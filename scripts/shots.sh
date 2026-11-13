@@ -1,6 +1,6 @@
 #!/bin/sh
-# Renders the TUI from fixtures into docs/screens/*.svg, then PNGs of them into
-# target/shots/ with rsvg-convert (brew install librsvg) for viewing.
+# Renders the TUI from fixtures into target/shots/*.svg, then PNGs beside them with
+# rsvg-convert (brew install librsvg) for viewing. Nothing here is committed.
 # Usage: scripts/shots.sh
 set -eu
 
@@ -12,10 +12,7 @@ if ! command -v rsvg-convert >/dev/null; then
   echo "rsvg-convert not found, so no PNGs. brew install librsvg"
   exit 0
 fi
-find docs/screens -name '*.svg' | while read -r svg; do
-  png="target/shots/${svg#docs/screens/}"
-  png="${png%.svg}.png"
-  mkdir -p "$(dirname "$png")"
-  rsvg-convert --zoom 2 -o "$png" "$svg"
+find target/shots -name '*.svg' | while read -r svg; do
+  rsvg-convert --zoom 2 -o "${svg%.svg}.png" "$svg"
 done
 echo "PNGs in $ROOT/target/shots"

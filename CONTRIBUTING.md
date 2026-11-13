@@ -26,7 +26,7 @@ change. To learn how the code fits together, start with
 |---|---|
 | `crates/scry-core` | Reading the system, the data model, attribution, the store, the daemon, cleanup and the view models. No terminal or UI types, so a future menu bar app can reuse it. |
 | `crates/scry` | The `scry` binary: the CLI commands and the terminal UI. |
-| `docs/` | Architecture, design and roadmap notes, and the screenshots in `docs/screens/`. |
+| `docs/` | Architecture, design and roadmap notes. |
 | `fixtures/` | Synthetic snapshots that tests and screenshots draw from. |
 | `packaging/` | The Homebrew formula. |
 | `scripts/` | Checks that tests alone cannot run, such as the terminal smoke test. |
@@ -48,8 +48,8 @@ cargo install cargo-insta
 cargo insta review
 ```
 
-`scripts/shots.sh` renders every screenshot in `docs/screens/` from the fixtures. Run it
-when a change alters how a view looks, and commit the new SVGs with the change.
+`scripts/shots.sh` renders every view from the fixtures into `target/shots/`, for looking
+at a change before and after; nothing it writes is committed.
 
 `scripts/pty-smoke.sh` runs the UI in a real terminal through `tmux` and checks that the
 terminal is restored after quit, SIGTERM, Ctrl-Z and a closed terminal.

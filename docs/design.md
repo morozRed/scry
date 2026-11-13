@@ -1,12 +1,13 @@
 # How the Scry TUI looks, and why
 
 Scry's terminal UI was designed by rendering candidate looks to pictures and choosing
-between them, not by argument. This page shows the comparison, the look that won, the
-design system the views are built from, and how to rerun the pictures.
+between them, not by argument. This page records the comparison, the look that won, the
+design system the views are built from, and how to rerun the pictures; none of the
+pictures themselves are kept in the repository.
 
-Every screen here is drawn from [`fixtures/design.json`](../fixtures/design.json), a
-recorded set of view models with synthetic sessions, ports and processes. Nothing on these
-pages comes from a real machine.
+Every screen compared here was drawn from [`fixtures/design.json`](../fixtures/design.json),
+a recorded set of view models with synthetic sessions, ports and processes. Nothing in this
+comparison came from a real machine.
 
 ## The comparison
 
@@ -16,25 +17,14 @@ The palette: the same fixture, the Agents view (the densest one), in a light and
 terminal at 80×24, the smallest size Scry supports. A and B are both still drawn by the code,
 in today's layout; C was a layout and a palette together.
 
-| | Light | Dark |
-|---|---|---|
-| **A. Native**: the 16 ANSI colours only, reverse-video selection | ![](screens/compare/native-light-80x24.svg) | ![](screens/compare/native-dark-80x24.svg) |
-| **B. Tinted**: fixed hues per light and dark, neutrals mixed from the terminal's own colours | ![](screens/compare/tinted-light-80x24.svg) | ![](screens/compare/tinted-dark-80x24.svg) |
-| **C. Panels**: rounded boxes around list and detail, states as filled pills, ANSI colours | ![](screens/compare/panels-light-80x24.svg) | ![](screens/compare/panels-dark-80x24.svg) |
+- **A. Native**: the 16 ANSI colours only, reverse-video selection.
+- **B. Tinted**: fixed hues per light and dark, neutrals mixed from the terminal's own
+  colours.
+- **C. Panels**: rounded boxes around list and detail, states as filled pills, ANSI colours.
 
-The same at 120×40, and with the reap sheet open:
-[native light](screens/compare/native-light-120x40.svg),
-[native dark](screens/compare/native-dark-120x40.svg),
-[tinted light](screens/compare/tinted-light-120x40.svg),
-[tinted dark](screens/compare/tinted-dark-120x40.svg),
-[panels light](screens/compare/panels-light-120x40.svg),
-[panels dark](screens/compare/panels-dark-120x40.svg);
-sheets:
-[native](screens/compare/native-dark-sheet.svg),
-[tinted](screens/compare/tinted-dark-sheet.svg),
-[panels](screens/compare/panels-dark-sheet.svg).
+Compared at 80×24 and 120×40, light and dark, and with the reap sheet open.
 
-The light terminal is macOS Terminal's default profile, "Basic". The dark one is Tomorrow
+The light terminal was macOS Terminal's default profile, "Basic". The dark one was Tomorrow
 Night, a common dark palette. Basic is what a new Mac gives you, which is the point: an ANSI
 look is only as good as the palette it lands in.
 
@@ -72,9 +62,6 @@ for Disk on [disktree](https://github.com/tobi/disktree)'s treemap:
 D keeps B's palette and every contrast rule below. At 80×24 the Agents list shows 14 rows
 where the old layout showed 12: the tab bar, the column titles and the rule above the footer
 are gone, and the pane under the list keeps to its sentence.
-
-![Agents at 120×40, dark](screens/agents-dark-120x40.svg)
-![Disk at 150×40, dark](screens/disk-dark-150x40.svg)
 
 ## The palette: B, Tinted
 
@@ -121,12 +108,10 @@ chip's text is the terminal's background on the hue, and each of the eight disk 
 its own pair of hues; both keep 4.5:1 in every theme above, and so does a tile's label on
 its bar, whose hue is held back until it does.
 
-![Solarized light, a low-contrast theme](screens/agents-solarized-light-80x24.svg)
-
 **C was rejected.** At 80×24 its borders cost three list rows (11 instead of 14). The box
 titles repeat the tab bar. Filled pills shout, and the quiet pill (reverse video) reads like
-an error. Panels was removed from the code after the spike; its pictures come from commit
-`2d39a74`, where `scripts/shots.sh` still renders it, and show that commit's layout.
+an error. Panels was removed from the code after the spike; `scripts/shots.sh` at commit
+`2d39a74` still rendered it, and shows that commit's layout.
 
 This departs on purpose from one line in the original plan ("the palette is the terminal's
 own 16 ANSI colours"). The goal behind that line, following the user's theme in light and
@@ -141,70 +126,26 @@ dark, holds. Without truecolor Scry falls back to exactly that principle, below.
 | `COLORTERM` unset or anything else | Native: the 16 ANSI colours, so the user's theme picks every hue. Nothing is asked |
 | `NO_COLOR` set | No colour at all: bold, dim and reverse video. Every state is still a glyph and a word |
 
-![Tinted falling back to ANSI, light](screens/ansi-light.svg)
-![Tinted falling back to ANSI, dark](screens/ansi-dark.svg)
-![NO_COLOR](screens/no-color-dark.svg)
-
 ## Every view in the chosen look
 
-| View | Light 80×24 | Dark 80×24 | Light 120×40 | Dark 120×40 |
-|---|---|---|---|---|
-| Overview | [svg](screens/overview-light-80x24.svg) | [svg](screens/overview-dark-80x24.svg) | [svg](screens/overview-light-120x40.svg) | [svg](screens/overview-dark-120x40.svg) |
-| Ports | [svg](screens/ports-light-80x24.svg) | [svg](screens/ports-dark-80x24.svg) | [svg](screens/ports-light-120x40.svg) | [svg](screens/ports-dark-120x40.svg) |
-| Agents | [svg](screens/agents-light-80x24.svg) | [svg](screens/agents-dark-80x24.svg) | [svg](screens/agents-light-120x40.svg) | [svg](screens/agents-dark-120x40.svg) |
-| Disk | [svg](screens/disk-light-80x24.svg) | [svg](screens/disk-dark-80x24.svg) | [svg](screens/disk-light-120x40.svg) | [svg](screens/disk-dark-120x40.svg) |
-| Worktrees | [svg](screens/worktrees-light-80x24.svg) | [svg](screens/worktrees-dark-80x24.svg) | [svg](screens/worktrees-light-120x40.svg) | [svg](screens/worktrees-dark-120x40.svg) |
-
-The Disk and Worktrees fixture rows are synthetic. Disk's cleanup sheets, a delete that
-waits for the item's name and a worktree going to the Trash:
-[delete light](screens/disk-delete-light.svg),
-[delete dark](screens/disk-delete-dark.svg),
-[trash light](screens/disk-trash-light.svg),
-[trash dark](screens/disk-trash-dark.svg).
-
-![Disk at 120×40, dark](screens/disk-dark-120x40.svg)
+All five views were checked at 80×24 and 120×40, light and dark: Overview, Ports, Agents,
+Disk and Worktrees. The Disk and Worktrees fixture rows are synthetic. Disk's cleanup
+sheets were checked too: a delete that waits for the item's name, and a worktree going to
+the Trash.
 
 On a first run with nothing to report, a view says what it checked and how to fill it:
 the Overview names the checks behind its all-clear, and an empty Agents view names the
 agents Scry recognises and the hook that makes attribution exact.
 
-| Overview | Agents |
-|---|---|
-| ![](screens/first-run-overview-light.svg) | ![](screens/first-run-agents-dark.svg) |
+From 100 columns the detail pane is beside the list; checked again at 150 columns for
+Agents, Ports, the Overview and the ANSI look.
 
-From 100 columns the detail pane is beside the list; at 150:
-[agents light](screens/agents-light-150x40.svg),
-[agents dark](screens/agents-dark-150x40.svg),
-[ports light](screens/ports-light-150x40.svg),
-[ports dark](screens/ports-dark-150x40.svg),
-[overview dark](screens/overview-dark-150x40.svg),
-[ANSI dark](screens/ansi-dark-150x40.svg).
+Also checked: Disk as a list, the detail opened with `enter`, and the command palette.
 
-Disk as a list ([light](screens/disk-list-light-120x40.svg),
-[dark](screens/disk-list-dark-120x40.svg)), the detail opened with `enter`
-([light](screens/detail-light.svg), [dark](screens/detail-dark.svg)), and the command
-palette ([light](screens/palette-light.svg), [dark](screens/palette-dark.svg)):
-
-![The command palette, dark](screens/palette-dark.svg)
-
-States and overlays, each in [light](screens/state-loading-light.svg) and dark:
-
-| Loading | Failed | Empty |
-|---|---|---|
-| ![](screens/state-loading-dark.svg) | ![](screens/state-failed-dark.svg) | ![](screens/state-empty-dark.svg) |
-
-| Reap sheet | Filter | Help |
-|---|---|---|
-| ![](screens/sheet-dark.svg) | ![](screens/filter-dark.svg) | ![](screens/help-dark.svg) |
-
-A reap sheet longer than the screen, at 80×24, at the top and scrolled to the end:
-
-| Top | End |
-|---|---|
-| ![](screens/sheet-long-light.svg) | ![](screens/sheet-long-end-dark.svg) |
-
-The same sheet [at 150×40](screens/sheet-long-dark-150x40.svg), and
-[in the ANSI look](screens/ansi-sheet-long-dark.svg), where it sits under the one rule.
+States and overlays were each checked in light and dark: loading, failed and empty states;
+the reap sheet, the filter and the help card; and a reap sheet longer than the screen, at
+80×24, at the top and scrolled to the end, again at 150×40 and in the ANSI look, where it
+sits under the one rule.
 
 ## The design system
 
@@ -417,7 +358,7 @@ one table in `app.rs`, `COMMANDS`, each with the key it presses and when it appl
 ## Rerunning the pictures and the numbers
 
 ```sh
-cargo run -p scry --example shots                 # SVGs into docs/screens
+cargo run -p scry --example shots                 # SVGs into target/shots, for looking at
 scripts/shots.sh                                  # the same, plus PNGs into target/shots
 cargo run --release -p scry --example frames      # frame times per view at 120×40
 scripts/pty-late-reply.py target/debug/scry       # the colour query against a played terminal
@@ -426,8 +367,9 @@ scripts/pty-late-reply.py target/debug/scry       # the colour query against a p
 The shots example draws frames through ratatui's `TestBackend` and writes each cell's
 foreground, background and bold, dim, italic, reverse, underline and strikethrough as SVG.
 Named colours map through the palettes above, truecolor passes through, and the text uses a
-monospace stack (`ui-monospace, SF Mono, Menlo, Consolas, Liberation Mono`) so GitHub renders
-it with a local font. PNGs come from `rsvg-convert` (`brew install librsvg`).
+monospace stack (`ui-monospace, SF Mono, Menlo, Consolas, Liberation Mono`) so a browser
+renders it with a local font. PNGs come from `rsvg-convert` (`brew install librsvg`). Nothing
+this writes is committed; it is for looking at a change before and after.
 
 `scripts/pty-smoke.sh` runs `pty-late-reply.py` after its own checks. It plays a terminal on
 a bare pty, because tmux answers DA1 at once and sends no colours, and Scry does not ask

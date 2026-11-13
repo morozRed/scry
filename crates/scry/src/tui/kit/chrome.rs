@@ -11,7 +11,7 @@ use super::width;
 use crate::tui::theme::{Theme, glyph};
 use unicode_width::UnicodeWidthStr;
 
-/// The cursor eye from `docs/logo/scry.svg`: an eye whose pupil is a block cursor.
+/// The cursor eye from `assets/scry.svg`: an eye whose pupil is a block cursor.
 const PUPIL: &str = "▮";
 
 /// Up to five eighths of the cell, in the muted ink: a trend beside the number, not the
