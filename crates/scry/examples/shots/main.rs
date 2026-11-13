@@ -1,4 +1,5 @@
-//! Renders TUI frames from fixtures as SVG into target/shots, for looking at, not committing.
+//! Renders TUI frames from fixtures as SVG into target/shots. `scripts/shots.sh` copies the
+//! README's screens from there into docs/screens.
 //! `cargo run -p scry --example shots`; `scripts/shots.sh` also makes PNGs.
 
 mod svg;

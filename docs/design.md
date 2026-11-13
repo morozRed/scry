@@ -365,7 +365,7 @@ one table in `app.rs`, `COMMANDS`, each with the key it presses and when it appl
 
 ```sh
 cargo run -p scry --example shots                 # SVGs into target/shots, for looking at
-scripts/shots.sh                                  # the same, plus PNGs into target/shots
+scripts/shots.sh                                  # the same, PNGs, and the README's into docs/screens
 cargo run --release -p scry --example frames      # frame times per view at 120×40
 scripts/pty-late-reply.py target/debug/scry       # the colour query against a played terminal
 ```
@@ -374,8 +374,9 @@ The shots example draws frames through ratatui's `TestBackend` and writes each c
 foreground, background and bold, dim, italic, reverse, underline and strikethrough as SVG.
 Named colours map through the palettes above, truecolor passes through, and the text uses a
 monospace stack (`ui-monospace, SF Mono, Menlo, Consolas, Liberation Mono`) so a browser
-renders it with a local font. PNGs come from `rsvg-convert` (`brew install librsvg`). Nothing
-this writes is committed; it is for looking at a change before and after.
+renders it with a local font. PNGs come from `rsvg-convert` (`brew install librsvg`). What lands
+in `target/shots` is for looking at a change before and after; the screens the README shows
+are copied into `docs/screens` and committed with the change that alters them.
 
 `scripts/pty-smoke.sh` runs `pty-late-reply.py` after its own checks. It plays a terminal on
 a bare pty, because tmux answers DA1 at once and sends no colours, and Scry does not ask
