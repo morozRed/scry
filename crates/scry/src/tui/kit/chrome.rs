@@ -59,7 +59,7 @@ pub fn header(
     area: Rect,
     theme: &Theme,
     board: &Board,
-    tabs: (Tab, [usize; 5]),
+    tabs: (Tab, [usize; 6]),
     pulse: bool,
     activity: &str,
 ) -> Vec<(Tab, Rect)> {

@@ -164,6 +164,7 @@ fn tab_command(tab: Tab) -> &'static str {
         Tab::Agents => "scry agents --tree",
         Tab::Disk => "scry disk",
         Tab::Worktrees => "scry worktrees",
+        Tab::Top => "scry top",
     }
 }
 

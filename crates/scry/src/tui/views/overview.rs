@@ -27,6 +27,7 @@ pub const VIEW: ViewDef = ViewDef {
     badge,
     hints: &[("⏎", "go to"), ("X", "reap")],
     reap: Some(super::agents::reap),
+    fold_all: false,
 };
 
 fn rows(board: &Board) -> Load<Vec<Row>> {

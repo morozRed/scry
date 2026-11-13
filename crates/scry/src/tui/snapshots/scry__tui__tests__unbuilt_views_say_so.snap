@@ -1,8 +1,9 @@
 ---
 source: crates/scry/src/tui/tests.rs
+assertion_line: 205
 expression: "render(&a, 80, 24)"
 ---
-" (▮) SCRY   Overview   Ports   Agents   Disk   Worktrees   fixture typical.json "
+" (▮) SCRY   Overview   Ports   Agents   Disk   Worktrees   Top                  "
 "────────────────────────────────────────────────────────────────────────────────"
 "                                                                                "
 " AGENT SESSIONS                                                                 "

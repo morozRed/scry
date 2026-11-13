@@ -266,6 +266,18 @@ impl Theme {
         }
     }
 
+    /// The `i`th of four hues for a series in a chart, such as a group's share of the load
+    /// bars. They are disk kinds' hues, which keep their contrast in every theme.
+    pub fn series(&self, i: usize) -> Style {
+        const SERIES: [Kind; 4] = [
+            Kind::Docker,
+            Kind::Simulators,
+            Kind::PackageCache,
+            Kind::AgentLogs,
+        ];
+        self.kind(SERIES[i % SERIES.len()])
+    }
+
     /// A swatch of a kind's hue, as the legend and the bars in the pane draw it.
     pub fn kind(&self, kind: Kind) -> Style {
         match self.colors {

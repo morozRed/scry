@@ -447,7 +447,7 @@ const KEYS: [(&str, &str, &str); 17] = [
     ("Move", "j k ↑ ↓", "rows; g G first and last, ^d ^u a page"),
     ("", "h l space", "fold, unfold; h goes to the parent"),
     ("", "⏎  click", "details, or go to an Overview item"),
-    ("Views", "1-5  tab", "switch view; or click its name"),
+    ("Views", "1-6  tab", "switch view; or click its name"),
     ("", "v", "Disk: treemap or list; hjkl by tile"),
     ("Find", "/", "filter, fuzzy, within a column"),
     ("", "esc", "clear the filter, close the details"),

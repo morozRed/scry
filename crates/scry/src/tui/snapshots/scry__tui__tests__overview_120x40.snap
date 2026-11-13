@@ -1,8 +1,9 @@
 ---
 source: crates/scry/src/tui/tests.rs
+assertion_line: 166
 expression: "render(&typical(), 120, 40)"
 ---
-" (▮) SCRY   Overview   Ports   Agents   Disk   Worktrees                                           fixture typical.json "
+" (▮) SCRY   Overview   Ports   Agents   Disk   Worktrees   Top                                     fixture typical.json "
 "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 "                                                                                                                        "
 "  CPU                                  │  MEMORY                               │  FROM AGENTS                           "

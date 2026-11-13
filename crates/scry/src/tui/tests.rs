@@ -218,6 +218,52 @@ fn design_agents_80x24() {
 }
 
 #[test]
+fn design_top_80x24() {
+    let mut a = design();
+    press(&mut a, "6");
+    insta::assert_snapshot!(render(&a, 80, 24));
+}
+
+#[test]
+fn design_top_120x40() {
+    let mut a = design();
+    // Open the node group: the leftovers inside it.
+    press(&mut a, "6jjj ");
+    insta::assert_snapshot!(render(&a, 120, 40));
+}
+
+#[test]
+fn top_starts_folded_and_space_opens_a_group() {
+    let mut a = design();
+    press(&mut a, "6");
+    let Load::Ready(rows) = a.rows() else {
+        panic!("Top has rows")
+    };
+    let shown = a.shown(&rows);
+    assert!(
+        shown.iter().all(|s| s.row.depth == 0),
+        "groups start folded"
+    );
+    assert!(shown.iter().any(|s| s.folded > 0));
+    press(&mut a, " ");
+    let Load::Ready(rows) = a.rows() else {
+        panic!("Top has rows")
+    };
+    assert!(
+        a.shown(&rows).iter().any(|s| s.row.depth == 1),
+        "space opens one"
+    );
+    press(&mut a, " ");
+    let Load::Ready(rows) = a.rows() else {
+        panic!("Top has rows")
+    };
+    assert!(
+        a.shown(&rows).iter().all(|s| s.row.depth == 0),
+        "and folds it again"
+    );
+}
+
+#[test]
 fn design_agents_120x40() {
     let mut a = design();
     press(&mut a, "3jj");

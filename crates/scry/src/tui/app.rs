@@ -113,7 +113,7 @@ fn always(_: &App) -> bool {
     true
 }
 
-pub static COMMANDS: [Command; 21] = [
+pub static COMMANDS: [Command; 22] = [
     Command {
         label: "Show details",
         keys: "⏎",
@@ -127,10 +127,10 @@ pub static COMMANDS: [Command; 21] = [
         when: |a| a.selected_row().is_some_and(|r| r.jump.is_some()),
     },
     Command {
-        label: "Fold or unfold the session",
+        label: "Fold or unfold the group",
         keys: "space",
         key: KeyCode::Char(' '),
-        when: |a| a.tab == Tab::Agents,
+        when: |a| matches!(a.tab, Tab::Agents | Tab::Top),
     },
     Command {
         label: "Stop the selected process",
@@ -208,6 +208,12 @@ pub static COMMANDS: [Command; 21] = [
         label: "Go to Worktrees",
         keys: "5",
         key: KeyCode::Char('5'),
+        when: always,
+    },
+    Command {
+        label: "Go to Top: what uses the CPU and memory",
+        keys: "6",
+        key: KeyCode::Char('6'),
         when: always,
     },
     Command {
@@ -382,7 +388,7 @@ pub struct App {
     pub theme: Theme,
     pub tab: Tab,
     pub mode: Mode,
-    pub views: [ViewState; 5],
+    pub views: [ViewState; 6],
     pub toast: Option<Toast>,
     pub fresh: Fresh,
     /// How wide the list was last drawn, which decides the columns on screen. Keys act on
@@ -482,6 +488,7 @@ impl App {
                 sort: self.sort(),
                 filter: &s.filter,
                 folded: &s.folded,
+                fold_all: views::view(self.tab).fold_all,
                 columns: &self.columns(),
             },
         )
@@ -841,7 +848,7 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right if self.disk_map_on() => self.move_tile(Dir::Right),
             KeyCode::Char('j') | KeyCode::Down if self.disk_map_on() => self.move_tile(Dir::Down),
             KeyCode::Char('k') | KeyCode::Up if self.disk_map_on() => self.move_tile(Dir::Up),
-            KeyCode::Char(c @ '1'..='5') => self.go(Tab::ALL[(c as u8 - b'1') as usize]),
+            KeyCode::Char(c @ '1'..='6') => self.go(Tab::ALL[(c as u8 - b'1') as usize]),
             KeyCode::Tab => self.go(Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()]),
             KeyCode::BackTab => {
                 self.go(Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()])
@@ -1242,7 +1249,7 @@ impl App {
         {
             return Action::None;
         }
-        let folded = self.state().folded.contains(&row.id);
+        let folded = self.state().folded.contains(&row.id) != views::view(self.tab).fold_all;
         self.fold(!folded)
     }
 
@@ -1275,6 +1282,8 @@ impl App {
             return Action::Redraw;
         }
         let id = rows[i].id.clone();
+        // A view that starts folded keeps the rows opened instead.
+        let fold = fold != views::view(self.tab).fold_all;
         let state = self.state_mut();
         if fold {
             state.folded.insert(id);

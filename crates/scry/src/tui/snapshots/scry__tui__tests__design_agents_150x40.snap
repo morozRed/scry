@@ -1,8 +1,9 @@
 ---
 source: crates/scry/src/tui/tests.rs
+assertion_line: 277
 expression: "render(&a, 150, 40)"
 ---
-" (▮) SCRY   Overview 5   Ports 1   Agents 4   Disk 1   Worktrees 4               cpu ▃▅▄▃▂▃▄▃ 23%   mem ● normal   swap 1.2G   disk 84G · full in 19d "
+" (▮) SCRY   Overview 5   Ports 1   Agents 4   Disk 1   Worktrees 4   Top 2       cpu ▃▅▄▃▂▃▄▃ 23%   mem ● normal   swap 1.2G   disk 84G · full in 19d "
 "──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────"
 "                                                                                         │                                                            "
 "  AGENT SESSIONS   4 leftovers                                                           │  next dev                                                  "

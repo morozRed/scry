@@ -1,5 +1,6 @@
 ---
 source: crates/scry/src/tui/tests.rs
+assertion_line: 1315
 expression: header(&a)
 ---
- (▮) SCRY   Overview 5   Ports 1   Agents 4   Disk 1   Worktrees 4                                        ⠴ refreshing…
+ (▮) SCRY   Overview 5   Ports 1   Agents 4   Disk 1   Worktrees 4   Top 2                                ⠴ refreshing…

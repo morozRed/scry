@@ -8,6 +8,11 @@ All notable changes to Scry are listed here. The format follows
 
 ### Added
 
+- **Top** (`6`, and `scry top`): what uses the CPU and memory. Your processes are grouped by
+  the app or program they belong to, ranked by load, with CPU and memory bars over the list
+  and a meter on each row; groups open with `space`, and `x` stops a process. Without root
+  macOS reads only your own processes, so the rest of the machine is one line, the total
+  less what yours account for.
 - **`scry setup`** installs a skill that teaches Claude Code, Codex, OpenCode or Gemini CLI
   to use Scry's CLI: when to reach for it, which command answers what, and to act only after
   you agree. Pick agents from a list, name them, or pass `--all`; `--remove` takes it out.

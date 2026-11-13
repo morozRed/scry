@@ -20,6 +20,7 @@ fn proc(pid: i32, ppid: i32, name: &str) -> Process {
         name: name.into(),
         exe: Some(format!("/usr/local/bin/{name}")),
         footprint: Some(1 << 20),
+        cpu_ns: None,
         command: None,
         cwd: Some("/Users/dev/sources/acme".into()),
         project: None,

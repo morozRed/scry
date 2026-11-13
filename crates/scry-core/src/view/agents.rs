@@ -611,6 +611,7 @@ mod tests {
                 name: name.into(),
                 exe: Some(format!("/usr/local/bin/{name}")),
                 footprint: Some(10 << 20),
+                cpu_ns: None,
                 command: None,
                 cwd: Some("/Users/dev/sources/acme".into()),
                 project: None,

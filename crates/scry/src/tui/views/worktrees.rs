@@ -27,6 +27,7 @@ pub const VIEW: ViewDef = ViewDef {
     badge,
     hints: &[("t", "clean up")],
     reap: None,
+    fold_all: false,
 };
 
 fn rows(board: &Board) -> Load<Vec<Row>> {

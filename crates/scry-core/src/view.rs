@@ -4,6 +4,7 @@
 pub mod agents;
 pub mod disk;
 pub mod ports;
+pub mod usage;
 pub mod worktrees;
 
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ use crate::model::Snapshot;
 pub use agents::AgentRow;
 pub use disk::{DiskItem, DiskList};
 pub use ports::{PortRow, PortsView};
+pub use usage::{UsageRow, UsageView};
 pub use worktrees::{WorktreeItem, WorktreeList, WorktreeRow, WorktreesView};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -26,15 +28,17 @@ pub enum Tab {
     Agents,
     Disk,
     Worktrees,
+    Top,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Overview,
         Tab::Ports,
         Tab::Agents,
         Tab::Disk,
         Tab::Worktrees,
+        Tab::Top,
     ];
 
     pub fn title(self) -> &'static str {
@@ -44,6 +48,7 @@ impl Tab {
             Tab::Agents => "Agents",
             Tab::Disk => "Disk",
             Tab::Worktrees => "Worktrees",
+            Tab::Top => "Top",
         }
     }
 
@@ -69,6 +74,14 @@ pub struct Board {
     /// Read with the worktrees, by the same reader.
     #[serde(default)]
     pub disk: Load<DiskList>,
+    /// What uses the CPU and memory. Its CPU shares need the reading before, which only a
+    /// live collector keeps; a board from one snapshot ranks by memory alone.
+    #[serde(default = "unrecorded_usage")]
+    pub usage: Load<UsageView>,
+}
+
+fn unrecorded_usage() -> Load<UsageView> {
+    Load::Unavailable("This board was recorded without CPU and memory use.".into())
 }
 
 impl Board {
@@ -82,6 +95,7 @@ impl Board {
             agents: Load::Unavailable("Agent sessions are not tracked yet.".into()),
             worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
             disk: Load::Unavailable("A process snapshot holds no disk reading.".into()),
+            usage: unrecorded_usage(),
         }
     }
 
@@ -114,6 +128,13 @@ impl Board {
             agents: Load::Ready(agents),
             worktrees: Load::Unavailable("A process snapshot holds no worktrees.".into()),
             disk: Load::Unavailable("A process snapshot holds no disk reading.".into()),
+            usage: Load::Ready(usage::build(
+                s,
+                lineage,
+                home,
+                crate::sys::logical_cores(),
+                None,
+            )),
         }
     }
 

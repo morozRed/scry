@@ -7,6 +7,7 @@ mod ports;
 mod reap;
 mod setup;
 mod stop;
+mod top;
 mod worktrees;
 
 use scry::tui;
@@ -52,6 +53,7 @@ enum Command {
     },
     Ports(ports::PortsArgs),
     Why(ports::WhyArgs),
+    Top(top::TopArgs),
     Stop(stop::StopArgs),
     Reap(reap::ReapArgs),
     Keep(reap::KeepArgs),
@@ -120,6 +122,7 @@ fn main() -> Result<()> {
         Some(Command::Snapshot { out }) => snapshot(out),
         Some(Command::Ports(a)) => ports::ports(a),
         Some(Command::Why(a)) => ports::why(a),
+        Some(Command::Top(a)) => top::run(a),
         Some(Command::Stop(a)) => stop::run(a),
         Some(Command::Reap(a)) => reap::run(a),
         Some(Command::Keep(a)) => reap::keep(a),

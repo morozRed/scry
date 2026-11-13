@@ -29,6 +29,11 @@ pub struct Process {
     /// Physical footprint in bytes, as Activity Monitor's Memory column. Readable only for
     /// the viewer's own processes without root.
     pub footprint: Option<u64>,
+    /// CPU time used since the process started, user and system, in nanoseconds. Readable
+    /// only for the viewer's own processes. A share needs two readings, so it is never
+    /// recorded: [`crate::view::usage`] takes the difference.
+    #[serde(skip)]
+    pub cpu_ns: Option<u64>,
     /// The command line as a label of safe parts. Raw arguments are never stored here. Only
     /// the viewer's own processes have one: other users' arguments are unreadable without root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,12 +332,21 @@ pub struct Swap {
     pub total: u64,
 }
 
+/// Physical memory in use and installed, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ram {
+    pub used: u64,
+    pub total: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Pulse {
     /// Busy share of all cores since the previous reading, 0 to 100.
     pub cpu_percent: Reading<f32>,
     pub memory: Reading<MemoryPressure>,
     pub swap: Reading<Swap>,
+    #[serde(default)]
+    pub ram: Reading<Ram>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

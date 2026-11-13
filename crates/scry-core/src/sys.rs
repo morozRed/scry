@@ -260,7 +260,7 @@ pub fn now_ms() -> i64 {
 fn read_process(id: ProcId) -> Option<Process> {
     let info = short_bsd_info(id.pid)?;
     let exe = exe_path(id.pid);
-    let footprint = footprint(id.pid);
+    let (footprint, cpu_ns) = usage(id.pid);
     let comm: Vec<u8> = info
         .pbsi_comm
         .iter()
@@ -274,6 +274,7 @@ fn read_process(id: ProcId) -> Option<Process> {
         name: String::from_utf8_lossy(&comm).into_owned(),
         exe,
         footprint,
+        cpu_ns,
         command: None,
         cwd: None,
         project: None,
@@ -313,10 +314,50 @@ pub fn exe_path(pid: i32) -> Option<String> {
     (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
 }
 
-fn footprint(pid: i32) -> Option<u64> {
+/// Physical footprint and CPU time (user and system, in nanoseconds) of one process. Both
+/// come from one `proc_pid_rusage` call, which the kernel allows for the viewer's own
+/// processes only.
+fn usage(pid: i32) -> (Option<u64>, Option<u64>) {
     let mut info = MaybeUninit::<libc::rusage_info_v2>::zeroed();
     let rc = unsafe { proc_pid_rusage(pid, libc::RUSAGE_INFO_V2, info.as_mut_ptr().cast()) };
-    (rc == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
+    if rc != 0 {
+        return (None, None);
+    }
+    let info = unsafe { info.assume_init() };
+    let ticks = info.ri_user_time.saturating_add(info.ri_system_time);
+    (Some(info.ri_phys_footprint), Some(mach_ns(ticks)))
+}
+
+/// Mach absolute time units in nanoseconds. On Apple Silicon a unit is 125/3 ns, not 1.
+#[allow(deprecated)]
+fn mach_ns(ticks: u64) -> u64 {
+    static TIMEBASE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    let &(numer, denom) = TIMEBASE.get_or_init(|| {
+        let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+        let rc = unsafe { libc::mach_timebase_info(&mut tb) };
+        if rc == 0 && tb.denom != 0 {
+            (tb.numer, tb.denom)
+        } else {
+            (1, 1)
+        }
+    });
+    (u128::from(ticks) * u128::from(numer) / u128::from(denom)) as u64
+}
+
+/// How many logical cores the machine has, which CPU shares are divided by.
+pub fn logical_cores() -> u32 {
+    let mut n: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.logicalcpu".as_ptr(),
+            (&mut n as *mut libc::c_int).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && n > 0 { n as u32 } else { 1 }
 }
 
 #[cfg(test)]

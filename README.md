@@ -74,7 +74,7 @@ SCRY_HOME=/tmp/scry-try scry
 
 ## A tour of the terminal UI
 
-Press `1` to `5` or `tab` to switch views, `j`/`k` or the arrow keys to move, `/` to
+Press `1` to `6` or `tab` to switch views, `j`/`k` or the arrow keys to move, `/` to
 filter, `s` to sort and `?` for every key. `ctrl-p` (or `:`) finds any command by name, and
 the mouse works too: click a view or a row, scroll with the wheel. The pane beside each list
 (under it below 100 columns) explains the selected row in one sentence, with its details
@@ -111,6 +111,15 @@ Every linked git worktree under your code roots, with its state, size and the ag
 probably made it. A worktree is "can go" only when removing it loses nothing and its work is
 merged or pushed.
 
+### 6 Top
+
+What uses the CPU and memory right now. Two bars split the machine's CPU and memory between
+the heaviest apps, and the list under them ranks your processes grouped by the app or
+program they belong to, so Chrome's helpers count as Chrome and twelve `rustc` processes as
+one line. `space` opens a group; `x` stops one of its processes. Without root, macOS reads
+CPU time and memory only for your own processes, so the rest of the machine (the kernel,
+WindowServer and other accounts) is one line: the total less what yours account for.
+
 Scry follows your terminal's light or dark theme and honours `NO_COLOR`. It needs a
 terminal of at least 80×24. [docs/design.md](docs/design.md) explains how the look was
 chosen.
@@ -131,6 +140,7 @@ opening the UI, so it never hangs a script.
 | `scry leftovers` | Processes left running by sessions that ended, with the evidence |
 | `scry reap` | Stop the leftovers, children first, after you confirm |
 | `scry keep <pid>` | Add a process to the keep list, so no rule selects it again |
+| `scry top [--tree]` | What uses the CPU and memory, grouped by app, heaviest first |
 | `scry worktrees` | Linked worktrees with state, size and probable creator |
 | `scry disk` | Free space, the forecast and the largest items |
 | `scry clean <item>` | Clean up one item from `scry disk` |

@@ -69,6 +69,7 @@ mod tests {
                 name: "x".into(),
                 exe: Some(exe.into()),
                 footprint: None,
+                cpu_ns: None,
                 command: None,
                 cwd: Some(exe.into()),
                 project: None,

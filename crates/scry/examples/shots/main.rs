@@ -50,6 +50,7 @@ fn main() -> anyhow::Result<()> {
         ("agents", "3jj"),
         ("disk", "4"),
         ("worktrees", "5"),
+        ("top", "6jjj "),
     ];
     for pal in PALETTES {
         let theme = || Theme::new(SHIPPED, colors(SHIPPED, pal));

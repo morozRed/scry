@@ -3,7 +3,7 @@
 use std::ffi::CStr;
 use std::mem::size_of;
 
-use crate::model::{MemoryPressure, Pulse, Reading, Swap};
+use crate::model::{MemoryPressure, Pulse, Ram, Reading, Swap};
 
 unsafe extern "C" {
     fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::c_int;
@@ -80,7 +80,38 @@ impl PulseSampler {
                 }),
                 None => Reading::Unavailable("vm.swapusage".into()),
             },
+            ram: match self.ram() {
+                Some(r) => Reading::Ready(r),
+                None => Reading::Unavailable("host_statistics64 vm info failed".into()),
+            },
         }
+    }
+
+    /// Memory in use as Activity Monitor's "Memory Used" counts it: app memory (anonymous
+    /// pages that cannot be purged), wired memory and what the compressor holds.
+    #[allow(deprecated)]
+    fn ram(&self) -> Option<Ram> {
+        let total = sysctl_value::<u64>(c"hw.memsize")?;
+        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        let mut info = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
+        let mut count = (size_of::<libc::vm_statistics64>() / size_of::<libc::integer_t>())
+            as libc::mach_msg_type_number_t;
+        let rc = unsafe {
+            libc::host_statistics64(
+                self.host,
+                libc::HOST_VM_INFO64,
+                info.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        if rc != libc::KERN_SUCCESS {
+            return None;
+        }
+        let v = unsafe { info.assume_init() };
+        Some(Ram {
+            used: used_pages(&v).saturating_mul(page).min(total),
+            total,
+        })
     }
 
     #[allow(deprecated)]
@@ -107,6 +138,11 @@ impl Drop for PulseSampler {
             mach_port_deallocate(libc::mach_task_self(), self.host);
         }
     }
+}
+
+fn used_pages(v: &libc::vm_statistics64) -> u64 {
+    let app = u64::from(v.internal_page_count).saturating_sub(u64::from(v.purgeable_count));
+    app + u64::from(v.wire_count) + u64::from(v.compressor_page_count)
 }
 
 fn sysctl_value<T: Copy>(name: &CStr) -> Option<T> {
@@ -184,6 +220,10 @@ mod tests {
             first.memory
         );
         assert!(matches!(first.swap, Reading::Ready(_)), "{:?}", first.swap);
+        match first.ram {
+            Reading::Ready(r) => assert!(r.used > 0 && r.used <= r.total, "{r:?}"),
+            other => panic!("ram {other:?}"),
+        }
         // The kernel's tick counters can stand still for a moment on a busy machine, as
         // under a parallel test run, and then a reading still warms up; it never stays so.
         let mut second = Reading::WarmingUp;

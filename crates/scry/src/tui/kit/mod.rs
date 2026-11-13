@@ -3,6 +3,7 @@
 pub mod chrome;
 pub mod detail;
 pub mod gauges;
+pub mod load;
 pub mod overlay;
 pub mod states;
 pub mod table;

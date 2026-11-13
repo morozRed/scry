@@ -5,6 +5,7 @@ mod agents;
 mod disk;
 mod overview;
 mod ports;
+mod top;
 mod worktrees;
 
 pub use disk::cleanable as disk_cleanable;
@@ -15,12 +16,13 @@ use std::collections::HashSet;
 use scry_core::disk::catalog::Kind;
 use scry_core::view::{Board, Detail, DiskItem, Load, State, Tab, Target, Tone};
 
-pub static VIEWS: [ViewDef; 5] = [
+pub static VIEWS: [ViewDef; 6] = [
     overview::VIEW,
     ports::VIEW,
     agents::VIEW,
     disk::VIEW,
     worktrees::VIEW,
+    top::VIEW,
 ];
 
 pub fn view(tab: Tab) -> &'static ViewDef {
@@ -95,6 +97,8 @@ pub struct ViewDef {
     pub hints: &'static [(&'static str, &'static str)],
     /// What `X` would act on.
     pub reap: Option<fn(&Board) -> Vec<Target>>,
+    /// Groups start folded, and the view state remembers the ones opened.
+    pub fold_all: bool,
 }
 
 /// A ranking drawn as bars in the detail pane.
@@ -226,6 +230,8 @@ pub enum CellKind {
     Num,
     /// Glyph and word.
     State(State),
+    /// A bar of block characters, in the accent.
+    Meter,
 }
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
@@ -326,6 +332,8 @@ pub struct Query<'a> {
     pub sort: Option<Sort>,
     pub filter: &'a str,
     pub folded: &'a HashSet<String>,
+    /// `folded` names the rows opened rather than the rows folded.
+    pub fold_all: bool,
     /// The columns on screen. The filter only matches these, so every match it keeps has
     /// something highlighted.
     pub columns: &'a [usize],
@@ -361,7 +369,7 @@ pub fn shown<'a>(rows: &'a [Row], q: &Query) -> Vec<Shown<'a>> {
         if !keep[i] {
             continue;
         }
-        let fold = fuzzy.is_none() && has_children(i) && q.folded.contains(&row.id);
+        let fold = fuzzy.is_none() && has_children(i) && (q.folded.contains(&row.id) != q.fold_all);
         let folded = if fold {
             skip_below = Some(row.depth);
             rows[i + 1..]
@@ -544,6 +552,7 @@ mod tests {
             sort,
             filter,
             folded,
+            fold_all: false,
             columns: &[0, 1],
         }
     }

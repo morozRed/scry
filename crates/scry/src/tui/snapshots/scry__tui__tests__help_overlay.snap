@@ -1,8 +1,9 @@
 ---
 source: crates/scry/src/tui/tests.rs
+assertion_line: 173
 expression: "render(&a, 80, 24)"
 ---
-" (▮) SCRY   Overview   Ports   Agents   Disk   Worktrees   fixture typical.json "
+" (▮) SCRY   Overview   Ports   Agents   Disk   Worktrees   Top                  "
 "────────────────────────────────────────────────────────────────────────────────"
 "       ┌───────────────────────────────────────────────────────────────┐        "
 "  CPU  │  Keys                                                         │        "
@@ -10,7 +11,7 @@ expression: "render(&a, 80, 24)"
 "       │  Move   j k ↑ ↓   rows; g G first and last, ^d ^u a page      │        "
 "       │         h l space fold, unfold; h goes to the parent          │        "
 "       │         ⏎  click  details, or go to an Overview item          │        "
-"       │  Views  1-5  tab  switch view; or click its name              │        "
+"       │  Views  1-6  tab  switch view; or click its name              │        "
 "  war  │         v         Disk: treemap or list; hjkl by tile         │        "
 "       │  Find   /         filter, fuzzy, within a column              │        "
 "─────  │         esc       clear the filter, close the details         │  ──────"

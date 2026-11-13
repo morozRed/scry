@@ -217,6 +217,7 @@ fn cell_spans<'a>(theme: &Theme, cell: &views::Cell, hits: &Hits) -> Vec<Span<'a
             marked(state.word(), &hits.text, tone, theme.matched)
         }
         CellKind::Muted => marked(&cell.text, &hits.text, theme.muted, theme.matched),
+        CellKind::Meter => vec![Span::styled(cell.text.clone(), theme.accent)],
         CellKind::Text | CellKind::Num => {
             let mut v = marked(&cell.text, &hits.text, theme.text, theme.matched);
             if let Some(ctx) = &cell.context {

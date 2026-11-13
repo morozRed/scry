@@ -18,7 +18,7 @@ use super::kit::detail::{self, Pane};
 use super::kit::states::Status;
 use super::kit::table::ListView;
 use super::kit::treemap::{self, Item};
-use super::kit::{chrome, gauges, overlay, states, table};
+use super::kit::{chrome, gauges, load, overlay, states, table};
 use super::theme::{Theme, glyph};
 use super::views::{self, Chip, Row, ViewDef};
 
@@ -108,6 +108,7 @@ pub fn draw(f: &mut Frame, app: &App) -> Painted {
                     treemap::volume(f, vol, theme, space, &lines);
                     list_area = rest;
                 }
+                list_area = load_bars(f, list_area, app);
                 let empty = views::empty(view, &app.board);
                 let status = match other {
                     Load::Ready(_) if views::empty_is_clear(view) => Status::Clear {
@@ -182,6 +183,24 @@ fn overview_top(f: &mut Frame, body: Rect, app: &App) -> Rect {
     };
     gauges::gauges(f, inner, &app.theme, &app.board);
     chrome::rule(f, rule, &app.theme);
+    rest
+}
+
+/// Top's CPU and memory bars over its list, when it has a reading. Returns what is left.
+fn load_bars(f: &mut Frame, area: Rect, app: &App) -> Rect {
+    let Some(usage) = app.board.usage.ready().filter(|_| app.tab == Tab::Top) else {
+        return area;
+    };
+    // On a short terminal the gaps go first, so the list keeps its rows.
+    let gap = u16::from(area.height >= 24);
+    let [_, bars, _, rest] = Layout::vertical([
+        Constraint::Length(gap),
+        Constraint::Length(load::HEIGHT),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    load::load(f.buffer_mut(), bars, &app.theme, usage);
     rest
 }
 
@@ -272,6 +291,9 @@ fn list(
     let tall = map || app.tab == Tab::Disk;
     let list_rows = if tall {
         u16::MAX / 2
+    } else if app.tab == Tab::Top && app.board.usage.ready().is_some() {
+        // The bars, the gaps around them at most, and the rows.
+        shown.len() as u16 + 1 + load::HEIGHT + 2
     } else {
         shown.len() as u16 + 1
     };
@@ -300,6 +322,7 @@ fn list(
         treemap::volume(f, vol, theme, space, &lines);
         under = rest;
     }
+    under = load_bars(f, under, app);
 
     if map {
         let items: Vec<Item> = app

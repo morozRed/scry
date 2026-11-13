@@ -119,6 +119,7 @@ fn outputs(command: &CommandLabel) -> Vec<(&'static str, String)> {
             name: "app".into(),
             exe: Some("/usr/local/bin/app".into()),
             footprint: None,
+            cpu_ns: None,
             command: Some(command.clone()),
             cwd: Some(CWD.into()),
             project: None,

@@ -16,7 +16,8 @@ use crate::model::Snapshot;
 use crate::paths::Paths;
 use crate::spool;
 use crate::store::{SCHEMA_VERSION, Store};
-use crate::view::{Board, Pulse};
+use crate::view::usage::{self, CpuMeter};
+use crate::view::{Board, Load, Pulse};
 
 /// CPU readings the pulse keeps, oldest first: enough for the Overview's graph.
 const CPU_RECENT: usize = 30;
@@ -47,6 +48,9 @@ pub struct Collector {
     home: Option<Home>,
     /// The last CPU readings, for the pulse's graph.
     cpu: VecDeque<u8>,
+    /// Each process's CPU time at the last reading, for the Top view's shares.
+    meter: CpuMeter,
+    cores: u32,
 }
 
 impl Collector {
@@ -64,6 +68,8 @@ impl Collector {
             paths,
             home: Home::from_env(),
             cpu: VecDeque::with_capacity(CPU_RECENT),
+            meter: CpuMeter::new(),
+            cores: crate::sys::logical_cores(),
         }
     }
 
@@ -97,6 +103,14 @@ impl Collector {
     pub fn board(&mut self) -> Result<Board> {
         let r = self.read()?;
         let mut board = Board::build(&r.snap, &r.lineage, self.home.as_ref());
+        let shares = self.meter.shares(&r.snap, self.cores);
+        board.usage = Load::Ready(usage::build(
+            &r.snap,
+            &r.lineage,
+            self.home.as_ref(),
+            self.cores,
+            shares.as_ref(),
+        ));
         if let Some(e) = self.config_error() {
             board.overview.config_unread(e);
         }

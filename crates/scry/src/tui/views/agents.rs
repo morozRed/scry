@@ -34,6 +34,7 @@ pub const VIEW: ViewDef = ViewDef {
         ("space", "fold"),
     ],
     reap: Some(reap),
+    fold_all: false,
 };
 
 fn rows(board: &Board) -> Load<Vec<Row>> {

@@ -234,6 +234,11 @@ All in `crates/scry/src/tui/kit/`:
   folder as the list shows it, its size and at least what it frees, and for a worktree its
   repo. A delete waits for the item's name to be typed into the sheet; enter does nothing
   until it matches.
+- `load`: Top's bars over its list, CPU and memory, each split among the three heaviest
+  groups in the series hues (`theme.series`, borrowed from disk kinds so they keep their
+  contrast), the rest of yours in the muted ink, and macOS and other users hatched (`▒`) on
+  a faint track; a legend names the hues. Each row of the list carries a meter in the
+  accent, scaled so the heaviest line fills it.
 - `states`: empty, loading, unavailable and failed, each a glyph and a sentence. ✓ is kept
   for an all-clear, a view that read its source and found nothing to show. No rows matching
   the filter, and an Overview whose sources are not collected yet, get a neutral ○. Under
@@ -247,7 +252,7 @@ The keys mean different things in each mode, so the mode is one value, not a set
 
 | Mode | Keys |
 |---|---|
-| Normal | `j k ↑ ↓ g G` move, `⏎` details (on the Overview, go to the row), `space` fold a session, `h l` fold and unfold (`h` on a process goes to its parent), `1-5 tab` views, `/` filter, `esc` clear the filter, `s S` sort, `x` stop, `X` reap, `K` keep, `t` clean up (Disk and Worktrees), `v` treemap or list (Disk), `ctrl-p :` commands, `r` refresh, `?` help, `q` quit. On Disk's treemap `h j k l` and the arrows move by tile |
+| Normal | `j k ↑ ↓ g G` move, `⏎` details (on the Overview, go to the row), `space` fold a session or a Top group, `h l` fold and unfold (`h` on a process goes to its parent), `1-6 tab` views, `/` filter, `esc` clear the filter, `s S` sort, `x` stop, `X` reap, `K` keep, `t` clean up (Disk and Worktrees), `v` treemap or list (Disk), `ctrl-p :` commands, `r` refresh, `?` help, `q` quit. On Disk's treemap `h j k l` and the arrows move by tile |
 | Detail | `j k ↑ ↓ g G` and `ctrl-d ctrl-u` scroll, `esc ⏎ q` back to the list; every other key acts as in Normal, on the same row |
 | Palette | type to find, `↑ ↓` or `ctrl-n ctrl-p` move, `⏎` run, `esc` close |
 | Filter | type to filter, `⏎` keep, `esc` clear, `↑ ↓` move |
@@ -350,7 +355,8 @@ set of folded rows.
 Each view is one file in `crates/scry/src/tui/views/` that fills a `ViewDef`: its title and
 note, the pane's heading and ranking, its columns, a function from `Board` to rows, its empty
 text, its tab badge, its key hints and what `X` reaps. `views/mod.rs` lists them in `VIEWS`,
-one line each; all five are registered already. A view's model lives in
+one line each; all six are registered already. A view whose rows start folded, as Top's
+groups do, sets `fold_all`, and its view state then remembers the rows opened. A view's model lives in
 `scry-core/src/view/` with a field on `Board`; `views::disk_lines` and `views::empty` name
 the views with lines or an empty text that only the board knows. The palette's commands are
 one table in `app.rs`, `COMMANDS`, each with the key it presses and when it applies.
