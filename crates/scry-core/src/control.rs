@@ -36,6 +36,10 @@ pub const TERM_GRACE: Duration = Duration::from_secs(3);
 const KILL_GRACE: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(25);
 
+/// How long a port is watched after its holder was stopped, for whatever takes it again.
+pub const PORT_WATCH: Duration = Duration::from_secs(1);
+const PORT_POLL: Duration = Duration::from_millis(100);
+
 /// Executables under these prefixes belong to macOS.
 const SYSTEM_PREFIXES: [&str; 4] = ["/System/", "/usr/libexec/", "/usr/sbin/", "/sbin/"];
 
@@ -520,6 +524,77 @@ fn authorised_signal(
     }
 }
 
+/// Who listens on a port after the process that held it was stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct Holder {
+    pub pid: i32,
+    /// It started after the stop: something, such as a launchd service with `KeepAlive` or
+    /// a process manager, started the server again. Otherwise it is an older process that
+    /// shares the socket and outlived the one stopped.
+    pub restarted: bool,
+}
+
+impl Holder {
+    /// What to tell the person who wanted the port free.
+    pub fn sentence(&self, port: &str) -> String {
+        let pid = self.pid;
+        if self.restarted {
+            format!(
+                "{port} is listening again, held by pid {pid}, which started after the stop: \
+                 something restarts this server, such as a launchd service or a process \
+                 manager. Stop it there, for example with `brew services stop <name>` or \
+                 `launchctl bootout`."
+            )
+        } else {
+            format!(
+                "{port} is still held by pid {pid}, which shares the socket with the process \
+                 that was stopped."
+            )
+        }
+    }
+}
+
+/// Watches `port` for `wait` after its holder was stopped at `stopped_ms`. Returns as soon
+/// as a process started since then listens on it, and otherwise whoever still holds it when
+/// the wait is over. `None` when the port stayed free, or the socket table cannot be read.
+pub fn port_after(proto: Proto, port: u16, stopped_ms: i64, wait: Duration) -> Option<Holder> {
+    let until = Instant::now() + wait;
+    loop {
+        let holders: Vec<i32> = sys::sockets::read(proto)
+            .ok()?
+            .iter()
+            .filter(|s| s.is_listening() && s.local_port == port)
+            .map(|s| s.pid)
+            .collect();
+        let started = |pid: i32| sys::liveness(pid).map(|l| l.start_us);
+        if let Some(pid) = newest_since(&holders, stopped_ms * 1000, started) {
+            return Some(Holder {
+                pid,
+                restarted: true,
+            });
+        }
+        if Instant::now() >= until {
+            return holders.first().map(|&pid| Holder {
+                pid,
+                restarted: false,
+            });
+        }
+        std::thread::sleep(PORT_POLL);
+    }
+}
+
+/// The first of `holders` that started at or after `since_us`, by `started`.
+fn newest_since(
+    holders: &[i32],
+    since_us: i64,
+    started: impl Fn(i32) -> Option<i64>,
+) -> Option<i32> {
+    holders
+        .iter()
+        .copied()
+        .find(|&pid| started(pid).is_some_and(|at| at >= since_us))
+}
+
 fn wait_gone(host: &impl Host, id: ProcId, timeout: Duration) -> bool {
     let until = Instant::now() + timeout;
     loop {
@@ -607,6 +682,35 @@ mod tests {
             resolve(&snap, Target::Port(9)),
             Err(Refusal::NotFound { .. })
         ));
+    }
+
+    #[test]
+    fn a_holder_that_started_after_the_stop_was_restarted() {
+        let started = |pid: i32| match pid {
+            10 => Some(900),
+            11 => Some(1_000),
+            _ => None,
+        };
+        assert_eq!(newest_since(&[10, 11], 1_000, started), Some(11));
+        assert_eq!(newest_since(&[10, 12], 1_000, started), None);
+        let again = Holder {
+            pid: 11,
+            restarted: true,
+        };
+        assert!(
+            again
+                .sentence(":8080")
+                .starts_with(":8080 is listening again")
+        );
+        let shared = Holder {
+            pid: 10,
+            restarted: false,
+        };
+        assert!(
+            shared
+                .sentence(":8080")
+                .starts_with(":8080 is still held by pid 10")
+        );
     }
 
     #[test]

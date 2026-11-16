@@ -6,6 +6,22 @@ All notable changes to Scry are listed here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stopping a server that forks.** A port is now shown as held by, and `scry stop :port`
+  and `x` stop, the process at the head of the family sharing its listening socket, such
+  as the nginx master. Scry used to stop whichever process touched the socket last, often
+  a worker, which the master replaced at once.
+- `scry stop :port` says when the port is listening again or still held a second after
+  the stop, as with a launchd service that keeps its server alive.
+
+### Changed
+
+- **Lighter disk and worktree readings in the UI.** The Trash is sized through the size
+  cache once per reading, one folder down, not walked whole for every update of the Disk
+  view. The threads that walk folders and search the code roots now give way to what you
+  are doing like the reader that starts them, and the `git` calls of a scan are niced.
+
 ## [0.1.0] - 2026-11-13
 
 The first public release.

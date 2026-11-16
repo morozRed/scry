@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::cache::{Part, SizeCache};
 use crate::protected::file_id;
 use crate::size::Walker;
 use crate::store::Store;
@@ -175,6 +176,51 @@ pub fn size(home: &Path, store: Option<&Store>) -> TrashSize {
             };
         }
     }
+    recorded(store)
+}
+
+/// [`size`] through the size cache, for a reading that repeats. The Trash is measured one
+/// folder down, and what sits in it never changes, so a reading walks only what was
+/// trashed since the last one and the Trash's own files, not the whole of it.
+pub fn size_cached(home: &Path, cache: &SizeCache) -> TrashSize {
+    if let Some(parts) = parts(&home.join(".Trash")) {
+        let look = cache.look(&parts, home);
+        let (sizes, _) = cache.measure(&parts, &look, home, &[]);
+        // The last part is the Trash itself. A folder in it that cannot be read is left
+        // out, as one walk of the Trash would skip it.
+        if sizes.last().is_some_and(|s| s.error.is_none()) {
+            return TrashSize::All {
+                bytes: sizes
+                    .iter()
+                    .filter(|s| s.error.is_none())
+                    .map(|s| s.size.allocated)
+                    .sum(),
+            };
+        }
+    }
+    recorded(cache.store())
+}
+
+/// The Trash cut for the cache: each folder in it whole, then the Trash with only its own
+/// files. `None` when the Trash cannot be listed.
+fn parts(trash: &Path) -> Option<Vec<Part>> {
+    let mut parts: Vec<Part> = std::fs::read_dir(trash)
+        .ok()?
+        .flatten()
+        // From the directory entry, so a symlink is never taken for a folder.
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| Part::whole(e.path()))
+        .collect();
+    parts.sort_by(|a, b| a.path.cmp(&b.path));
+    parts.push(Part {
+        path: trash.to_path_buf(),
+        top: true,
+    });
+    Some(parts)
+}
+
+/// What Scry's records say it put in the Trash and is still there.
+fn recorded(store: Option<&Store>) -> TrashSize {
     let records = store.and_then(|s| s.trashed().ok()).unwrap_or_default();
     // The newest record of each object, by where it is and what it is.
     let mut latest = std::collections::HashMap::new();

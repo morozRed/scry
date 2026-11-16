@@ -218,8 +218,17 @@ impl Walker {
             links: &links,
             trees: roots.len(),
         };
+        // A walk asked for by a thread that gives way gives way on every thread.
+        let yielding = crate::sys::gives_way();
         let partials: Vec<Work> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..self.threads).map(|_| s.spawn(|| ctx.work())).collect();
+            let handles: Vec<_> = (0..self.threads)
+                .map(|_| {
+                    s.spawn(|| {
+                        crate::sys::give_way_if(yielding);
+                        ctx.work()
+                    })
+                })
+                .collect();
             handles
                 .into_iter()
                 .map(|h| h.join().expect("size worker panicked"))

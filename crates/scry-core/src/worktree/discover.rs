@@ -1570,10 +1570,12 @@ fn commit_times(
 /// Runs `f` over `items` on up to `threads` threads, keeping order.
 fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = AtomicUsize::new(0);
+    let yielding = crate::sys::gives_way();
     let mut done: Vec<(usize, R)> = std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads.clamp(1, items.len().max(1)))
             .map(|_| {
                 s.spawn(|| {
+                    crate::sys::give_way_if(yielding);
                     let mut mine = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);

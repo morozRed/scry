@@ -10,6 +10,7 @@ use scry_core::label::printable;
 use scry_core::paths::Paths;
 use scry_core::reap;
 use scry_core::reap::{StopJudge, StoreAudit};
+use scry_core::view::ports::port_label;
 use serde_json::{Value, json};
 
 /// Stop one of your processes by pid or by the port it holds. Sends SIGTERM and waits 3 s.
@@ -77,6 +78,7 @@ pub fn run(a: StopArgs) -> Result<()> {
     };
     // The judge reads the config and the process again before each signal, so an answer
     // that took minutes, or a `destructive = false` saved meanwhile, is seen.
+    let stopped_ms = scry_core::sys::now_ms();
     let done = reap::stop_one(
         &t,
         a.kill,
@@ -92,8 +94,22 @@ pub fn run(a: StopArgs) -> Result<()> {
         (None, Some(r)) => refuse(a.json, Some(&t), json!(r), &r.to_string()),
         (None, None) => unreachable!("a stop either acts or says why not"),
     };
+    // Stopping by port is meant to free the port, so say when it did not.
+    let port_after = |t: &StopTarget| {
+        let (proto, port) = t
+            .port
+            .filter(|_| matches!(outcome, Outcome::Exited { .. }))?;
+        let holder = control::port_after(proto, port, stopped_ms, control::PORT_WATCH)?;
+        Some((holder, port_label(proto, port)))
+    };
     if a.json {
-        let out = json!({ "target": t, "outcome": outcome });
+        let after = port_after(&t);
+        let out = json!({
+            "target": t,
+            "outcome": outcome,
+            "port_after": after.as_ref().map(|(h, _)| h),
+            "message": after.as_ref().map(|(h, port)| h.sentence(port)),
+        });
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         match &outcome {
@@ -109,6 +125,11 @@ pub fn run(a: StopArgs) -> Result<()> {
                 println!("pid {pid} ({what}) is still running; SIGKILL was not sent: {why}")
             }
         }
+    }
+    if !a.json
+        && let Some((holder, port)) = port_after(&t)
+    {
+        println!("{}", holder.sentence(&port));
     }
     if matches!(
         outcome,

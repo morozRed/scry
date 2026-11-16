@@ -445,6 +445,7 @@ const QOS_CLASS_UTILITY: u32 = 0x11;
 
 unsafe extern "C" {
     fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    fn qos_class_self() -> u32;
 }
 
 /// Runs the calling thread as utility work, so macOS favours what the user is doing and can
@@ -455,8 +456,45 @@ pub fn yield_to_the_user() -> bool {
     unsafe { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) == 0 }
 }
 
+/// Whether the calling thread runs as utility work or below, as after
+/// [`yield_to_the_user`]. A thread it starts does not take that class over: macOS gives a new
+/// thread the default one. Work that fans out asks here first and has each thread it starts
+/// give way too, with [`give_way_if`].
+pub fn gives_way() -> bool {
+    // SAFETY: only reads the calling thread's scheduling class.
+    let class = unsafe { qos_class_self() };
+    class != 0 && class <= QOS_CLASS_UTILITY
+}
+
+/// For the first line of a thread started by one that [`gives_way`].
+pub fn give_way_if(parent_gives_way: bool) {
+    if parent_gives_way {
+        yield_to_the_user();
+    }
+}
+
 #[cfg(test)]
 mod qos_tests {
+    #[test]
+    fn a_thread_started_by_one_that_gives_way_can_follow_it() {
+        let (parent, before, after) = std::thread::spawn(|| {
+            super::yield_to_the_user();
+            let parent = super::gives_way();
+            let (before, after) = std::thread::spawn(move || {
+                let before = super::gives_way();
+                super::give_way_if(parent);
+                (before, super::gives_way())
+            })
+            .join()
+            .unwrap();
+            (parent, before, after)
+        })
+        .join()
+        .unwrap();
+        // `before` is not asserted: it is whether macOS hands the class down by itself.
+        assert!(parent && after, "{parent} {before} {after}");
+    }
+
     #[test]
     fn a_thread_can_give_way_to_the_user() {
         let set = std::thread::spawn(super::yield_to_the_user).join().unwrap();

@@ -68,6 +68,7 @@ pub fn read() -> Result<Disk> {
         &paths,
         config.destructive,
         false,
+        Some(disk::trash::size_cached(&home, &cache)),
     );
     Ok(Disk {
         reading,

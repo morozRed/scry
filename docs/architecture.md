@@ -69,7 +69,10 @@ Inside `scry-core`:
 1. `Engine::snapshot()` reads the process table and the socket table. For your own
    processes it also reads arguments, the working directory and a few environment keys
    (below). Arguments are turned into a command label right away and the raw arguments are
-   dropped; every other environment value is dropped in memory.
+   dropped; every other environment value is dropped in memory. The socket table names the
+   last process to touch a listening socket, often a forked worker, so a listener is given
+   to the furthest ancestor of yours that holds the same socket: stopping an nginx worker
+   would only make the master start another.
 2. `live::Collector` adds history: sessions and recorded ancestry from the store, and hook
    events from the spool that the daemon has not taken yet. Without a store it reads the
    spool in memory and writes nothing.

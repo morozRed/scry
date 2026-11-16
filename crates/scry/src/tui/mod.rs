@@ -339,13 +339,16 @@ fn read_storage(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, s: &Storag
     scry_core::sys::yield_to_the_user();
     let cache = SizeCache::open(&s.paths);
     let home = &s.worktrees.home;
+    // Sized last in each reading, so the lists never wait for it; until then the one from
+    // the reading before shows.
+    let mut trash = None;
     while asks.recv().is_ok() {
         while asks.try_recv().is_ok() {}
         let now = unix_now();
         // Each reading offers what the config allows now.
         let destructive = clean::destructive_now(&s.paths);
-        let disk = |items: &[disk::Item], pending| {
-            let list = disk::view(items, &cache, &s.paths, destructive, pending);
+        let disk = |items: &[disk::Item], pending, trash: &Option<disk::trash::TrashSize>| {
+            let list = disk::view(items, &cache, &s.paths, destructive, pending, trash.clone());
             Update::Disk(Box::new(Load::Ready(list)))
         };
         let worktrees = |scan: &WorktreeScan, sizing| {
@@ -357,7 +360,7 @@ fn read_storage(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, s: &Storag
         let mut layout = Layout::new(&found, None, home, now, &split);
         let look = cache.look(&layout.parts, home);
         layout.fill(&look.cached, &look.changed());
-        if tx.send(disk(&layout.items, true)).is_err() {
+        if tx.send(disk(&layout.items, true, &trash)).is_err() {
             return;
         }
 
@@ -370,7 +373,7 @@ fn read_storage(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, s: &Storag
         layout.relabel(&scan, home, now);
         let sizing = look.stale.iter().any(|&st| st);
         if tx.send(worktrees(&scan, sizing)).is_err()
-            || tx.send(disk(&layout.items, false)).is_err()
+            || tx.send(disk(&layout.items, false, &trash)).is_err()
         {
             return;
         }
@@ -382,11 +385,13 @@ fn read_storage(tx: &mpsc::Sender<Update>, asks: &mpsc::Receiver<()>, s: &Storag
             let measured = layout.worktree_sizes(&scan);
             worktree::apply_sizes(&mut scan, measured);
             layout.relabel(&scan, home, now);
-            if tx.send(worktrees(&scan, false)).is_err()
-                || tx.send(disk(&layout.items, false)).is_err()
-            {
+            if tx.send(worktrees(&scan, false)).is_err() {
                 return;
             }
+        }
+        trash = Some(disk::trash::size_cached(home, &cache));
+        if tx.send(disk(&layout.items, false, &trash)).is_err() {
+            return;
         }
         if tx.send(Update::StorageDone).is_err() {
             return;

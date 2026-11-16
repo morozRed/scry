@@ -394,13 +394,15 @@ pub fn read(home: &Path, roots: &[PathBuf], cache: &SizeCache, now: i64) -> Read
 }
 
 /// The Disk view of `items`: with free space, the forecast from the daemon's samples in the
-/// cache's store, and the Trash.
+/// cache's store, and the Trash, which the caller sizes with [`trash::size_cached`] once
+/// per reading and passes to each view of it; `None` while it is not known yet.
 pub fn view(
     items: &[Item],
     cache: &SizeCache,
     paths: &Paths,
     destructive: bool,
     worktrees_pending: bool,
+    trash: Option<trash::TrashSize>,
 ) -> DiskList {
     let now = crate::sys::now_ms();
     let forecast = cache.store().and_then(|s| {
@@ -412,7 +414,7 @@ pub fn view(
         items,
         space: space::read(Path::new(SAMPLED_VOLUME)).ok(),
         forecast,
-        trash: Some(trash::size(&paths.user_home, cache.store())),
+        trash,
         destructive,
         worktrees_pending,
         home: &paths.user_home,

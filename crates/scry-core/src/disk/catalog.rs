@@ -430,7 +430,9 @@ fn find_named(
     let ready = Condvar::new();
     let found = Mutex::new(Vec::new());
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
+    let yielding = crate::sys::gives_way();
     let work = || {
+        crate::sys::give_way_if(yielding);
         loop {
             let (dir, depth) = {
                 let mut j = jobs.lock().unwrap();

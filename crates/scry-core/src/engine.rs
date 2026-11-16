@@ -92,6 +92,28 @@ impl Engine {
         self.files.refresh();
         let live: HashSet<ProcId> = snap.processes.iter().map(|p| p.id).collect();
         self.args.retain(|id, _| live.contains(id));
+        // The table names the last process to touch a listening socket, which for a server
+        // that forks is often a child: an nginx worker, a `uvicorn --reload` server. The
+        // process to show, and to stop, is the one at the head of that family.
+        let mut open: HashMap<i32, Vec<(Proto, u16)>> = HashMap::new();
+        let mut heads: HashMap<(i32, Proto, u16), i32> = HashMap::new();
+        for i in 0..snap.sockets.len() {
+            let s = &snap.sockets[i];
+            if !s.is_listening() {
+                continue;
+            }
+            let (pid, port) = (s.pid, (s.proto, s.local_port));
+            let head = *heads.entry((pid, port.0, port.1)).or_insert_with(|| {
+                family_head(&snap, pid, |parent| {
+                    open.entry(parent)
+                        .or_insert_with(|| {
+                            sys::sockets::listening_ports(parent).unwrap_or_default()
+                        })
+                        .contains(&port)
+                })
+            });
+            snap.sockets[i].pid = head;
+        }
         let mut listening: HashMap<i32, Vec<(Proto, u16)>> = HashMap::new();
         for s in snap.sockets.iter().filter(|s| s.is_listening()) {
             listening
@@ -263,6 +285,30 @@ fn held(pid: i32, candidates: Option<&Vec<(Proto, u16)>>) -> Vec<u16> {
     }
 }
 
+/// How many parents up a listening socket's family is followed.
+const FAMILY_DEPTH: usize = 8;
+
+/// The process at the head of the family that shares a listening socket `pid` was last seen
+/// on: its furthest ancestor, each one on the way holding the socket too, as `holds` says of
+/// a pid. A master that forks its workers keeps the socket and starts a new worker when one
+/// dies, so stopping the worker frees nothing. Only the viewer's own processes are followed,
+/// never past another user's or into launchd; with no such parent, it is `pid` itself.
+fn family_head(snap: &Snapshot, pid: i32, mut holds: impl FnMut(i32) -> bool) -> i32 {
+    let Some(mut p) = snap.process(pid).filter(|p| p.uid == snap.viewer_uid) else {
+        return pid;
+    };
+    for _ in 0..FAMILY_DEPTH {
+        let parent = snap
+            .process(p.ppid)
+            .filter(|a| a.id.pid > 1 && a.id.pid != p.id.pid && a.uid == p.uid);
+        match parent {
+            Some(a) if holds(a.id.pid) => p = a,
+            _ => break,
+        }
+    }
+    p.id.pid
+}
+
 fn confirmed(table: &[(Proto, u16)], open: &[(Proto, u16)]) -> Vec<u16> {
     let mut ports: Vec<u16> = table
         .iter()
@@ -370,6 +416,85 @@ mod tests {
         let open = [(Proto::Tcp, 8080), (Proto::Udp, 3000), (Proto::Udp, 5353)];
         assert_eq!(confirmed(&table, &open), [5353, 8080]);
         assert_eq!(confirmed(&table, &[]), Vec::<u16>::new());
+    }
+
+    #[test]
+    fn a_listener_belongs_to_the_head_of_the_family_that_holds_it() {
+        let mut snap =
+            crate::fixture::parse(include_str!("../../../fixtures/typical.json")).unwrap();
+        let master = snap.process(1320).unwrap().clone();
+        let mut add = |pid, ppid, uid| {
+            let mut p = master.clone();
+            p.id.pid = pid;
+            p.ppid = ppid;
+            p.uid = uid;
+            snap.processes.push(p);
+        };
+        add(1330, 1320, master.uid);
+        add(1331, 1330, master.uid);
+        add(1340, 1320, master.uid + 1);
+        // A worker, and a worker's child, lead to the master while each parent holds it.
+        assert_eq!(family_head(&snap, 1330, |pid| pid == 1320), 1320);
+        assert_eq!(
+            family_head(&snap, 1331, |pid| pid == 1330 || pid == 1320),
+            1320
+        );
+        // A parent that does not hold the socket only started the server.
+        assert_eq!(family_head(&snap, 1331, |pid| pid == 1320), 1331);
+        assert_eq!(family_head(&snap, 1330, |_| false), 1330);
+        // Another user's process is not followed, nor is a pid the snapshot lacks.
+        assert_eq!(family_head(&snap, 1340, |_| true), 1340);
+        assert_eq!(family_head(&snap, 99_999, |_| true), 99_999);
+        // The walk ends below launchd whatever it is told.
+        assert_ne!(family_head(&snap, 1330, |_| true), 1);
+    }
+
+    /// A server that forks, as nginx does: the parent opens the listener and keeps it, and
+    /// the child is the one that touches it. Whichever the socket table names, the port is
+    /// the parent's, since stopping the child would leave the port held.
+    #[test]
+    fn a_forked_servers_port_is_its_parents() {
+        let script = r#"
+import os, socket, time
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen()
+if os.fork() == 0:
+    s.settimeout(0.2)
+    try:
+        s.accept()
+    except OSError:
+        pass
+    print(s.getsockname()[1], flush=True)
+    time.sleep(30)
+    os._exit(0)
+time.sleep(30)
+"#;
+        let mut parent = Command::new("python3")
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("python3");
+        let mut line = String::new();
+        BufReader::new(parent.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let port: u16 = line.trim().parse().expect("port");
+        let pid = parent.id() as i32;
+        let snap = Engine::new().snapshot().unwrap();
+        let child = snap.processes.iter().find(|p| p.ppid == pid).map(|p| p.id);
+        let named: Vec<i32> = snap
+            .sockets
+            .iter()
+            .filter(|s| s.is_listening() && s.local_port == port)
+            .map(|s| s.pid)
+            .collect();
+        if let Some(child) = child {
+            unsafe { libc::kill(child.pid, libc::SIGKILL) };
+        }
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        assert_eq!(named, [pid], "the parent, not the child that accepts");
     }
 
     /// A Python process that opens a listener, forks a child that keeps it, and execs into a

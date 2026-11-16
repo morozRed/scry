@@ -14,6 +14,9 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::protected::read_no_follow;
 
+/// The niceness of a git started by a thread that gives way to the user.
+const YIELDING_NICE: libc::c_int = 10;
+
 pub struct Output {
     pub code: Option<i32>,
     pub stdout: String,
@@ -35,6 +38,17 @@ pub fn run<S: AsRef<OsStr>>(dir: &Path, args: &[S], timeout: Duration) -> Result
     for (key, _) in std::env::vars_os() {
         if key.as_bytes().starts_with(b"GIT_") {
             cmd.env_remove(key);
+        }
+    }
+    // A scan that gives way to the user runs a git per core; a thread's class does not
+    // reach the processes it starts, so each git is niced instead.
+    if crate::sys::gives_way() {
+        // SAFETY: between fork and exec only `setpriority` runs, which is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpriority(libc::PRIO_PROCESS, 0, YIELDING_NICE);
+                Ok(())
+            });
         }
     }
     let mut child = cmd
