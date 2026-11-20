@@ -309,7 +309,9 @@ fn send(fd: RawFd, bytes: &[u8], deadline: Instant, stopped: &dyn Fn() -> bool) 
         if n == 0 || !retry(kind) || left.is_zero() {
             break;
         }
-        if kind == io::ErrorKind::WouldBlock && ready(fd, Dir::Write, left.min(SLICE)).is_err() {
+        if kind == io::ErrorKind::WouldBlock
+            && matches!(ready(fd, Dir::Write, left.min(SLICE)), Err(e) if !retry(e.kind()))
+        {
             break;
         }
     }
@@ -585,6 +587,12 @@ impl LateReply {
     pub fn expire(&mut self, now: Instant) -> Option<Vec<KeyEvent>> {
         if now < self.until || now < self.last + LATE_QUIET {
             return None;
+        }
+        if matches!(self.at, Grammar::Da1(_)) {
+            self.at = Grammar::Ground;
+            self.held.clear();
+            self.cut.clear();
+            return Some(Vec::new());
         }
         Some(self.release())
     }
@@ -1028,6 +1036,12 @@ mod tests {
         let (mut late, now) = after(b"\x1b[");
         assert!(feed_all(&mut late, &read(b"?6"), now).is_empty());
         assert_eq!(chars(&late.feed(read(b"q")[0], now)), "q");
+
+        // An unfinished DA1 left in the guard when the window expires is dropped, not typed.
+        let (mut late, now) = after(b"\x1b[");
+        assert!(feed_all(&mut late, &read(b"?6"), now).is_empty());
+        let then = now + LATE_FOR + LATE_QUIET;
+        assert_eq!(late.expire(then), Some(Vec::new()));
 
         // An answer that does finish is still swallowed whole.
         let (mut late, now) = after(&DA1[..5]);

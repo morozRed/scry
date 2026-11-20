@@ -1852,3 +1852,35 @@ fn the_pulse_takes_the_disk_forecast_from_the_disk_reading() {
         .and_then(|d| d.full_in_days);
     assert_eq!(days, Some(19), "19.3 days, as Disk says ~19");
 }
+
+#[test]
+fn clean_confirmation_trims_whitespace_and_ignores_alt_chords() {
+    let mut a = disk();
+    press(&mut a, "jt");
+    assert!(matches!(a.mode, Mode::Clean(_)));
+    a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+    press(&mut a, " Xcode DerivedData ");
+    let Action::Clean(job) = a.on_key(key(KeyCode::Enter)) else {
+        panic!("trimmed name should confirm");
+    };
+    assert_eq!(job.1.as_deref(), Some("Xcode DerivedData"));
+}
+
+#[test]
+fn palette_ignores_alt_chords_and_overlays_do_not_scroll_behind() {
+    let mut a = design();
+    press(&mut a, "3:");
+    a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+    let Mode::Palette(p) = &a.mode else {
+        panic!("expected palette");
+    };
+    assert!(p.query.is_empty());
+    press(&mut a, "\x1b");
+
+    let before = a.state().selected.clone();
+    press(&mut a, "?");
+    assert_eq!(a.mode, Mode::Help);
+    a.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert_eq!(a.state().selected, before);
+}

@@ -154,6 +154,31 @@ fn widths(list: &ListView, visible: &[usize], inner: u16) -> Vec<u16> {
 /// column adds.
 fn longest(rows: &[views::Row], i: usize, first: usize) -> u16 {
     use unicode_width::UnicodeWidthStr;
+    let below: Vec<usize> = if i == first {
+        let mut counts = vec![0usize; rows.len()];
+        let mut stack: Vec<(u8, usize)> = Vec::new();
+        for (n, r) in rows.iter().enumerate() {
+            while let Some(&(d, idx)) = stack.last() {
+                if d >= r.depth {
+                    stack.pop();
+                    if let Some(&(_, parent)) = stack.last() {
+                        counts[parent] += counts[idx] + 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            stack.push((r.depth, n));
+        }
+        while let Some((_, idx)) = stack.pop() {
+            if let Some(&(_, parent)) = stack.last() {
+                counts[parent] += counts[idx] + 1;
+            }
+        }
+        counts
+    } else {
+        Vec::new()
+    };
     rows.iter()
         .enumerate()
         .map(|(n, r)| {
@@ -164,12 +189,9 @@ fn longest(rows: &[views::Row], i: usize, first: usize) -> u16 {
             let mut w = cell.text.width() + context;
             if i == first {
                 w += 2 + 2 * r.depth as usize;
-                let below = rows[n + 1..]
-                    .iter()
-                    .take_while(|c| c.depth > r.depth)
-                    .count();
-                if below > 0 {
-                    w += 3 + below.to_string().len();
+                let kids = below[n];
+                if kids > 0 {
+                    w += 3 + kids.to_string().len();
                 }
             }
             w as u16

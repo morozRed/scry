@@ -21,15 +21,30 @@ pub fn width(spans: &[Span]) -> usize {
 /// Lines `text` takes when word-wrapped to `width` columns.
 pub fn wrapped_lines(text: &str, width: u16) -> u16 {
     let width = width.max(1) as usize;
-    let mut lines = 1;
+    let mut lines: u16 = 1;
     let mut used = 0;
     for word in text.split_whitespace() {
         let w = word.width();
         if used > 0 && used + 1 + w > width {
-            lines += 1;
-            used = w;
+            lines = lines.saturating_add(1);
+            used = 0;
+        }
+        if used > 0 {
+            used += 1;
+        }
+        if w > width && used == 0 {
+            let mut piece = 0;
+            for g in word.graphemes(true) {
+                let gw = g.width();
+                if piece > 0 && piece + gw > width {
+                    lines = lines.saturating_add(1);
+                    piece = 0;
+                }
+                piece += gw;
+            }
+            used = piece;
         } else {
-            used += w + usize::from(used > 0);
+            used += w;
         }
     }
     lines
@@ -165,6 +180,8 @@ mod tests {
         assert_eq!(wrapped_lines("one two three", 12), 2);
         assert_eq!(wrapped_lines("東京 東京", 4), 2);
         assert_eq!(wrapped_lines("", 10), 1);
+        assert_eq!(wrapped_lines(&"a".repeat(25), 10), 3);
+        assert_eq!(wrapped_lines("hi aaaaaaaaaaaa", 6), 3);
     }
 
     #[test]

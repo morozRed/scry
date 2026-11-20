@@ -38,6 +38,7 @@ fn main() -> anyhow::Result<()> {
         ("agents", "3"),
         ("disk", "4"),
         ("worktrees", "5"),
+        ("top", "6"),
         ("agents /e", "3/e\n"),
     ] {
         let mut app = App::new(

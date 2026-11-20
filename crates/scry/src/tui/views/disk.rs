@@ -58,10 +58,7 @@ fn row(d: &DiskItem, sizing: bool) -> Row {
             ..Cell::num("-", 0)
         },
     };
-    let context = match (&d.state, d.kind.word()) {
-        (Some(state), _) => Some(state.word().to_string()),
-        _ => None,
-    };
+    let context = d.state.map(|state| state.word().to_string());
     let mut chips = vec![
         Chip::Kind(d.kind.word().into(), d.kind),
         Chip::Tone(

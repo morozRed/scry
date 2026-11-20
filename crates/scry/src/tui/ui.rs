@@ -288,8 +288,7 @@ fn list(
         });
     // Disk's volume and treemap fill the list area whatever the rows.
     let map = app.disk_map_on();
-    let tall = map || app.tab == Tab::Disk;
-    let list_rows = if tall {
+    let list_rows = if app.tab == Tab::Disk {
         u16::MAX / 2
     } else if app.tab == Tab::Top && app.board.usage.ready().is_some() {
         // The bars, the gaps around them at most, and the rows.

@@ -536,15 +536,14 @@ impl App {
             }
         }
         match (before, self.rows()) {
-            (Load::Ready(old), Load::Ready(new)) => new
-                .iter()
-                .filter(|r| {
-                    old.iter()
-                        .find(|o| o.id == r.id)
-                        .is_none_or(|o| o.state() != r.state())
-                })
-                .map(|r| r.id.clone())
-                .collect(),
+            (Load::Ready(old), Load::Ready(new)) => {
+                let prev: std::collections::HashMap<&str, Option<scry_core::view::State>> =
+                    old.iter().map(|o| (o.id.as_str(), o.state())).collect();
+                new.iter()
+                    .filter(|r| prev.get(r.id.as_str()).is_none_or(|&s| s != r.state()))
+                    .map(|r| r.id.clone())
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -644,7 +643,8 @@ impl App {
             let page = |app: &mut App, by: isize| match app.mode {
                 Mode::Sheet(_) => app.scroll_sheet(by),
                 Mode::Detail(_) => app.scroll_detail(by),
-                _ => app.step(by),
+                Mode::Normal | Mode::Filter => app.step(by),
+                Mode::Help | Mode::Clean(_) | Mode::Palette(_) => Action::None,
             };
             return match key.code {
                 KeyCode::Char('c') => Action::Quit,
@@ -666,7 +666,11 @@ impl App {
         }
         match &self.mode {
             Mode::Normal => self.on_normal(key.code),
-            Mode::Filter if key.modifiers.contains(KeyModifiers::ALT) => Action::None,
+            Mode::Filter | Mode::Clean(_) | Mode::Palette(_)
+                if key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Action::None
+            }
             Mode::Filter => self.on_filter(key.code),
             Mode::Sheet(_) => self.on_sheet(key.code),
             Mode::Clean(_) => self.on_clean(key.code),
@@ -1094,7 +1098,7 @@ impl App {
                     return Action::None;
                 };
                 let CleanSheet { plan, typed, .. } = *sheet;
-                Action::Clean(Box::new((plan, word.map(|_| typed))))
+                Action::Clean(Box::new((plan, word.map(|_| typed.trim().to_string()))))
             }
             (KeyCode::Backspace, Some(_)) => {
                 sheet.typed.pop();

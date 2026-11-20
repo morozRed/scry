@@ -139,10 +139,17 @@ fn gauge_list<'a>(theme: &Theme, board: &Board, fourth: bool) -> Vec<Gauge<'a>> 
                 )]
             }
             _ => match d.full_in_days {
-                Some(days) => vec![Span::styled(
-                    format!("{} full in ~{days} days", glyph(Tone::Warn)),
-                    theme.warn,
-                )],
+                Some(days) => {
+                    let tone = if (days as f64) < FORECAST_WARN_DAYS {
+                        Tone::Warn
+                    } else {
+                        Tone::Quiet
+                    };
+                    vec![Span::styled(
+                        format!("{} full in ~{days} days", glyph(tone)),
+                        theme.tone(tone),
+                    )]
+                }
                 None => Vec::new(),
             },
         };
@@ -150,7 +157,11 @@ fn gauge_list<'a>(theme: &Theme, board: &Board, fourth: bool) -> Vec<Gauge<'a>> 
             Some(s) if s.total > 0 => {
                 let total = s.total as f64;
                 Graph::Bar(vec![
-                    ((s.total - s.available) as f64 / total, "█", theme.faint),
+                    (
+                        s.total.saturating_sub(s.available) as f64 / total,
+                        "█",
+                        theme.faint,
+                    ),
                     (s.purgeable as f64 / total, "▒", theme.info),
                     (0.0, "█", theme.ok),
                 ])
@@ -178,7 +189,11 @@ fn gauge_list<'a>(theme: &Theme, board: &Board, fourth: bool) -> Vec<Gauge<'a>> 
             } else {
                 theme.strong
             },
-            unit: format!("{unit}B free"),
+            unit: if unit == "B" {
+                "B free".into()
+            } else {
+                format!("{unit}B free")
+            },
             graph,
             caption,
         });

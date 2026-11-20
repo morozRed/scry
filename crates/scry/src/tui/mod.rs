@@ -671,6 +671,12 @@ fn receive(app: &mut App, motion: &mut Motion, update: Update) -> bool {
             if app.board.ports == Load::Loading {
                 app.board.ports = Load::Failed(why.clone());
             }
+            if app.board.agents == Load::Loading {
+                app.board.agents = Load::Failed(why.clone());
+            }
+            if app.board.usage == Load::Loading {
+                app.board.usage = Load::Failed(why.clone());
+            }
             finish_scan(app, Some(why))
         }
         Update::Acted(done) => {

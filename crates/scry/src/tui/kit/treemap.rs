@@ -35,12 +35,14 @@ pub fn volume(
     lines: &[Vec<(String, Ink)>; 2],
 ) {
     let buf = f.buffer_mut();
-    if let Some(s) = space.filter(|s| s.total > 0) {
+    if let Some(s) = space.filter(|s| s.total > 0 && area.width > 0) {
         let w = area.width as f64;
         let total = s.total as f64;
         let cells = |b: u64| ((b as f64 / total) * w).round() as u16;
-        let purge = cells(s.purgeable).max(u16::from(s.purgeable > 0));
-        let used = cells(s.total - s.available).min(area.width - purge);
+        let purge = cells(s.purgeable)
+            .max(u16::from(s.purgeable > 0))
+            .min(area.width);
+        let used = cells(s.total.saturating_sub(s.available)).min(area.width - purge);
         let free = area.width - used - purge;
         for row in 0..2.min(area.height) {
             let y = area.y + row;
@@ -181,6 +183,9 @@ pub fn treemap(
             continue;
         }
         let cell = Rect::new(x0, y0, x1 - x0, y1 - y0).intersection(area);
+        if cell.is_empty() {
+            continue;
+        }
         out.push((item.id.to_string(), cell));
         draw_tile(buf, cell, theme, item, selected == Some(item.id));
     }

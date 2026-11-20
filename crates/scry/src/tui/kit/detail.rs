@@ -86,7 +86,7 @@ pub fn beside(f: &mut Frame, area: Rect, theme: &Theme, p: &Pane, scroll: &Cell<
     if top < max {
         buf.set_string(
             area.right().saturating_sub(INSET),
-            area.bottom() - 1,
+            area.bottom().saturating_sub(1),
             "↓",
             theme.muted,
         );
