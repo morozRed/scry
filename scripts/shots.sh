@@ -17,7 +17,7 @@ for shot in $README; do
   view=${shot%-*}
   size=${shot##*-}
   for p in light dark; do
-    if [ "$view" = sheet ]; then name="sheet-$p-$size"; else name="$view-$p-$size"; fi
+    name="$view-$p-$size"
     cp "target/shots/$name.svg" "docs/screens/$name.svg"
   done
 done

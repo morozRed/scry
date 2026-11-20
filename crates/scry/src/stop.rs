@@ -57,7 +57,12 @@ pub fn run(a: StopArgs) -> Result<()> {
                 ),
             );
         }
-        eprint!("Stop pid {pid} ({what}) with SIGTERM? [y/N] ");
+        let signals = if a.kill {
+            "SIGTERM (and SIGKILL if still running)"
+        } else {
+            "SIGTERM"
+        };
+        eprint!("Stop pid {pid} ({what}) with {signals}? [y/N] ");
         std::io::stderr().flush()?;
         let mut answer = String::new();
         std::io::stdin().lock().read_line(&mut answer)?;

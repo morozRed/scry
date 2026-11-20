@@ -128,8 +128,8 @@ dark, holds. Without truecolor Scry falls back to exactly that principle, below.
 
 ## Every view in the chosen look
 
-All five views were checked at 80×24 and 120×40, light and dark: Overview, Ports, Agents,
-Disk and Worktrees. The Disk and Worktrees fixture rows are synthetic. Disk's cleanup
+All six views were checked at 80×24 and 120×40, light and dark: Overview, Ports, Agents,
+Disk, Worktrees and Top. The Disk and Worktrees fixture rows are synthetic. Disk's cleanup
 sheets were checked too: a delete that waits for the item's name, and a worktree going to
 the Trash.
 
@@ -283,8 +283,11 @@ returns. STATE sorts by what it asks of you:
 full, then leftover, stale and filling, then kept, the quiet states and live last. Rows
 without a value come last whichever way a column sorts.
 
-Stopping and reaping are not wired to signals yet; confirming a sheet says so. Cleanup
-is: `t` on an item opens its sheet when the item allows an action, and otherwise says in
+Stopping, reaping, SIGKILL, keeping and cleanup are all wired to the live engine off the UI
+thread. Stop, reap and SIGKILL re-check every target and `destructive` right before each
+signal, write an audit row first, and report the outcome in the footer; processes that
+outlive SIGTERM open a second confirmation sheet for SIGKILL. Cleanup works the same way:
+`t` on an item opens its sheet when the item allows an action, and otherwise says in
 the footer why not (the command to run yourself, "shows its size only", or that cleanup
 is off). A confirmed cleanup runs off the UI thread; the footer says "Cleaning up…", then
 "Moved 1.3 GB to Trash; the Trash holds at least 3.7 GB. Empty it to free the space." or

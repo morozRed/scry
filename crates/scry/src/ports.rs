@@ -43,7 +43,8 @@ pub struct WhyArgs {
 }
 
 fn parse_port(s: &str) -> Result<u16, String> {
-    s.trim_start_matches(':')
+    s.strip_prefix(':')
+        .unwrap_or(s)
         .parse()
         .map_err(|_| format!("`{s}` is not a port"))
 }

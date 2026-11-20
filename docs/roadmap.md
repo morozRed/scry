@@ -34,7 +34,7 @@ These hold for every release.
 | Disk | Free space as Finder counts it, a forecast of when it runs out, and the largest caches, `node_modules` folders and worktrees, ranked by what deleting them frees. Each item allows one cleanup: Trash, delete, a command for you to run, or none. |
 | Worktrees | Every linked git worktree under your code roots, with its state (can go, dirty, active, locked, …), its size and the agent that probably made it. |
 | Pulse | CPU, memory pressure, swap and free disk, as gauges on the Overview and a strip in the header. |
-| CLI | `overview`, `ports`, `why`, `stop`, `agents`, `leftovers`, `reap`, `keep`, `worktrees`, `disk`, `clean`, `watch`, each with `--json`. |
+| CLI | `overview`, `ports`, `why`, `stop`, `agents`, `leftovers`, `reap`, `keep`, `worktrees`, `disk`, `clean`, `top`, `watch`, each with `--json`. |
 | Background recorder | An optional LaunchAgent that records disk history for the forecast, takes hook events, and remembers which session each process belonged to while its agent lived. |
 | Claude Code hooks | `scry hook install claude` adds SessionStart and SessionEnd hooks, so sessions are known exactly. |
 | Health | `scry doctor` checks each part and says how to fix what is wrong. |

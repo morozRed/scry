@@ -65,8 +65,13 @@ pub fn run(a: SetupArgs) -> Result<()> {
         }
         found
     } else if !a.agents.is_empty() {
-        let mut v: Vec<Agent> = a.agents.iter().map(|&g| g.into()).collect();
-        v.dedup();
+        let mut v = Vec::new();
+        for &g in &a.agents {
+            let g: Agent = g.into();
+            if !v.contains(&g) {
+                v.push(g);
+            }
+        }
         v
     } else if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         let picked = ask(&env, a.remove)?;
@@ -198,6 +203,7 @@ fn names() -> String {
 
 fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => path.display().to_string(),
     }

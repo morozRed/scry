@@ -184,6 +184,12 @@ pub fn agents(a: AgentsArgs) -> Result<()> {
             "Scry recognises Claude Code, Codex, OpenCode and Gemini CLI by their executables, and lists their sessions here while they run."
         );
         println!("`scry hook install claude` makes Claude Code attribution exact.");
+        if let Some(e) = &r.config_error {
+            println!("Your config could not be read, so no process is marked a leftover: {e}");
+        }
+        if let Some(c) = r.caveat() {
+            println!("{c}");
+        }
         return Ok(());
     }
     print!("{}", table(&rows));
@@ -345,9 +351,9 @@ pub fn watch(a: WatchArgs) -> Result<()> {
     }
 }
 
-/// Fields that move by themselves: ages, RAM, the header's pulse, and counts of every process
-/// on the machine (with the `checked` lines that quote them).
-const RESTLESS: [&str; 10] = [
+/// Fields that move by themselves: ages, RAM, the header's pulse, Top's CPU/RAM usage, and
+/// counts of every process on the machine (with the `checked` lines that quote them).
+const RESTLESS: [&str; 11] = [
     "age_s",
     "age_secs",
     "ram",
@@ -358,6 +364,7 @@ const RESTLESS: [&str; 10] = [
     "own_count",
     "checked",
     "pulse",
+    "usage",
 ];
 
 /// The board as JSON without what moves by itself: the [`RESTLESS`] fields, and the ages and
@@ -478,7 +485,8 @@ mod tests {
         busier.overview.own_footprint += 1 << 20;
         busier.overview.checked = vec!["420 of your processes".into()];
         busier.pulse = None;
-        assert_eq!(signature(&busier), sig, "only RAM and counts moved");
+        busier.usage = Load::Unavailable("moving CPU and RAM".into());
+        assert_eq!(signature(&busier), sig, "only RAM, CPU and counts moved");
 
         // A new state, label or port does.
         let mut left = board.clone();

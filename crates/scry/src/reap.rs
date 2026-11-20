@@ -68,7 +68,7 @@ pub fn run(a: ReapArgs) -> Result<()> {
                     "message": r.to_string(),
                 }));
             } else {
-                println!("{r} Nothing to reap.");
+                println!("{} Nothing to reap.", printable(&r.to_string()));
             }
             return Ok(());
         }
@@ -98,7 +98,7 @@ pub fn run(a: ReapArgs) -> Result<()> {
             println!("Dry run: nothing was signalled. `scry reap` stops these, children first.");
             println!("{PERSISTENT}");
             if let Err(r) = &allowed {
-                println!("{r}");
+                println!("{}", printable(&r.to_string()));
             }
         }
         return Ok(());
@@ -122,7 +122,12 @@ pub fn run(a: ReapArgs) -> Result<()> {
             );
         }
         eprint!("{}", crate::agents::leftover_table(&list));
-        eprint!("Reap {what}, children first, with SIGTERM? [y/N] ");
+        let signals = if a.kill {
+            "SIGTERM (and SIGKILL if still running)"
+        } else {
+            "SIGTERM"
+        };
+        eprint!("Reap {what}, children first, with {signals}? [y/N] ");
         std::io::stderr().flush()?;
         let mut answer = String::new();
         std::io::stdin().lock().read_line(&mut answer)?;

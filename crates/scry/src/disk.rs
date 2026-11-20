@@ -252,7 +252,7 @@ pub fn clean(args: CleanArgs) -> Result<()> {
             }
             eprintln!("{}", printable(&format!("This will {what}.")));
             match word {
-                Some(w) => eprint!("Type {w} to delete it for good: "),
+                Some(w) => eprint!("Type {} to delete it for good: ", printable(w)),
                 None => eprint!("Go ahead? [y/N] "),
             }
             std::io::stderr().flush()?;
@@ -303,6 +303,7 @@ pub fn clean(args: CleanArgs) -> Result<()> {
 /// "move ~/.codex/sessions (1.2 GB) to the Trash".
 fn describe(plan: &Plan, home: &Path) -> String {
     let path = match plan.path.strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
         Ok(rest) => format!("~/{}", rest.display()),
         Err(_) => plan.path.display().to_string(),
     };

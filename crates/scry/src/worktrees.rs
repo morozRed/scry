@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use clap::Args;
 use scry_core::config::Config;
+use scry_core::label::printable;
 use scry_core::paths::Paths;
 use scry_core::view::worktrees::{WorktreesView, bytes};
 use scry_core::worktree::{self, ScanOptions, Timings, WorktreeScan};
@@ -78,7 +79,7 @@ pub fn run(args: WorktreesArgs) -> Result<()> {
     }
     print_table(&view);
     for w in &scan.warnings {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", printable(w));
     }
     println!(
         "{} Took {:.1} s.",
@@ -109,6 +110,7 @@ fn print_table(view: &WorktreesView) {
                 r.creator.clone(),
                 r.last_commit.clone().unwrap_or_else(|| "-".into()),
             ]
+            .map(|c| printable(&c))
         })
         .collect();
     let head = [
@@ -139,7 +141,7 @@ fn print_table(view: &WorktreesView) {
     println!("{}", line(&head));
     for (c, r) in cells.iter().zip(&view.rows) {
         println!("{}", line(&c.each_ref().map(String::as_str)));
-        println!("    {}", r.sentence);
+        println!("    {}", printable(&r.sentence));
     }
     println!();
 }
@@ -226,6 +228,7 @@ fn show_roots(roots: &[PathBuf], home: &Path) -> String {
     roots
         .iter()
         .map(|r| match r.strip_prefix(home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
             Ok(rest) => format!("~/{}", rest.display()),
             Err(_) => r.display().to_string(),
         })

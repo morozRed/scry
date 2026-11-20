@@ -87,7 +87,7 @@ fn print(v: &UsageView) {
         .map(|r| r.label.chars().count() + 2 * r.depth as usize)
         .max()
         .unwrap_or(0)
-        .min(40);
+        .clamp("NAME".len(), 40);
     println!(
         "{:<name_w$}  {:>5}  {:>5}  {:>5}  STATE",
         "NAME", "CPU", "RAM", "PROCS"

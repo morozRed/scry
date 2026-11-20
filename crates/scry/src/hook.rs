@@ -201,7 +201,7 @@ fn record(event: &str) -> Result<()> {
     paths.ensure_state()?;
     spool::append(&paths.spool(), &e)?;
     if event == "SessionStart"
-        && let Some(file) = std::env::var_os("CLAUDE_ENV_FILE")
+        && let Some(file) = std::env::var_os("CLAUDE_ENV_FILE").filter(|f| !f.is_empty())
     {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -232,10 +232,13 @@ fn agent_above() -> Option<ProcId> {
         if pid <= 1 {
             return None;
         }
-        let exe = sys::exe_path(pid)?;
-        let argv = reader.read(pid).map(|a| a.argv).unwrap_or_default();
-        if catalog::classify(&exe, &argv).map(|r| r.role) == Some(Role::Agent(Agent::ClaudeCode)) {
-            return sys::proc_id(pid);
+        if let Some(exe) = sys::exe_path(pid) {
+            let argv = reader.read(pid).map(|a| a.argv).unwrap_or_default();
+            if catalog::classify(&exe, &argv).map(|r| r.role)
+                == Some(Role::Agent(Agent::ClaudeCode))
+            {
+                return sys::proc_id(pid);
+            }
         }
         pid = sys::ppid(pid)?;
     }

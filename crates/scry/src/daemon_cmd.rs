@@ -172,7 +172,7 @@ fn status(paths: &Paths, json: bool) -> Result<()> {
             println!("store      {}, schema {schema}", paths.tilde(path));
             match newest {
                 Some(n) => {
-                    let ahead_ms = n.at_ms - sys::now_ms();
+                    let ahead_ms = n.at_ms.saturating_sub(sys::now_ms());
                     let when = if ahead_ms > 60_000 {
                         let ahead = Duration::from_millis(ahead_ms as u64);
                         format!("dated {} in the future", human_duration(ahead))
