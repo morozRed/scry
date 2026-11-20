@@ -6,6 +6,61 @@ All notable changes to Scry are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-20
+
+### Fixed
+
+- **Disk cleanup and safety:**
+  - Trashing Claude Code or Codex session folders now warns when the agent is running (the
+    check previously read an unlabelled snapshot).
+  - Unreadable symlinks, symlink loops, and unresolvable relative paths now fail closed
+    instead of passing protected-path checks; symlinked catalog entries are resolved before
+    inspecting them, and tool-clone stash and config checks fail closed on errors or
+    symlinks.
+  - FSEvents history queries now drain their dispatch queue before releasing shared state on
+    timeout, avoiding a potential use-after-free, and handle poisoned locks without panicking
+    across FFI.
+  - Background git commands now kill their process group on fast exit too, preventing hangs
+    when grandchildren hold open pipes.
+- **Lineage, keep list, hooks and stop:**
+  - Out-of-order hook events in a single spool batch now apply in timestamp order so a
+    resumed session is never left ended, and resuming a hook session preserves its original
+    start time and working directory in the store.
+  - Live agent-tree processes holding listening ports without an environment stamp now show
+    as live instead of unowned.
+  - Keeping a shared script run directly in `~` now expands and matches cleanly, and `~`
+    display in Disk, Worktrees, and setup no longer shows `~/`.
+  - `SIGKILL` outcomes now report the elapsed wait time instead of `0 ms`, and `--kill`
+    confirmation prompts note that `SIGKILL` follows if `SIGTERM` does not stop the process.
+  - Claude Code hook installation accepts prerelease and build-tagged version strings and
+    cleans up temporary or backup files if writing fails; hook runner ancestor walks continue
+    past processes whose executable path cannot be read.
+  - Older databases that already have session tables are now readable without requiring the
+    latest unrelated schema version.
+- **CLI and terminal UI:**
+  - `scry watch --json` no longer emits a line on every tick from moving CPU and memory
+    usage, and `scry agents` still shows config errors and caveats when the list is empty.
+  - Leading or trailing whitespace around a cleanup confirmation word in the TUI now matches
+    validation instead of failing at execution; `Alt` chords no longer type into cleanup
+    confirmations or the command palette, and `Ctrl-D`/`Ctrl-U` no longer scroll the list
+    behind open overlays.
+  - Failed live refreshes now mark Agents and Top as failed rather than leaving them stuck
+    loading.
+  - Terminal writes retry on `EINTR`, and unfinished DA1 replies that time out are dropped
+    instead of leaking as typed keys.
+  - Fixed narrow/empty treemap and gauge underflows, sub-kilobyte `"BB free"` disk gauge
+    formatting, over-wide word line-count estimation in cleanup sheets, and `NAME` header
+    alignment in `scry top`.
+  - Sanitized untrusted paths and names in Worktrees, Disk, and Reap output; deduplicated
+    repeated agent names in `scry setup`; rejected repeated leading colons in `scry ports`.
+
+### Changed
+
+- Removed quadratic hot-path scans in lineage attribution, Top grouping, reap ordering, TUI
+  board refreshes, and table sizing; cached static memory and page-size lookups; skipped
+  per-process rusage calls for other users' processes when unprivileged; and applied macOS
+  utility QoS to disk-catalog, sizing, and worktree worker threads.
+
 ## [0.1.0] - 2026-11-13
 
 The first public release.
@@ -76,5 +131,6 @@ The first public release.
 - Folder walks, cleanups and the background recorder run at macOS's utility priority, so
   they give way to your own work.
 
-[Unreleased]: https://github.com/morozRed/scry/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/morozRed/scry/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/morozRed/scry/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/morozRed/scry/releases/tag/v0.1.0

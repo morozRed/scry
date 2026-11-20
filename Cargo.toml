@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/scry-core", "crates/scry"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 rust-version = "1.89"
@@ -14,7 +14,7 @@ keywords = ["macos", "tui", "agents", "ports", "monitor"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-scry-core = { path = "crates/scry-core", version = "0.1.0" }
+scry-core = { path = "crates/scry-core", version = "0.1.1" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 insta = "1"
