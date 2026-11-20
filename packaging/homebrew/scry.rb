@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 # Template for the formula in morozRed/homebrew-tap (Formula/scry.rb). The Release
-# workflow fills __VERSION__ and __SHA256__ with scripts/render-formula.sh, checks the result
+# workflow fills the version and sha256 with scripts/render-formula.sh, checks the result
 # with brew and pushes it to the tap. Edit it here, never in the tap.
 class Scry < Formula
   desc "See what your coding agents left running on your Mac"
