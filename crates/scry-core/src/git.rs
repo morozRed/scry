@@ -123,8 +123,12 @@ fn collect(pid: i32, pipes: &[OwnedFd; 2], deadline: Instant) -> io::Result<[Vec
         libc::NOTE_EXIT,
     )) {
         Ok(()) => false,
-        // It exited before it could be watched.
-        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => true,
+        // It exited before it could be watched; still clear its group so no grandchild
+        // can hold stdout or stderr open until the timeout.
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            true
+        }
         Err(e) => return Err(e),
     };
     let mut open = [true, true];
@@ -250,7 +254,8 @@ pub fn parse_index(z: &str) -> Result<IndexFlags> {
         else {
             bail!("unexpected git ls-files record {record:?}");
         };
-        let flagged = tag == "S" || tag.bytes().all(|b| b.is_ascii_lowercase());
+        let flagged =
+            tag == "S" || (!tag.is_empty() && tag.bytes().all(|b| b.is_ascii_lowercase()));
         // An unmerged path has one entry per stage; count it once.
         if flagged && last_hidden != Some(path) {
             out.hidden += 1;

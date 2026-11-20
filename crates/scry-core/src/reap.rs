@@ -111,16 +111,18 @@ fn session_named(lineage: &Lineage, list: &[Leftover], s: &str) -> Result<String
 
 /// Deepest first by the parent chain, then newest first among equals.
 fn children_first(snap: &Snapshot, list: &mut [Leftover]) {
+    let ppids: std::collections::HashMap<i32, i32> =
+        snap.processes.iter().map(|p| (p.id.pid, p.ppid)).collect();
     let depth = |pid: i32| {
         let mut d = 0;
         let mut at = pid;
-        while let Some(p) = snap.process(at).filter(|p| p.ppid > 1 && d < 64) {
+        while let Some(&ppid) = ppids.get(&at).filter(|&&ppid| ppid > 1 && d < 64) {
             d += 1;
-            at = p.ppid;
+            at = ppid;
         }
         d
     };
-    list.sort_by_key(|l| (Reverse(depth(l.pid)), Reverse(l.start_us), l.pid));
+    list.sort_by_cached_key(|l| (Reverse(depth(l.pid)), Reverse(l.start_us), l.pid));
 }
 
 /// The check right before each signal, ahead of the audit row and the identity check.

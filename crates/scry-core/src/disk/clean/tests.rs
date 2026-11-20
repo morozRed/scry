@@ -1321,3 +1321,34 @@ fn yarns_git_dependency_clones_are_regenerable_until_they_hold_work() {
         assert_eq!(cache.exists(), dirty);
     }
 }
+
+#[test]
+fn writer_running_warns_only_for_this_users_matching_agent() {
+    let mut snap =
+        crate::fixture::parse(include_str!("../../../../../fixtures/typical.json")).unwrap();
+    for p in &mut snap.processes {
+        p.role = None;
+    }
+    let own = snap.viewer_uid;
+    let first = snap.processes.iter_mut().find(|p| p.uid == own).unwrap();
+    first.role = Some(Role::Agent(Agent::ClaudeCode));
+    let other = snap.processes.iter_mut().find(|p| p.uid != own).unwrap();
+    other.role = Some(Role::Agent(Agent::Codex));
+
+    let msg = writer_running_in(&snap, "claude-projects").unwrap();
+    assert!(msg.contains("Claude Code is running (1 process)"), "{msg}");
+    assert_eq!(writer_running_in(&snap, "codex-sessions"), None);
+    assert_eq!(writer_running_in(&snap, "xcode-derived-data"), None);
+
+    let second = snap
+        .processes
+        .iter_mut()
+        .find(|p| p.uid == own && p.role.is_none())
+        .unwrap();
+    second.role = Some(Role::Agent(Agent::ClaudeCode));
+    let msg = writer_running_in(&snap, "claude-projects").unwrap();
+    assert!(
+        msg.contains("Claude Code is running (2 processes)"),
+        "{msg}"
+    );
+}

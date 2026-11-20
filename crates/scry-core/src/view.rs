@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::attribution::{AgentState, Known, Lineage, Policy};
+use crate::attribution::{AgentState, Lineage};
 use crate::home::Home;
 use crate::model::Snapshot;
 pub use agents::AgentRow;
@@ -99,12 +99,6 @@ impl Board {
         }
     }
 
-    /// Every view from a recorded snapshot alone, with no store or spool behind it.
-    pub fn from_recorded(s: &Snapshot) -> Self {
-        let lineage = Lineage::build(s, &Known::default(), &Policy::default());
-        Board::build(s, &lineage, None)
-    }
-
     /// Every view from one snapshot and its lineage. Paths are shown as [`Home::redact`]
     /// writes them.
     pub fn build(s: &Snapshot, lineage: &Lineage, home: Option<&Home>) -> Self {
@@ -112,7 +106,7 @@ impl Board {
         for r in ports.iter_mut().filter(|r| r.uid == s.viewer_uid) {
             if lineage.is_leftover(r.pid) {
                 r.state = Some(State::Leftover);
-            } else if r.state.is_none()
+            } else if matches!(r.state, None | Some(State::Unowned))
                 && lineage.session_of(r.pid).is_some_and(|(session, _)| {
                     !session.ended() && matches!(session.agent, AgentState::Live { .. })
                 })
@@ -725,5 +719,38 @@ mod tests {
         assert!(!board.overview.attention.is_empty());
         assert!(board.agents.ready().is_some_and(|rows| rows.len() > 8));
         assert!(board.ports.ready().is_some_and(|rows| rows.len() > 5));
+    }
+
+    #[test]
+    fn a_live_agent_tree_listener_without_a_stamp_shows_as_live() {
+        use crate::attribution::{Known, Policy};
+        use crate::catalog::Role;
+        use crate::model::Agent;
+        let mut snap =
+            crate::fixture::parse(include_str!("../../../fixtures/typical.json")).unwrap();
+        let mut agent = snap.process(1320).unwrap().clone();
+        agent.id.pid = 1300;
+        agent.ppid = 1;
+        agent.role = Some(Role::Agent(Agent::Codex));
+        agent.stamps = Default::default();
+        snap.processes.push(agent);
+        let child = snap
+            .processes
+            .iter_mut()
+            .find(|p| p.id.pid == 1320)
+            .unwrap();
+        child.ppid = 1300;
+        child.stamps = Default::default();
+
+        let lineage = Lineage::build(&snap, &Known::default(), &Policy::default());
+        let board = Board::build(&snap, &lineage, None);
+        let port = board
+            .ports
+            .ready()
+            .unwrap()
+            .iter()
+            .find(|p| p.port == 3000 && p.pid == 1320)
+            .unwrap();
+        assert_eq!(port.state, Some(State::Live));
     }
 }

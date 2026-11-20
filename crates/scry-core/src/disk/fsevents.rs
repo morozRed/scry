@@ -77,8 +77,11 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
+    fn dispatch_sync_f(queue: *mut c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
     fn dispatch_release(object: *mut c_void);
 }
+
+extern "C" fn drain_queue(_: *mut c_void) {}
 
 /// The newest event id on this Mac. A reading stamped with it is checked from there.
 pub fn current_id() -> u64 {
@@ -145,7 +148,7 @@ extern "C" fn on_events(
     // and FSEvents passes `n` C strings, flags and ids.
     let shared = unsafe { &*(info as *const Shared) };
     let paths = paths as *const *const c_char;
-    let mut s = shared.state.lock().unwrap();
+    let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     for i in 0..n {
         let (path, flag, id) =
             unsafe { (CStr::from_ptr(*paths.add(i)), *flags.add(i), *ids.add(i)) };
@@ -251,23 +254,30 @@ pub fn since(paths: &[PathBuf], since: u64, timeout: Duration) -> History {
             return lost();
         }
         let queue = dispatch_queue_create(c"scry.fsevents".as_ptr(), std::ptr::null());
+        if queue.is_null() {
+            FSEventStreamRelease(stream);
+            return lost();
+        }
         FSEventStreamSetDispatchQueue(stream, queue);
         let started = FSEventStreamStart(stream) != 0;
         let finished = started && {
-            let s = shared.state.lock().unwrap();
+            let s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             let (s, _) = shared
                 .ready
                 .wait_timeout_while(s, timeout, |s| !s.done)
-                .unwrap();
+                .unwrap_or_else(|e| e.into_inner());
             s.done
         };
         if started {
             FSEventStreamStop(stream);
         }
         FSEventStreamInvalidate(stream);
+        // Wait for any callback already running on the serial queue to finish before
+        // releasing the stream and dropping `shared`, which the callback borrows.
+        dispatch_sync_f(queue, std::ptr::null_mut(), drain_queue);
         FSEventStreamRelease(stream);
         dispatch_release(queue);
-        let mut s = shared.state.lock().unwrap();
+        let mut s = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut history = std::mem::take(&mut s.history);
         history.lost |= !finished;
         history

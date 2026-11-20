@@ -275,6 +275,9 @@ mod tests {
         let n = s.len();
         for x in &mut s[n / 2..n / 2 + 36] {
             x.avail_bytes -= 40 * GB;
+            if let Some(imp) = &mut x.important_bytes {
+                *imp -= 40 * GB;
+            }
         }
         let Forecast::FullIn { per_day, .. } = forecast(&s, NOW) else {
             panic!()

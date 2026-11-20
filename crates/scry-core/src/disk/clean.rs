@@ -1028,12 +1028,21 @@ fn record_folder(record: &Path, gitdir: &[u8], home: &Path) -> Option<PathBuf> {
 /// An agent that writes into this item while it runs, when one is running now: moving its
 /// sessions away under it loses what it writes next.
 pub fn writer_running(item: &str) -> Option<String> {
+    if !matches!(item, "claude-projects" | "codex-sessions") {
+        return None;
+    }
+    let snap = crate::engine::Engine::labelling(crate::engine::Labels::None)
+        .snapshot()
+        .ok()?;
+    writer_running_in(&snap, item)
+}
+
+fn writer_running_in(snap: &crate::model::Snapshot, item: &str) -> Option<String> {
     let agent = match item {
         "claude-projects" => Agent::ClaudeCode,
         "codex-sessions" => Agent::Codex,
         _ => return None,
     };
-    let snap = crate::sys::scan().ok()?;
     let n = snap
         .processes
         .iter()

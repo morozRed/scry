@@ -244,7 +244,7 @@ pub fn matches(p: &Process, entry: &str) -> bool {
 /// `<script> in <dir>`, when both are paths.
 fn split_in(entry: &str) -> Option<(&str, &str)> {
     let (script, dir) = entry.rsplit_once(IN)?;
-    let path = |s: &str| s.starts_with('/') || s.starts_with("~/");
+    let path = |s: &str| s == "~" || s.starts_with('/') || s.starts_with("~/");
     (path(script) && path(dir)).then_some((script, dir))
 }
 
@@ -858,6 +858,15 @@ mod tests {
             }
         }
         assert!(matches(&server, "node"), "by name, as before");
+
+        // A shared script run directly in $HOME writes `in ~`, which expands back to $HOME.
+        let at_home = process("node", "/opt/homebrew/bin/node", Some(vite), Some(&home));
+        let home_entry = format!("{vite} in ~");
+        assert_eq!(entry(&at_home), KeepAs::Entry(home_entry.clone()));
+        let expanded = expand(&home_entry, &p);
+        assert_eq!(expanded, format!("{vite} in {home}"));
+        assert!(matches(&at_home, &expanded));
+        assert!(!matches(&here, &expanded));
     }
 
     #[test]

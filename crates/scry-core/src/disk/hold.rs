@@ -267,7 +267,7 @@ pub struct Removed {
 }
 
 impl Removed {
-    /// "1,204 files and 87 folders (12 MB)".
+    /// "1204 files and 87 folders (12 MB)".
     pub fn sentence(&self) -> String {
         let n = |k: u64, one: &str, many: &str| format!("{k} {}", if k == 1 { one } else { many });
         format!(

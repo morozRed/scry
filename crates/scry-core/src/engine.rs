@@ -240,11 +240,12 @@ impl Engine {
             .filter(|&uid| uid != snap.viewer_uid);
         let mut names = BTreeMap::new();
         for uid in uids {
-            let name = self
-                .names
-                .entry(uid)
-                .or_insert_with(|| user_name(uid).unwrap_or_else(|| format!("uid {uid}")));
-            names.insert(uid, name.clone());
+            names.entry(uid).or_insert_with(|| {
+                self.names
+                    .entry(uid)
+                    .or_insert_with(|| user_name(uid).unwrap_or_else(|| format!("uid {uid}")))
+                    .clone()
+            });
         }
         names
     }

@@ -2,6 +2,7 @@
 
 use std::ffi::CStr;
 use std::mem::size_of;
+use std::sync::OnceLock;
 
 use crate::model::{MemoryPressure, Pulse, Ram, Reading, Swap};
 
@@ -14,9 +15,7 @@ pub type Ticks = [u32; 4];
 
 /// Busy share of all cores between two tick readings. `None` when no time passed.
 pub fn cpu_percent(prev: Ticks, now: Ticks) -> Option<f32> {
-    let d: Vec<u64> = (0..4)
-        .map(|i| u64::from(now[i].wrapping_sub(prev[i])))
-        .collect();
+    let d: [u64; 4] = std::array::from_fn(|i| u64::from(now[i].wrapping_sub(prev[i])));
     let total: u64 = d.iter().sum();
     if total == 0 {
         return None;
@@ -91,8 +90,12 @@ impl PulseSampler {
     /// pages that cannot be purged), wired memory and what the compressor holds.
     #[allow(deprecated)]
     fn ram(&self) -> Option<Ram> {
-        let total = sysctl_value::<u64>(c"hw.memsize")?;
-        let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+        static HARDWARE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+        let (total, page) = (*HARDWARE.get_or_init(|| {
+            let total = sysctl_value::<u64>(c"hw.memsize")?;
+            let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+            Some((total, page))
+        }))?;
         let mut info = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
         let mut count = (size_of::<libc::vm_statistics64>() / size_of::<libc::integer_t>())
             as libc::mach_msg_type_number_t;

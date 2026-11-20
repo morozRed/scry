@@ -171,8 +171,9 @@ impl SizeCache {
         let Some(uuid) = fsevents::log_uuid(dev) else {
             return look;
         };
-        if store.size_log().ok().flatten().as_deref() != Some(uuid.as_str()) {
-            look.stats.lost = store.size_log().ok().flatten().is_some();
+        let logged = store.size_log().ok().flatten();
+        if logged.as_deref() != Some(uuid.as_str()) {
+            look.stats.lost = logged.is_some();
             if store.reset_sizes(&uuid).is_err() {
                 return look;
             }

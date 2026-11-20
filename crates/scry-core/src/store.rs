@@ -99,6 +99,8 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 pub const SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
+/// First schema version that has the `session` and `session_process` tables.
+pub const SESSION_SCHEMA_VERSION: u32 = 2;
 
 /// A store written by a newer Scry. Opening it would risk misreading or damaging it.
 #[derive(Debug, PartialEq, Eq)]
@@ -122,7 +124,7 @@ impl std::error::Error for SchemaTooNew {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditRow {
     pub at_ms: i64,
-    /// Who acted: `cli`, `tui`, `mcp`, `daemon`.
+    /// Who acted: `cli`, `tui`, `daemon`.
     pub actor: String,
     pub action: String,
     pub target: String,
@@ -269,9 +271,9 @@ impl Store {
             "INSERT INTO session (agent, session_id, cwd, started_at_ms, ended_at_ms, end_reason, source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (agent, session_id) DO UPDATE SET
-               cwd = CASE WHEN excluded.source = 'hook'
+               cwd = CASE WHEN excluded.source = 'hook' AND source != 'hook'
                      THEN coalesce(excluded.cwd, cwd) ELSE coalesce(cwd, excluded.cwd) END,
-               started_at_ms = CASE WHEN excluded.source = 'hook'
+               started_at_ms = CASE WHEN excluded.source = 'hook' AND source != 'hook'
                      THEN coalesce(excluded.started_at_ms, started_at_ms)
                      ELSE coalesce(started_at_ms, excluded.started_at_ms) END,
                ended_at_ms = coalesce(ended_at_ms, excluded.ended_at_ms),

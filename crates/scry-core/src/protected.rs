@@ -95,7 +95,10 @@ impl Protected {
     /// it never looks inside one.
     pub fn resolve(&self, path: &Path) -> Resolved {
         let path = if path.is_relative() {
-            std::env::current_dir().unwrap_or_default().join(path)
+            let Ok(cwd) = std::env::current_dir() else {
+                return Resolved::Unresolvable;
+            };
+            cwd.join(path)
         } else {
             path.to_path_buf()
         };
@@ -123,7 +126,7 @@ impl Protected {
                 // Past 40 links the path is a loop that nothing can open.
                 let target = fs::read_link(&next).ok().filter(|_| links <= 40);
                 let Some(target) = target else {
-                    return Resolved::Outside(next);
+                    return Resolved::Unresolvable;
                 };
                 if target.is_absolute() {
                     out = PathBuf::from("/");

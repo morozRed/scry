@@ -364,11 +364,11 @@ fn program_name(f: &Facts) -> String {
 }
 
 fn interpreter(program: &str) -> Option<&'static str> {
-    let bare = program
-        .to_ascii_lowercase()
-        .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')
-        .to_string();
-    INTERPRETERS.iter().copied().find(|i| *i == bare)
+    let bare = program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    INTERPRETERS
+        .iter()
+        .copied()
+        .find(|i| i.eq_ignore_ascii_case(bare))
 }
 
 /// A script that stands for the interpreter running it: a file in a `bin` or `.bin`
@@ -451,14 +451,15 @@ enum PyValue {
 /// and `forkserver` runs `-c 'from multiprocessing.forkserver import main; …'`, whose forks
 /// keep those arguments. A `fork` child keeps its parent's arguments and so its label.
 pub fn multiprocessing_worker(argv: &[String]) -> bool {
+    const PREFIXES: [&str; 2] = [
+        "from multiprocessing.spawn import ",
+        "from multiprocessing.forkserver import ",
+    ];
     let argv = &argv[..argv.len().min(MAX_ARGS + 1)];
     argv.iter().any(|a| a == "--multiprocessing-fork")
-        || argv.windows(2).any(|w| {
-            w[0] == "-c"
-                && ["spawn import", "forkserver import"]
-                    .iter()
-                    .any(|m| w[1].starts_with(&format!("from multiprocessing.{m} ")))
-        })
+        || argv
+            .windows(2)
+            .any(|w| w[0] == "-c" && PREFIXES.iter().any(|p| w[1].starts_with(p)))
 }
 
 /// The path `a` names, when it exists. Relative paths resolve against the working directory.
@@ -500,10 +501,12 @@ fn file_name(path: &Path, home: Option<&Home>) -> Option<String> {
 
 /// A port the process listens on, written as the port number exactly, so `03000` is not.
 fn is_port(a: &str, ports: &[u16]) -> bool {
-    a.len() <= 5
+    !ports.is_empty()
+        && !a.is_empty()
+        && a.len() <= 5
+        && !(a.len() > 1 && a.starts_with('0'))
         && a.bytes().all(|b| b.is_ascii_digit())
-        && a.parse::<u16>()
-            .is_ok_and(|p| ports.contains(&p) && p.to_string() == a)
+        && a.parse::<u16>().is_ok_and(|p| ports.contains(&p))
 }
 
 /// A flag name after its dashes: letters, digits, `-`, `_` and `.`.
@@ -556,7 +559,13 @@ pub fn unprintable(c: char) -> bool {
 
 impl fmt::Display for CommandLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.parts.join(" "))
+        for (i, part) in self.parts.iter().enumerate() {
+            if i > 0 {
+                f.write_str(" ")?;
+            }
+            f.write_str(part)?;
+        }
+        Ok(())
     }
 }
 
@@ -788,7 +797,7 @@ fn remote_mounts() -> Vec<PathBuf> {
     if got <= 0 {
         return Vec::new();
     }
-    unsafe { buf.set_len(got as usize) };
+    unsafe { buf.set_len((got as usize).min(cap)) };
     buf.iter()
         .filter(|s| s.f_flags & libc::MNT_LOCAL as u32 == 0)
         .map(|s| {

@@ -219,7 +219,14 @@ impl Walker {
             trees: roots.len(),
         };
         let partials: Vec<Work> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..self.threads).map(|_| s.spawn(|| ctx.work())).collect();
+            let handles: Vec<_> = (0..self.threads)
+                .map(|_| {
+                    s.spawn(|| {
+                        crate::sys::yield_to_the_user();
+                        ctx.work()
+                    })
+                })
+                .collect();
             handles
                 .into_iter()
                 .map(|h| h.join().expect("size worker panicked"))
@@ -242,7 +249,7 @@ impl Walker {
             }
             for (all, mine) in parts.iter_mut().zip(w.parts) {
                 for (k, t) in mine {
-                    all.entry(k).or_default().add(&t);
+                    all.entry(k).or_default().add_owned(t);
                 }
             }
         }
@@ -451,13 +458,28 @@ fn sorted_links(links: HashMap<FileId, Linked>) -> Vec<Linked> {
 
 impl Tally {
     fn add(&mut self, o: &Tally) {
-        merge_links(&mut self.links, o.links.clone());
+        for (&id, &l) in &o.links {
+            self.links.entry(id).and_modify(|k| k.5 += l.5).or_insert(l);
+        }
         self.allocated += o.allocated;
         self.reclaimable += o.reclaimable;
         self.files += o.files;
         self.dirs += o.dirs;
         self.skipped += o.skipped;
         self.repos.extend(o.repos.iter().cloned());
+        self.git_at_root |= o.git_at_root;
+        self.mounts += o.mounts;
+        self.shared_links |= o.shared_links;
+    }
+
+    fn add_owned(&mut self, o: Tally) {
+        merge_links(&mut self.links, o.links);
+        self.allocated += o.allocated;
+        self.reclaimable += o.reclaimable;
+        self.files += o.files;
+        self.dirs += o.dirs;
+        self.skipped += o.skipped;
+        self.repos.extend(o.repos);
         self.git_at_root |= o.git_at_root;
         self.mounts += o.mounts;
         self.shared_links |= o.shared_links;

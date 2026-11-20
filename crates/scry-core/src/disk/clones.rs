@@ -100,10 +100,14 @@ pub fn regenerable(path: &Path, shape: Shape, timeout: Duration) -> Result<(), S
     if !real_dir || gitdir.join("commondir").exists() {
         return Err("is not a clone of its own".into());
     }
+    let config_file = gitdir.join("config");
+    if !std::fs::symlink_metadata(&config_file).is_ok_and(|m| m.is_file()) {
+        return Err("has a git config that is not a regular file".into());
+    }
     let read = |args: &[&std::ffi::OsStr]| {
         git::stdout(path, args, timeout).map_err(|e| format!("could not be read: {e:#}"))
     };
-    let config = git::parse_config(&read(&git::config_list_args(&gitdir.join("config")))?);
+    let config = git::parse_config(&read(&git::config_list_args(&config_file))?);
     let value = |key: &str| {
         config
             .iter()
@@ -159,8 +163,10 @@ pub fn regenerable(path: &Path, shape: Shape, timeout: Duration) -> Result<(), S
                 timeout,
             )
             .map_err(|e| format!("could not be read: {e:#}"))?;
-            if stash.code == Some(0) {
-                return Err("has a stash".into());
+            match stash.code {
+                Some(0) => return Err("has a stash".into()),
+                Some(1) => {}
+                _ => return Err("could not check for stashes".into()),
             }
             let unpushed = with(&[
                 "rev-list",

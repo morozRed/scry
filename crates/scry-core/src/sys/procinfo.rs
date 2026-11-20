@@ -27,7 +27,7 @@ pub fn parse_procargs2(buf: &[u8]) -> Option<ProcArgs> {
     let start = rest.iter().position(|&b| b != 0).unwrap_or(rest.len());
     rest = &rest[start..];
     let mut strings = rest.split(|&b| b == 0);
-    let mut argv = Vec::with_capacity(argc as usize);
+    let mut argv = Vec::with_capacity((argc as usize).min(rest.len()));
     for _ in 0..argc {
         argv.push(String::from_utf8_lossy(strings.next()?).into_owned());
     }

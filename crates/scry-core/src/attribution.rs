@@ -339,9 +339,13 @@ struct Ctx<'a> {
 
 /// Whether `q` carries `session`'s stamp.
 fn carries(q: &Process, session: &SessionKey) -> bool {
-    q.stamps.sessions().iter().any(|&(agent, id, _)| {
-        agent == session.agent && session.id == SessionId::Known(id.to_string())
-    })
+    let SessionId::Known(want) = &session.id else {
+        return false;
+    };
+    q.stamps
+        .sessions()
+        .iter()
+        .any(|&(agent, id, _)| agent == session.agent && id == want)
 }
 
 impl<'a> Ctx<'a> {
@@ -446,6 +450,30 @@ impl Lineage {
     pub fn build(snap: &Snapshot, known: &Known, policy: &Policy) -> Lineage {
         let cx = Ctx::new(snap);
         let now_us = snap.taken_at_ms * 1000;
+        let known_sessions: HashMap<&SessionKey, &Session> =
+            known.sessions.iter().map(|s| (&s.key, s)).collect();
+
+        // Each non-host process's nearest live host above it, computed once.
+        let mut host_of: HashMap<i32, &Process> = HashMap::new();
+        let mut stamped_for_host: HashMap<i32, Vec<&Process>> = HashMap::new();
+        for p in snap.own_processes() {
+            if cx.hosts.contains_key(&p.id.pid) {
+                continue;
+            }
+            if let Some(h) = cx.host_above(p) {
+                host_of.insert(p.id.pid, h);
+                if p.stamps.session().is_some() {
+                    stamped_for_host.entry(h.id.pid).or_default().push(p);
+                }
+            }
+            if let Some(cp) = p.stamps.claude_pid
+                && cx.hosts.contains_key(&cp)
+                && host_of.get(&p.id.pid).map(|h| h.id.pid) != Some(cp)
+                && p.stamps.session().is_some()
+            {
+                stamped_for_host.entry(cp).or_default().push(p);
+            }
+        }
 
         // Each agent process's current session: the newest open one a hook tied to it,
         // else the newest stamp among the processes below it, else a stand-in.
@@ -457,7 +485,7 @@ impl Lineage {
                 .iter()
                 .filter(|m| m.part == Part::Agent && m.proc == id && m.session.agent == agent)
                 .filter_map(|m| {
-                    let s = known.sessions.iter().find(|s| s.key == m.session);
+                    let s = known_sessions.get(&m.session).copied();
                     (s.is_none_or(|s| s.ended_at_ms.is_none())).then(|| {
                         (
                             s.and_then(|s| s.started_at_ms).unwrap_or(m.first_seen_ms),
@@ -468,10 +496,12 @@ impl Lineage {
                 .max_by_key(|(at, _)| *at)
                 .map(|(_, k)| k.clone());
             let stamped = || {
-                snap.own_processes()
-                    .filter(|p| !cx.hosts.contains_key(&p.id.pid))
+                stamped_for_host
+                    .get(&pid)?
+                    .iter()
+                    .copied()
                     .filter(|p| {
-                        cx.host_above(p).is_some_and(|h| h.id.pid == pid)
+                        host_of.get(&p.id.pid).is_some_and(|h| h.id.pid == pid)
                             || (p.stamps.claude_pid == Some(pid) && p.id.start_us >= id.start_us)
                     })
                     .filter_map(|p| {
@@ -526,7 +556,7 @@ impl Lineage {
             if cx.hosts.contains_key(&p.id.pid) {
                 continue;
             }
-            let host = cx.host_above(p);
+            let host = host_of.get(&p.id.pid).copied();
             // A stamp from a session that ended before the process started was inherited
             // through something that outlived the session, so it names the wrong one.
             let stamps: Vec<(SessionKey, &'static str)> = p
@@ -540,7 +570,7 @@ impl Lineage {
                     };
                     (session, key)
                 })
-                .filter(|(session, _)| !ended_before(known, session, p.id.start_us))
+                .filter(|(session, _)| !ended_before(&known_sessions, session, p.id.start_us))
                 .collect();
             for (session, _) in stamps.iter().filter(|(s, _)| s.agent == Agent::ClaudeCode) {
                 if let Some(cp) = p.stamps.claude_pid {
@@ -627,7 +657,7 @@ impl Lineage {
         let mut sessions: Vec<SessionView> = keys
             .into_iter()
             .map(|key| SessionView {
-                session: known.sessions.iter().find(|s| s.key == key).cloned(),
+                session: known_sessions.get(&key).copied().cloned(),
                 agent: state(&key),
                 members: Vec::new(),
                 key,
@@ -753,11 +783,13 @@ impl Lineage {
 }
 
 /// Whether the store or a hook says `session` ended before a process started at `start_us`.
-fn ended_before(known: &Known, session: &SessionKey, start_us: i64) -> bool {
-    known
-        .sessions
-        .iter()
-        .find(|s| s.key == *session)
+fn ended_before(
+    known_sessions: &HashMap<&SessionKey, &Session>,
+    session: &SessionKey,
+    start_us: i64,
+) -> bool {
+    known_sessions
+        .get(session)
         .and_then(|s| s.ended_at_ms)
         .is_some_and(|end| start_us / 1000 > end)
 }
@@ -775,7 +807,11 @@ fn guess(p: &Process, known: &Known) -> Option<SessionKey> {
             let Some(dir) = s.cwd.as_deref().filter(|d| d.matches('/').count() >= 3) else {
                 return false;
             };
-            let inside = cwd == dir || cwd.starts_with(&format!("{dir}/"));
+            let trimmed = dir.trim_end_matches('/');
+            let inside = cwd == trimmed
+                || cwd
+                    .strip_prefix(trimmed)
+                    .is_some_and(|rest| rest.starts_with('/'));
             let after = s.started_at_ms.is_some_and(|t| start_ms >= t);
             let before = s.ended_at_ms.is_none_or(|t| start_ms <= t);
             inside && after && before
@@ -876,8 +912,8 @@ fn tty_below(p: &Process, children: &HashMap<i32, Vec<&Process>>) -> Option<(i32
     None
 }
 
-/// A keep entry names a process by its name, its executable's full path or its command
-/// label; see [`crate::keep`].
+/// A keep entry names a process by its name, its executable's full path, its script's real
+/// path, or its script in one working directory; see [`crate::keep`].
 fn kept(p: &Process, keep: &[String]) -> Option<String> {
     keep.iter().find(|k| crate::keep::matches(p, k)).cloned()
 }

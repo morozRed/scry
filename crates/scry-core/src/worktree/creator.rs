@@ -63,9 +63,9 @@ pub struct Clues<'a> {
 /// One kind of evidence for who made a worktree. Sources are asked in order: the first to
 /// name an agent decides, and later sources that agree add their evidence.
 ///
-/// Record files, path convention and lock reason are the sources today. M2 adds env-stamped
-/// processes whose cwd is inside the worktree, then a session's time window labelled as a
-/// guess.
+/// Record files, path convention and lock reason are the sources today. Future sources can
+/// add env-stamped processes whose cwd is inside the worktree or a session's time window
+/// labelled as a guess.
 pub trait CreatorSource: Send + Sync {
     fn evidence(&self, clues: &Clues) -> Option<(Agent, CreatorEvidence)>;
 }

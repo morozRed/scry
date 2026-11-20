@@ -1574,6 +1574,7 @@ fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + 
         let workers: Vec<_> = (0..threads.clamp(1, items.len().max(1)))
             .map(|_| {
                 s.spawn(|| {
+                    crate::sys::yield_to_the_user();
                     let mut mine = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);

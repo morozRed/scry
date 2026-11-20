@@ -15,7 +15,7 @@ use crate::home::Home;
 use crate::model::Snapshot;
 use crate::paths::Paths;
 use crate::spool;
-use crate::store::{SCHEMA_VERSION, Store};
+use crate::store::{SESSION_SCHEMA_VERSION, Store};
 use crate::view::usage::{self, CpuMeter};
 use crate::view::{Board, Load, Pulse};
 
@@ -146,7 +146,7 @@ impl Collector {
         let (mut known, history) = if db.exists() {
             // A store the daemon has not migrated yet has no session tables.
             match Store::open_read_only(&db).and_then(|s| {
-                if s.schema_version()? < SCHEMA_VERSION {
+                if s.schema_version()? < SESSION_SCHEMA_VERSION {
                     return Ok(None);
                 }
                 Ok(Some(Known {

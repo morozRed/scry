@@ -65,7 +65,8 @@ pub fn check_exec_form(version_output: &str) -> std::result::Result<(), String> 
         MIN_EXEC_FORM.0, MIN_EXEC_FORM.1, MIN_EXEC_FORM.2
     );
     let word = version_output.split_whitespace().next().unwrap_or("");
-    let parts: Vec<u32> = word.split('.').map_while(|p| p.parse().ok()).collect();
+    let core = word.split(['-', '+']).next().unwrap_or("");
+    let parts: Vec<u32> = core.split('.').map_while(|p| p.parse().ok()).collect();
     let [a, b, c] = parts[..] else {
         return Err(format!(
             "could not read Claude Code's version from `{}`; Scry's hooks need {need} or newer",
@@ -282,7 +283,12 @@ impl Plan {
             .file_name()
             .map_or("settings.json".into(), |n| n.to_string_lossy());
         let tmp = target.with_file_name(format!(".{name}.scry-{now_ms}"));
-        write_new(&tmp, &self.after, mode)?;
+        if let Err(e) = write_new(&tmp, &self.after, mode) {
+            if let Some(b) = &backup {
+                let _ = fs::remove_file(b);
+            }
+            return Err(e);
+        }
         meanwhile(Step::Written);
         let refuse = || {
             let _ = fs::remove_file(&tmp);
@@ -322,8 +328,10 @@ impl Plan {
                 if held != Some(read) || named != Some(read) {
                     return Err(refuse());
                 }
-                fs::rename(&tmp, &target)
-                    .with_context(|| format!("replacing {}", target.display()))?;
+                if let Err(e) = fs::rename(&tmp, &target) {
+                    let _ = refuse();
+                    return Err(e).with_context(|| format!("replacing {}", target.display()));
+                }
             }
             (None, _) => {
                 // A link fails where a file now stands, so one saved meanwhile is kept.
@@ -868,9 +876,12 @@ mod tests {
     fn exec_form_needs_a_recent_claude_code() {
         assert!(check_exec_form("2.1.322 (Claude Code)").is_ok());
         assert!(check_exec_form("2.1.139 (Claude Code)").is_ok());
+        assert!(check_exec_form("2.1.139-beta.1 (Claude Code)").is_ok());
+        assert!(check_exec_form("2.1.140+build.5 (Claude Code)").is_ok());
         assert!(check_exec_form("3.0.0").is_ok());
         let old = check_exec_form("2.1.138 (Claude Code)").unwrap_err();
         assert!(old.contains("2.1.139 or newer"), "{old}");
+        assert!(check_exec_form("2.1.138-rc.1 (Claude Code)").is_err());
         assert!(check_exec_form("").is_err());
         assert!(check_exec_form("command not found").is_err());
     }

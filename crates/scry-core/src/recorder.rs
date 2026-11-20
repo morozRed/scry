@@ -53,8 +53,12 @@ impl Recorder {
         let now = now_ms();
         let mut events = 0;
         spool::drain(&paths.spool(), now, |batch| {
+            // Apply in event-time order, matching `Known::apply`, so an out-of-order
+            // Start/End pair in one batch cannot leave a resumed session stuck ended.
+            let mut ordered: Vec<&crate::session::SessionEvent> = batch.iter().collect();
+            ordered.sort_by_key(|e| e.at_ms);
             store.batch(|s| {
-                for e in batch {
+                for e in ordered {
                     if !s.take_event(&e.id, now)? {
                         continue;
                     }
@@ -272,6 +276,46 @@ mod tests {
         };
         take(&[start]);
         let s = s1(&store);
+        assert_eq!((s.ended_at_ms, s.end_reason), (None, None), "resumed");
+    }
+
+    #[test]
+    fn out_of_order_spool_events_in_one_batch_apply_in_timestamp_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(tmp.path().into(), Some(tmp.path().join("scry")));
+        paths.ensure_state().unwrap();
+        let store = Store::open(&paths.db()).unwrap();
+        let mut rec = Recorder::new(Policy {
+            scry: None,
+            ..Policy::default()
+        });
+        let mut resume = event(
+            "e3",
+            EventKind::Start {
+                source: Some("resume".into()),
+            },
+        );
+        resume.at_ms = t0() + 2_000;
+        let mut end = event(
+            "e2",
+            EventKind::End {
+                reason: Some("prompt_input_exit".into()),
+            },
+        );
+        end.at_ms = t0() + 1_000;
+        let start = event("e1", EventKind::Start { source: None });
+        // Written newest-first, as concurrent hooks can race into the spool.
+        for e in [&resume, &end, &start] {
+            spool::append(&paths.spool(), e).unwrap();
+        }
+        rec.pass(&store, &paths).unwrap();
+        let s = store
+            .sessions(0)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.key.id.short() == "s1")
+            .unwrap();
+        assert_eq!(s.started_at_ms, Some(t0()));
         assert_eq!((s.ended_at_ms, s.end_reason), (None, None), "resumed");
     }
 

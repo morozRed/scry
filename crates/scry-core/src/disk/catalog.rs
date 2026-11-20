@@ -360,14 +360,14 @@ pub fn locate(home: &Path, roots: &[PathBuf], worktrees: &[PathBuf]) -> Vec<Foun
         if let Place::Home(paths) = e.place {
             for p in paths {
                 let path = home.join(p);
+                if guard.resolve(&path).outside().is_none() {
+                    continue;
+                }
                 // The last component is not followed: a symlinked cache is someone else's.
                 let Ok(meta) = fs::symlink_metadata(&path) else {
                     continue;
                 };
                 if meta.file_type().is_symlink() {
-                    continue;
-                }
-                if guard.resolve(&path).outside().is_none() {
                     continue;
                 }
                 out.push(Found {
@@ -429,8 +429,11 @@ fn find_named(
     });
     let ready = Condvar::new();
     let found = Mutex::new(Vec::new());
+    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let home = home.as_path();
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
     let work = || {
+        crate::sys::yield_to_the_user();
         loop {
             let (dir, depth) = {
                 let mut j = jobs.lock().unwrap();

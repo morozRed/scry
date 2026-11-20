@@ -269,11 +269,16 @@ fn session_row(
         .filter(|m| lineage.is_leftover(m.proc.pid))
         .filter_map(|m| snap.process(m.proc.pid)?.footprint)
         .sum();
-    let left_ports: Vec<String> = s
+    let mut left_port_nums: Vec<u16> = s
         .members
         .iter()
         .filter(|m| lineage.is_leftover(m.proc.pid))
-        .flat_map(|m| ports.get(&m.proc.pid).cloned().unwrap_or_default())
+        .flat_map(|m| ports.get(&m.proc.pid).into_iter().flatten().copied())
+        .collect();
+    left_port_nums.sort_unstable();
+    left_port_nums.dedup();
+    let left_ports: Vec<String> = left_port_nums
+        .into_iter()
         .map(|p| format!(":{p}"))
         .collect();
     let in_dir = cwd

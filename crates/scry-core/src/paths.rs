@@ -74,9 +74,10 @@ impl Paths {
         Ok(())
     }
 
-    /// `~/x` becomes `<home>/x`. Other paths pass through.
+    /// `~` and `~/x` become `<home>` and `<home>/x`. Other paths pass through.
     pub fn expand(&self, p: &Path) -> PathBuf {
         match p.strip_prefix("~") {
+            Ok(rest) if rest.as_os_str().is_empty() => self.user_home.clone(),
             Ok(rest) => self.user_home.join(rest),
             Err(_) => p.to_path_buf(),
         }
@@ -187,7 +188,9 @@ mod tests {
     #[test]
     fn tilde_round_trips() {
         let p = Paths::new("/Users/ann".into(), None);
+        assert_eq!(p.expand(Path::new("~")), Path::new("/Users/ann"));
         assert_eq!(p.expand(Path::new("~/src")), Path::new("/Users/ann/src"));
+        assert_eq!(p.tilde(Path::new("/Users/ann")), "~");
         assert_eq!(p.tilde(Path::new("/Users/ann/src")), "~/src");
         assert_eq!(p.tilde(Path::new("/Users/anna/src")), "/Users/anna/src");
     }

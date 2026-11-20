@@ -842,6 +842,7 @@ fn short(oid: &str) -> &str {
 
 fn tilde(p: &Path, home: &Path) -> String {
     match p.strip_prefix(home) {
+        Ok(rest) if home.as_os_str().len() > 1 && rest.as_os_str().is_empty() => "~".into(),
         Ok(rest) if home.as_os_str().len() > 1 => format!("~/{}", rest.display()),
         _ => p.display().to_string(),
     }

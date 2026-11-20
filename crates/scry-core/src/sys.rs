@@ -44,10 +44,13 @@ pub fn scan() -> Result<Snapshot> {
     let read: Vec<Process> = records
         .into_iter()
         .filter_map(|r| {
-            let mut p = read_process(ProcId {
-                pid: r.pid,
-                start_us: r.start_us,
-            })?;
+            let mut p = read_process(
+                ProcId {
+                    pid: r.pid,
+                    start_us: r.start_us,
+                },
+                viewer_uid,
+            )?;
             p.tty = r
                 .tty
                 .map(|dev| ttys.entry(dev).or_insert_with(|| tty_name(dev)).clone());
@@ -207,24 +210,10 @@ fn parse_record(rec: &[u8; KINFO_PROC_SIZE]) -> (i32, i64) {
 
 /// The identity of one live process, or `None` if no process has that pid.
 pub fn proc_id(pid: i32) -> Option<ProcId> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
-    let mut buf = [0u8; KINFO_PROC_SIZE];
-    let mut len = buf.len();
-    let rc = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            4,
-            buf.as_mut_ptr().cast(),
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc != 0 || len != KINFO_PROC_SIZE {
-        return None;
-    }
-    let (found, start_us) = parse_record(&buf);
-    (found == pid).then_some(ProcId { pid, start_us })
+    liveness(pid).map(|l| ProcId {
+        pid,
+        start_us: l.start_us,
+    })
 }
 
 /// Reads total, free and available space of the volume holding `path`.
@@ -257,10 +246,15 @@ pub fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-fn read_process(id: ProcId) -> Option<Process> {
+fn read_process(id: ProcId, viewer_uid: u32) -> Option<Process> {
     let info = short_bsd_info(id.pid)?;
     let exe = exe_path(id.pid);
-    let (footprint, cpu_ns) = usage(id.pid);
+    // `proc_pid_rusage` fails with EPERM for other users' processes without root.
+    let (footprint, cpu_ns) = if info.pbsi_uid == viewer_uid || viewer_uid == 0 {
+        usage(id.pid)
+    } else {
+        (None, None)
+    };
     let comm: Vec<u8> = info
         .pbsi_comm
         .iter()

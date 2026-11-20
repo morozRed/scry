@@ -428,8 +428,9 @@ pub(crate) fn stop_on(
             });
         }
     }
+    let gone = wait_gone(host, t.id, KILL_GRACE);
     let after_ms = elapsed();
-    if wait_gone(host, t.id, KILL_GRACE) {
+    if gone {
         Ok(Outcome::Exited {
             signal: "SIGKILL".into(),
             after_ms,
@@ -452,8 +453,9 @@ pub(crate) fn kill_on(
 ) -> Result<Outcome, Refusal> {
     let started = Instant::now();
     authorised_signal(host, t, gate, libc::SIGKILL)?;
+    let gone = wait_gone(host, t.id, KILL_GRACE);
     let after_ms = started.elapsed().as_millis() as u64;
-    if wait_gone(host, t.id, KILL_GRACE) {
+    if gone {
         Ok(Outcome::Exited {
             signal: "SIGKILL".into(),
             after_ms,
@@ -1147,5 +1149,63 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn sigkill_reports_elapsed_time_after_waiting_for_exit() {
+        struct SlowKill {
+            killed_at: Cell<Option<Instant>>,
+            ignores_term: bool,
+        }
+        struct NeverChanged;
+        impl Watch for NeverChanged {
+            fn changed(&self) -> bool {
+                false
+            }
+        }
+        impl Host for SlowKill {
+            fn liveness(&self, _: i32) -> Option<Liveness> {
+                let gone = self
+                    .killed_at
+                    .get()
+                    .is_some_and(|t| t.elapsed() >= Duration::from_millis(60));
+                (!gone).then_some(Liveness {
+                    start_us: 0,
+                    zombie: false,
+                })
+            }
+            fn holds_port(&self, _: i32, _: Proto, _: u16) -> Option<bool> {
+                Some(true)
+            }
+            fn watch(&self, _: i32) -> std::io::Result<Box<dyn Watch>> {
+                Ok(Box::new(NeverChanged))
+            }
+            fn signal(&self, _: i32, sig: libc::c_int) -> std::io::Result<()> {
+                if sig == libc::SIGKILL || !self.ignores_term {
+                    self.killed_at.set(Some(Instant::now()));
+                }
+                Ok(())
+            }
+        }
+
+        let host = SlowKill {
+            killed_at: Cell::new(None),
+            ignores_term: true,
+        };
+        let out = kill_on(&host, &fake_target(false), &mut Open).unwrap();
+        assert!(
+            matches!(out, Outcome::Exited { ref signal, after_ms } if signal == "SIGKILL" && after_ms >= 50),
+            "{out:?}"
+        );
+
+        let host = SlowKill {
+            killed_at: Cell::new(None),
+            ignores_term: true,
+        };
+        let out = stop_on(&host, &fake_target(false), true, Duration::ZERO, &mut Open).unwrap();
+        assert!(
+            matches!(out, Outcome::Exited { ref signal, after_ms } if signal == "SIGKILL" && after_ms >= 50),
+            "{out:?}"
+        );
     }
 }

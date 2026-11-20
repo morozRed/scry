@@ -133,6 +133,12 @@ pub fn build(
         _ => (None, None),
     };
     let share = |p: &Process| shares.and_then(|s| s.get(&p.id).copied());
+    let by_pid: HashMap<i32, &Process> = snap.processes.iter().map(|p| (p.id.pid, p)).collect();
+    let session_by_pid: HashMap<i32, &crate::attribution::SessionView> = lineage
+        .sessions
+        .iter()
+        .flat_map(|s| s.members.iter().map(move |m| (m.proc.pid, s)))
+        .collect();
 
     let mut groups: HashMap<String, Vec<&Process>> = HashMap::new();
     for p in snap.own_processes() {
@@ -146,7 +152,18 @@ pub fn build(
             });
             let children: Vec<UsageRow> = procs
                 .iter()
-                .map(|p| process_row(snap, lineage, home, p, share(p), 1))
+                .map(|p| {
+                    process_row(
+                        snap,
+                        &by_pid,
+                        &session_by_pid,
+                        lineage,
+                        home,
+                        p,
+                        share(p),
+                        1,
+                    )
+                })
                 .collect();
             let head = if procs.len() == 1 {
                 UsageRow {
@@ -208,22 +225,30 @@ pub fn group_of(p: &Process) -> String {
             .split('/')
             .find(|part| part.len() > 4 && part.ends_with(".app"))
     {
-        return app.trim_end_matches(".app").to_string();
+        return app.strip_suffix(".app").unwrap_or(app).to_string();
     }
     p.name.clone()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_row(
     snap: &Snapshot,
+    by_pid: &HashMap<i32, &Process>,
+    session_by_pid: &HashMap<i32, &crate::attribution::SessionView>,
     lineage: &Lineage,
     home: Option<&Home>,
     p: &Process,
     cpu: Option<f32>,
     depth: u8,
 ) -> UsageRow {
-    let label = snap.worker_parent(p).unwrap_or(p).label();
+    let worker_parent = p
+        .worker
+        .then(|| by_pid.get(&p.ppid).copied())
+        .flatten()
+        .filter(|parent| parent.uid == p.uid);
+    let label = worker_parent.unwrap_or(p).label();
     let project = p.project.as_ref().map(|r| short_dir(home, &r.root));
-    let session = lineage.session_of(p.id.pid).map(|(s, _)| s);
+    let session = session_by_pid.get(&p.id.pid).copied();
     let state = if lineage.is_leftover(p.id.pid) {
         Some(State::Leftover)
     } else {
@@ -254,7 +279,7 @@ fn process_row(
     if let Some(exe) = &p.exe {
         evidence.push(format!("Runs {}", shown(home, exe)));
     }
-    if let Some(parent) = snap.process(p.ppid) {
+    if let Some(parent) = by_pid.get(&p.ppid).copied() {
         evidence.push(format!(
             "Started by {} (pid {})",
             parent.name, parent.id.pid
